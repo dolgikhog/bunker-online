@@ -13,7 +13,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   check, load, Report, checkContent, checkMessages, checkClient, checkGlossary, latinLeft, reviewWords, timeAgreement,
-  textProblems, pluralLint, placeholderLint, numbersIn, combos, readMarks, write,
+  textProblems, pluralLint, placeholderLint, numbersIn, combos, readMarks, write, reviewId, REVIEW_FILE,
 } from '../tools/i18n-check.js';
 import * as core from '../public/i18n/core.js';
 
@@ -45,6 +45,13 @@ describe('the real catalogues', () => {
     assert.equal(out.ok, true);
     const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
     assert.equal(pkg.scripts['i18n:check'], 'node tools/i18n-check.js');
+  });
+
+  test('the tracked gender review list marks every line of today\'s list ok (the --gate rule, so a fresh clone passes)', () => {
+    const marks = readMarks(path.join(ROOT, REVIEW_FILE));
+    const bad = result.reviews.filter((r) => marks.get(reviewId(r)) !== 'ok')
+      .map((r) => `${marks.get(reviewId(r)) ?? '?'} ${r.file} ${r.key} (${r.words.join(' ')})`);
+    assert.deepEqual(bad, [], `not marked ok in ${REVIEW_FILE}: run npm run i18n:check, read each line, mark it ok or fix`);
   });
 });
 

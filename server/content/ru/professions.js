@@ -197,7 +197,7 @@ export default {
   'lighthouse-keeper': 'Смотритель маяка',
   'postman': 'Почтальон',
   // {0}: years, 2..12. No modifier: the English entry has its own "(…)".
-  'unemployed-years-without-a-job': 'Без работы (уже {0} {0|год|года|лет})',
+  'unemployed-years-without-a-job': 'Без работы (уже {0}\u00a0{0|год|года|лет})',
   // {0}: children, 2..6. The option selector indexes by the number itself (index 0 and 1 are never drawn), as in
   // ./biology.js: «двое детей» reads better than «2 ребёнка». «За плечами» = raised, with no past tense.
   'homemaker-raised-children': 'Домашнее хозяйство (за плечами {0:||двое|трое|четверо|пятеро|шестеро} детей)',

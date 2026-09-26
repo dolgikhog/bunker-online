@@ -83,6 +83,6 @@ export default {
   'soap-making': 'Мыловарение',
   'family-tree-research': 'Составление родословной',
   'learning-a-made-up-language-from': 'Изучение выдуманного языка из сериала',
-  'collecting-bottle-caps-of-them': 'Коллекционирование пробок от бутылок (уже {0} {0|штука|штуки|штук})',
+  'collecting-bottle-caps-of-them': 'Коллекционирование пробок от бутылок (уже {0}\u00a0{0|штука|штуки|штук})',
   'watching-cooking-shows-never': 'Кулинарные шоу (смотрит, но никогда не готовит)',
 };

@@ -12,8 +12,9 @@
 //   features    the 75 ids; positional templates ({0} is the English entry's {n:a-b}); a nominative phrase each, since
 //               the client lists them and the log may name one
 //   letters     exactly 15 letters (../gen.js draws an index). Index-aligned with the English 'ABCDEKMNPRSTVXZ' where
-//               Russian has the same letter (A→А, B→Б, D→Д, E→Е, K→К, …, V→В, X→Х, Z→З; C→Л), so «Объект 245-К» stays
-//               «Object 245-K» when a player switches language
+//               Russian has the same letter (A→А, B→Б, D→Д, E→Е, K→К, …, V→В, X→Х; C→Л, Z→Ж), so «Объект 245-К»
+//               stays «Object 245-K» when a player switches language. Z is «Ж», not «З»: «412-З» reads as "412-3"
+//               (i18n QA, defect 3), so a letter that passes for a digit (З, О) is not used
 //   name        named params; a bunker name is a nominative phrase, never inflected (§10.3 rule 6); «№ 42» with a
 //               no-break space
 //   size, duration, food, months(), range()
@@ -30,13 +31,13 @@ const YEAR = ['год', 'года', 'лет'];
  */
 function months(v, f) {
   const { m } = v;
-  if (m < 12) return `${f.num(m)} ${f.pl(m, MONTH)}`;
+  if (m < 12) return `${f.num(m)}\u00a0${f.pl(m, MONTH)}`;
   const y = Math.floor(m / 12);
   const rest = m % 12;
-  if (rest === 0) return `${f.num(y)} ${f.pl(y, YEAR)}`;
+  if (rest === 0) return `${f.num(y)}\u00a0${f.pl(y, YEAR)}`;
   // A half year: «1,5 года», «2,5 года» (a fraction takes the few form, §7).
-  if (rest === 6) return `${f.num(y + 0.5)} ${f.pl(y + 0.5, YEAR)}`;
-  return `${f.num(y)} ${f.pl(y, YEAR)} ${f.num(rest)} ${f.pl(rest, MONTH)}`;
+  if (rest === 6) return `${f.num(y + 0.5)}\u00a0${f.pl(y + 0.5, YEAR)}`;
+  return `${f.num(y)}\u00a0${f.pl(y, YEAR)} ${f.num(rest)}\u00a0${f.pl(rest, MONTH)}`;
 }
 
 /**
@@ -52,9 +53,9 @@ function months(v, f) {
 function range(v, f) {
   const { lo, hi } = v;
   if (lo >= 12 && lo % 6 === 0 && hi % 6 === 0) {
-    return `${f.num(lo / 12)}–${f.num(hi / 12)} ${f.pl(hi / 12, YEAR)}`;
+    return `${f.num(lo / 12)}–\u2060${f.num(hi / 12)}\u00a0${f.pl(hi / 12, YEAR)}`;
   }
-  return `${f.num(lo)}–${f.num(hi)} ${f.pl(hi, MONTH)}`;
+  return `${f.num(lo)}–\u2060${f.num(hi)}\u00a0${f.pl(hi, MONTH)}`;
 }
 
 export const COMPLETE = true;
@@ -97,21 +98,21 @@ export default {
   features: {
     'medical-bay-with-an-operating': 'Медблок с операционным столом',
     'hydroponic-farm-the-water-pump': 'Гидропонная ферма (водяной насос сломан)',
-    'armory-with-rifles-but-no': 'Оружейная: {0} {0|винтовка|винтовки|винтовок} и ни одного патрона',
+    'armory-with-rifles-but-no': 'Оружейная: {0}\u00a0{0|винтовка|винтовки|винтовок} и ни одного патрона',
     'well-with-a-hand-pump-and-clean': 'Колодец с ручным насосом и чистой водой',
     'workshop-with-power-tools': 'Мастерская с электроинструментом',
-    'library-of-books-mostly-romance': 'Библиотека: {0} {0|книга|книги|книг}, в основном любовные романы',
+    'library-of-books-mostly-romance': 'Библиотека: {0}\u00a0{0|книга|книги|книг}, в основном любовные романы',
     'radio-room-it-can-receive-but': 'Радиорубка (принимает, но не передаёт)',
     'greenhouse-with-grow-lamps': 'Теплица с фитолампами',
-    'diesel-generator-fuel-for-months': 'Дизельный генератор (топлива на {0} {0|месяц|месяца|месяцев})',
+    'diesel-generator-fuel-for-months': 'Дизельный генератор (топлива на {0}\u00a0{0|месяц|месяца|месяцев})',
     'solar-panels-on-a-hidden-mast': 'Солнечные панели на замаскированной мачте',
-    'chicken-coop-with-hens-and-a': 'Курятник: {0} {0|несушка|несушки|несушек} и петух',
+    'chicken-coop-with-hens-and-a': 'Курятник: {0}\u00a0{0|несушка|несушки|несушек} и петух',
     'rabbit-hutch-they-are': 'Крольчатник (кролики плодятся с пугающей скоростью)',
     'mushroom-cellar': 'Грибной погреб',
     'water-purification-station': 'Станция очистки воды',
     'gym-with-a-single-treadmill': 'Спортзал с единственной беговой дорожкой',
     'sauna': 'Сауна',
-    'home-cinema-with-dvds': 'Домашний кинотеатр: {0} {0|диск|диска|дисков} с фильмами',
+    'home-cinema-with-dvds': 'Домашний кинотеатр: {0}\u00a0{0|диск|диска|дисков} с фильмами',
     'childrens-playroom-full-of-toys': 'Детская комната, заваленная игрушками',
     'small-chapel': 'Маленькая часовня',
     'bar-with-a-well-stocked-wine': 'Бар с богатым винным погребом',
@@ -119,9 +120,9 @@ export default {
     'pharmacy-cabinet-everything-in': 'Аптечный шкаф (всё в нём давно просрочено)',
     'dentists-chair-and-tools-no': 'Стоматологическое кресло и инструменты (стоматолог в комплект не входит)',
     'maternity-room-with-an-incubator': 'Родильная палата с инкубатором для новорождённых',
-    'seed-vault-with-plant-varieties': 'Семенное хранилище: {0} {0|сорт|сорта|сортов} растений',
+    'seed-vault-with-plant-varieties': 'Семенное хранилище: {0}\u00a0{0|сорт|сорта|сортов} растений',
     'fish-farm-tank-with-tilapia': 'Рыбоводный бассейн с тилапией',
-    'air-filtration-system-spare': 'Система фильтрации воздуха (запасных фильтров на {0} {0|месяц|месяца|месяцев})',
+    'air-filtration-system-spare': 'Система фильтрации воздуха (запасных фильтров на {0}\u00a0{0|месяц|месяца|месяцев})',
     'periscope-camera-for-watching': 'Камера-перископ для наблюдения за поверхностью',
     'decontamination-airlock-with': 'Камера дезактивации с душевыми',
     'emergency-exit-through-the-old': 'Запасной выход через старые канализационные тоннели',
@@ -140,9 +141,9 @@ export default {
     'isolation-cell-that-locks-from': 'Изолятор, который запирается снаружи',
     'weather-station-on-the-surface': 'Метеостанция на поверхности',
     'satellite-dish-needs-repair': 'Спутниковая тарелка (требует ремонта)',
-    'camera-drone-with-batteries': 'Дрон с камерой и {0} {0|аккумулятор|аккумулятора|аккумуляторов} к нему',
+    'camera-drone-with-batteries': 'Дрон с камерой и {0}\u00a0{0|аккумулятор|аккумулятора|аккумуляторов} к нему',
     'out-of-tune-piano': 'Расстроенное пианино',
-    'kg-of-salt-in-the-pantry': '{0} кг соли в кладовой',
+    'kg-of-salt-in-the-pantry': '{0}\u00a0кг соли в кладовой',
     'karaoke-machine-that-cannot-be': 'Караоке, которое невозможно выключить',
     'tunnel-to-a-neighboring-bunker': 'Туннель в соседний бункер (там кто-то живёт)',
     'geothermal-heating': 'Геотермальное отопление',
@@ -154,13 +155,13 @@ export default {
     'sewing-room-with-bolts-of-fabric': 'Швейная мастерская с рулонами ткани',
     'stable-with-two-goats-one-of': 'Хлев с двумя козами (одна из них беременна)',
     'beehive-in-the-greenhouse': 'Улей в теплице',
-    'radiation-suits': '{0} {0|костюм|костюма|костюмов} радиационной защиты',
+    'radiation-suits': '{0}\u00a0{0|костюм|костюма|костюмов} радиационной защиты',
     'morgue-cold-and-empty-for-now': 'Морг (холодный и пока пустой)',
     'terrarium-of-venomous-snakes': 'Террариум с ядовитыми змеями, от которых никак не избавиться',
     'wall-map-of-the-region-with': 'Настенная карта района, на которой отмечены тайники с припасами',
     'computer-with-a-chess-program': 'Компьютер с шахматной программой — и больше ничего',
     'bunker-ai-that-runs-the-systems': 'ИИ бункера, который управляет всеми системами (и слегка язвит)',
-    'hidden-stash-of-bottles-of-vodka': 'Заначка: {0} {0|бутылка|бутылки|бутылок} водки',
+    'hidden-stash-of-bottles-of-vodka': 'Заначка: {0}\u00a0{0|бутылка|бутылки|бутылок} водки',
     'weevils-in-the-flour-stores': 'Долгоносики в запасах муки',
     'micro-nuclear-reactor-the-manual': 'Ядерный микрореактор (инструкции нет)',
     'aquarium-with-ornamental-fish': 'Аквариум с декоративными рыбками',
@@ -172,16 +173,16 @@ export default {
     'hidden-storeroom': 'Потайная кладовая',
   },
   // «Объект {n}-{letter}»: 15 letters, index-aligned with English (see the header).
-  letters: 'АБЛДЕКМНПРСТВХЗ',
+  letters: 'АБЛДЕКМНПРСТВХЖ',
   // {nick}: a nickname above; {n}: a number (shelter 2..99, object 10..999); {letter}: a letter above.
   name: {
     nick: 'Бункер «{nick}»',
     shelter: 'Убежище № {n}',
-    object: 'Объект {n}-{letter} «{nick}»',
+    object: 'Объект {n}\u2011{letter} «{nick}»',
     fallback: 'Бункер',
   },
   // {n}: square meters, 60..300.
-  size: '{n} м²',
+  size: '{n}\u00a0м²',
   // {months}: months() above. The client shows them as «… · 120 м² · Сидеть под землёй 2 года · Еды на 1 год».
   duration: 'Сидеть под землёй {months}',
   food: 'Еды на {months}',

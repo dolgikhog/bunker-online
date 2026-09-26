@@ -19,11 +19,11 @@ export default {
   },
   // pregnant: female only (../gen.js), so one string.
   notes: {
-    'pregnant': 'беременна ({0} {0|месяц|месяца|месяцев})',
+    'pregnant': 'беременна ({0}\u00a0{0|месяц|месяца|месяцев})',
     'twin': 'из двойни',
     'left-handed': 'левша',
-    'very-tall': { f: 'очень высокая ({0} см)', m: 'очень высокий ({0} см)' },
-    'short': { f: 'невысокая ({0} см)', m: 'невысокий ({0} см)' },
+    'very-tall': { f: 'очень высокая ({0}\u00a0см)', m: 'очень высокий ({0}\u00a0см)' },
+    'short': { f: 'невысокая ({0}\u00a0см)', m: 'невысокий ({0}\u00a0см)' },
     'one-child': 'есть ребёнок',
     'children': '{0:||двое|трое|четверо|пятеро} детей',
     'adopted': 'из приёмной семьи',
@@ -38,5 +38,5 @@ export default {
    * @param {object} f  formatter helpers (public/i18n/core.js helpers()): f.num, f.pl, f.opt, f.list, f.text
    * @returns {string}
    */
-  card: (v, f) => `${v.sexText}, ${f.num(v.age)} ${f.pl(v.age, 'год', 'года', 'лет')}, ${v.oText}${v.noteText ? `, ${v.noteText}` : ''}`,
+  card: (v, f) => `${v.sexText}, ${f.num(v.age)}\u00a0${f.pl(v.age, 'год', 'года', 'лет')}, ${v.oText}${v.noteText ? `, ${v.noteText}` : ''}`,
 };

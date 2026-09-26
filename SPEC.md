@@ -553,6 +553,12 @@ every `error` now carries a `code` and one new code (`replaced`) exists; no §0 
   `index.html` is `no-store`, other files `no-cache`; the exact §9 CSP plus `nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`. WebSocket upgrades only on `/ws` (else 404); the per-IP cap answers 429; a 30 s ping/pong
   heartbeat drops dead sockets.
+- S9 §9 static (2026-09-26, "the audio is not playing on the test build"): files answer byte ranges like the production
+  proxy does, since Safari and every iOS browser play no media without them and Chrome cannot seek. `Accept-Ranges: bytes`
+  on every file; a GET with one range (`a-b`, `a-`, `-n`) → 206 with `Content-Range`; a malformed `bytes` range, one past
+  the end, or `-0` → 416 with `Content-Range: bytes */size`; several ranges or another unit → 200, the whole file
+  (multipart is not implemented); HEAD ignores Range; an `If-Range` other than the file's `Last-Modified` → 200. Every
+  S8 rule and header holds for 206 and 416 too (`test/static.test.js`).
 
 **2026-09-24, tests.** What the simulations and tools rely on; no protocol change.
 - T1 §7 ordering: each socket's messages are handled in order, and every `state` a message causes is sent before the reply to
@@ -1393,12 +1399,13 @@ This folds the "Spec deltas" of every report of the X5 build: `i18n-server-A1/A2
     - Every label entry needs all seven forms.
     - `word.airlock` must equal the Airlock's title in lower case, and `fmt.quote` must be `«{title}»`.
     - A printed `yrs` param carries its own plural word, so it is exempt from the plural lint.
-  - **The gender review list** is `<out>/gender-review.txt` (default `.scratch/i18n-qa/`).
+  - **The gender review list** is `test/fixtures/i18n-gender-review.txt`, tracked (`--review <file>` points elsewhere;
+    `--out <dir>`, default `.scratch/i18n-qa/`, now only takes the sample sheet `ru-sample.txt`).
     - Each line is `mark<TAB>area<TAB>file<TAB>key<TAB>words<TAB>text`. The mark is `?`, `ok` or `fix`, and it is kept
-      across runs.
-    - `--gate` needs every line `ok`. `npm test` never writes the file.
-    - `.scratch/` is git-ignored, so `--gate` passes only where QA's marked file is. Moving the marks into the
-      repository is an open point.
+      across runs. A line is known by file, key and text, with every run of spaces (no-break ones too) read as one
+      space, so a changed text comes back as `?`.
+    - `npm run i18n:check` rewrites the file (only when it changes). `--gate` needs every line `ok`, and so does
+      `npm test` (`test/i18n-catalog.test.js`), which never writes the file. A fresh clone passes `--gate`.
     - It covers messages and client strings that name a player or «ты», plus cards and specials. Catastrophe narratives
       and bunker features are left out.
 - **X5.12 Russian as written (X5.6).** The glossary in report §10 still applies, with these changes.
@@ -1437,7 +1444,8 @@ This folds the "Spec deltas" of every report of the X5 build: `i18n-server-A1/A2
     - The forecast is a single-unit range after «через»: «через 2–6 лет», «через 1,5–5 лет», «через 6–24 месяца».
     - The lines are «Сидеть под землёй {months}» and «Еды на {months}». `months()` gives «1,5 года» or «1 год 3
       месяца».
-    - The object letters are 'АБЛДЕКМНПРСТВХЗ', index-aligned with the English ones.
+    - The object letters are 'АБЛДЕКМНПРСТВХЖ', index-aligned with the English ones. Z is «Ж», not «З», which reads as
+      the digit 3 («412-З»): a letter that passes for a digit is not used.
     - Units outside §7's invariable list (м, л, шт.) are spelled out with a plural selector.
   - **Brand and typography.**
     - The brand in running text and `app.title` is «Бункер онлайн» (sentence case).
@@ -1445,7 +1453,13 @@ This folds the "Spec deltas" of every report of the X5 build: `i18n-server-A1/A2
     - A number and its unit in a short UI hint are joined by a no-break space («60 с»).
     - The room-code hint says the code is 4 Latin letters and that Russian look-alikes work too.
   - **The gender review list** had 8 lines. QA marked all of them ok: each word agrees with a noun, not a player, and
-    «Вернулся из леса» is the owner's title, only ever a quoted card name.
+    «Вернулся из леса» is the owner's title, only ever a quoted card name. The merge of the sound seat (PR #2) added a
+    9th, `narr.tableOther`, marked ok: its «англ.» is the abbreviation in «Слушать (англ.)», not a verb.
+  - **No-break characters** (after QA, written as `\u00a0`, `\u2060`, `\u2011` escapes in the sources): a printed
+    number and the word it counts (`{n}\u00a0{n|игрок|…}`, months(), range(), the Biology age, «60 с», «12 кг»); a
+    noun and the number after it («раунд 7», «тур 1 из 2», «ход 3 из 8», «с раунда 2»); a word joiner after the en
+    dash of a range («4–16 игроков» on the landing footer, in both languages; range(), `est.range`); and a no-break
+    hyphen in «Объект 412-Ж».
 - **X5.13 Client (X5.7).**
   - **Where the switch sits.**
     - On the landing page it has its own row above the brand.
@@ -1491,7 +1505,8 @@ This folds the "Spec deltas" of every report of the X5 build: `i18n-server-A1/A2
   - **Modules and keys.**
     - `public/i18n/index.js` has `initLang({memory, storageKey})`, `setLang(l, {store})`, `saveLang`, `langStorageKey`,
       `pickLang`, `has` and `latinCode` (the look-alike map).
-    - There are 848 client keys. `public/strings.js` is gone: its strings are now `landing.profile*` and `fb.*`.
+    - There are 848 client keys (851 after the merge of PR #2's `narr.table*`). `public/strings.js` is gone: its strings
+      are now `landing.profile*`, `fb.*` and `narr.table*`.
     - Keys beyond the report's inventory include `track.otShort`, `hdr.timeUp`, `lang.switch`, `toast.whyOffline`,
       `toast.whyHandover` and `final.causeLine`.
     - The kicked notice uses `landing.kicked` and `landing.kickedPlain`. The server's `reason` is never shown.
@@ -1550,6 +1565,43 @@ This folds the "Spec deltas" of every report of the X5 build: `i18n-server-A1/A2
     - the «изгнан» / «остался в лесу» deviation;
     - the display font on a real iPhone.
 
+### X5.15: WebSocket compression (permessage-deflate), measured and left off (2026-09-26, ws-compression; detail in reports/ws-compression.md)
+
+- **The question.** A Russian state at 16 players + 50 spectators is up to 120 KB (X5.10), and every recipient gets one
+  after every change: up to 7.9 MB per broadcast, and about 29 MB per member over a game. The production VPS has one
+  vCPU. Browsers offer permessage-deflate (RFC 7692) on every WebSocket, and Caddy passes the offer through (not checked
+  on the box).
+- **Measured** with `taskset -c 0 node tools/bench-broadcast.js` (one core; the all-RU and the mixed table; the
+  full-log point and the final):
+  - **bytes:** 5.1–5.5× fewer. A RU final goes from 119.7 KB to 23 KB per recipient, and a RU player's whole game from
+    29 MB to 5.5 MB;
+  - **CPU per broadcast:** 51–65 ms against pre-X5's 15–17 ms, so 3.2–3.9×. The X5.2 budget is at most 1×. zlib level
+    1 is already the fastest, and no setting came near the budget (report, tuning table);
+  - **memory:** the deflater takes about 180–200 KB of RSS per socket, from the first message it compresses; the
+    socket and its inflater take about 20 KB more than a plain socket.
+- **Decision: off by default** (`server/index.js` `WS_DEFLATE_DEFAULT = false`). `BUNKER_WS_DEFLATE=1` turns it on
+  with `WS_DEFLATE`, and `=0` turns it off. With it on, the bench gates the deflate CPU too, so the owner can trade CPU
+  for bytes only knowingly.
+- **`WS_DEFLATE`:**
+  - zlib level 1 and memLevel 8;
+  - `server_no_context_takeover`: every message is compressed on its own. The `joined` token never shares a window
+    with other people's names, and messages under 1 KB (`threshold`) are sent as they are;
+  - no window-bits parameters, so every browser offer is accepted as made;
+  - ws's `concurrencyLimit` of 10.
+
+  `MAX_PAYLOAD` still bounds a client message after inflating: such a message closes the socket with 1009.
+- **Tools and tests.**
+  - The bench also times the X5 broadcast over deflate sockets, in a loop of its own. It reports the bytes on the wire
+    for every kind, a member's whole game compressed, and the memory per socket. Options: `--deflate off` and
+    `--z-*`.
+  - `test/ws-deflate.test.js` covers the switch, the wire (RSV1, a fresh inflater for each message, the 1009), and a
+    whole game over negotiated sockets.
+  - The e2e records every page's `Sec-WebSocket-Extensions` and checks it against the spawned server's setting. Run
+    it with `BUNKER_WS_DEFLATE=1` to play the whole run over deflate in Chrome.
+- **Not built.** Compressing the shared log once per language and only the head per recipient. The prototype spent
+  12–17 ms of zlib per broadcast instead of 34–38 ms, which is still about 2× pre-X5 with the sockets. It would also
+  need ws internals to send a frame that is already compressed. A smaller state (deltas) is the real lever on bytes.
+
 ### X9: local test build, profiles and a dev test table with shortcuts (2026-09-26, owner request)
 
 The owner tests alone in one browser. Every incognito window shares one storage, so every tab became the same player.
@@ -1571,6 +1623,7 @@ The owner tests alone in one browser. Every incognito window shares one storage,
 - **Add bots** (count): in-process server bots join using `tools/botlib.js`.
 - **Start, Fast timers** (5/5/5/5 s), and **Seed**: in dev mode, `create` accepts `seed` so the deal is reproducible.
 - **Open seat in a new tab,** and **Focus a seat** to enlarge one frame.
+- **🔊 Sound** (2026-09-26): the narrator's sound goes to **one** seat, since all the seats would read the catastrophe at once, and each profile's own switch starts off. Auto (the default) is the focused seat or open tab, else P1, and it never moves in the middle of a clip (a Focus or a tab switch right after the Start would stop the narration: the seat that reads keeps the sound until its clip ends); or a fixed seat; or Off. That seat plays at Start as if its switch were on, without changing the switch its profile saved. The other seats stay silent, and a seat that loses the sound stops its clip. ▶ Listen or the switch in another seat moves the sound there. The seat frames carry `allow="autoplay"`, so a click on the table counts as the gesture browsers want.
 - **The shortcuts below as buttons,** with a target-player dropdown fed by the host frame's `window.__bunkerState`.
 
 **4. Dev ops:** `{t:'dev', op, ...}`. Any member of the room may send them, but only in dev mode, and each one is logged in the game log as `[dev] …`.
@@ -1590,7 +1643,7 @@ The owner tests alone in one browser. Every incognito window shares one storage,
 **6. Tests**
 - `?profile` isolation in the e2e: two tabs in one browser context are two players.
 - `/dev` and `/devinfo` return 404 without dev mode, and dev ops are rejected.
-- A puppeteer smoke of the test table: 4 seats, a new game, bots, start, `giveSpecial airlock` to P1 and P2, both play it on P3, P3 is ejected, then `skipToVote`, `forceTie`, and the god view.
+- A puppeteer smoke of the test table: 4 seats, a new game, bots, start, `giveSpecial airlock` to P1 and P2, both play it on P3, P3 is ejected, then `skipToVote`, `forceTie`, and the god view. Then the sound, under Chrome's real autoplay policy: one seat reads the catastrophe at Start, and ▶ Listen and the switch move it.
 
 ### X9.7: the test build as built (2026-09-26; devtools-server D1–D15, devtools-client, gate-devtools, and the X5 build; folded by i18n-qa)
 
@@ -1682,6 +1735,10 @@ The owner tests alone in one browser. Every incognito window shares one storage,
     - The controls column hides (`dev-ctl-toggle`), and its log is pinned under the controls.
     - Op buttons are enabled only in their phases, with the reason in their tooltip.
     - A dev-log error from a non-English seat is tagged with that seat's language.
+    - **🔊 Sound** (X9.3, merged with X5): the /dev control, its top-bar status and the seat badges are English like
+      the rest of the page. The note in a seat's own narrator popover («Тестовый стол: звук у места P2…») is the
+      seat's client, so it is translated: `narr.tableOn`, `narr.tableOther` ({who} = the seat's name) and
+      `narr.tableOff` in `public/i18n/{en,ru}.js` (they were `public/strings.js` narrTable*).
 - **X10 as built.**
   - New test ids: `header-menu-btn`, `header-menu` and `profile-tag`.
   - The links and the version carry `data-where` (`landing`, `menu`, `rules` or `final`).

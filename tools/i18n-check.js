@@ -5,9 +5,12 @@
 //   npm run i18n:check                 check everything; exit 1 on any error
 //   node tools/i18n-check.js --gate    the release gate (§13): also every Russian file COMPLETE and the gender review
 //                                      list fully marked, with no line marked fix
-//   options: --out <dir>   where the gender review list and the sample sheet go (default .scratch/i18n-qa)
-//            --no-write    write nothing          --json   print the result as JSON
-//            --quiet       only the summary and the errors (not the missing entries)
+//   options: --review <file>  the gender review list with QA's marks, read by --gate and rewritten (marks kept) on
+//                             every run (default test/fixtures/i18n-gender-review.txt: tracked, so a fresh clone
+//                             passes --gate, and a new or changed line shows up in the diff marked ?)
+//            --out <dir>      where the sample sheet ru-sample.txt goes (default .scratch/i18n-qa)
+//            --no-write       write nothing          --json   print the result as JSON
+//            --quiet          only the summary and the errors (not the missing entries)
 //
 // Three catalogues, each English and Russian: the content (server/content/{en,ru}/*.js, 13 files), the server
 // messages (server/i18n/{en,ru}.js, whose index.js SCHEMA types every param) and the client dictionary
@@ -28,7 +31,8 @@
 //     the params supply (player names, room codes), no bracketed gender form, and year/month/player/bed words that
 //     agree with the number before them;
 //   - the gender lint: `(а)`, `(ла)`, `(ась)`, `(ая)`, `(на)`, `(ен)` fail; a past tense or short participle near a
-//     player or «ты», and in any card, goes to the review list (<out>/gender-review.txt) that QA marks ok or fix;
+//     player or «ты», and in any card, goes to the review list (test/fixtures/i18n-gender-review.txt) that QA marks ok
+//     or fix;
 //   - the glossary (§10.1): the category labels and their case forms; «Шлюз» and «Вернулся из леса»; every client
 //     string that names a special in English names it in Russian; the server's and the client's labels agree.
 // A render that depends on a Russian entry still missing elsewhere (a nested message, a category label) is not
@@ -39,6 +43,8 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+/** The gender review list with QA's marks, relative to the root: tracked, so --gate needs no local file. */
+export const REVIEW_FILE = 'test/fixtures/i18n-gender-review.txt';
 
 // ---- the rules' data ------------------------------------------------------------------------------------------------
 
@@ -1265,7 +1271,9 @@ export async function load(root = ROOT) {
   return out;
 }
 
-const reviewId = (r) => `${r.file}\t${r.key}\t${r.text.replace(/\s+/g, ' ')}`;
+/** A review line's identity, which its mark is kept under: file, key and the text (any run of spaces, no-break ones
+ * included, as one space). A changed text is a new line, marked ? again. */
+export const reviewId = (r) => `${r.file}\t${r.key}\t${r.text.replace(/\s+/g, ' ')}`;
 
 /** Reads the marks of an existing review list: id -> 'ok' | 'fix'. */
 export function readMarks(file) {
@@ -1284,17 +1292,18 @@ function reviewText(reviews, marks) {
     '# Gender review list (reports/i18n-design.md §11): every Russian string with a player or «ты» and a word that looks',
     '# like a past tense or a short participle, and every card or special with such a word. Mark the first column ok or',
     '# fix (tab-separated; the checker keeps the marks when it rewrites this file). The release gate needs every line',
-    '# marked and none marked fix.',
+    '# marked and none marked fix. This file is tracked (tools/i18n-check.js REVIEW_FILE): `npm run i18n:check` rewrites',
+    '# it, and a new or changed line comes back marked ?; `npm test` fails until every line is marked ok.',
     '# mark\tarea\tfile\tkey\twords\ttext',
   ];
   return `${[...head, ...reviews.map((r) => `${marks.get(reviewId(r)) ?? '?'}\t${r.area}\t${r.file}\t${r.key}\t${r.words.join(' ')}\t${r.text.replace(/\s+/g, ' ')}`)].join('\n')}\n`;
 }
 
 /**
- * The whole check: {problems, reviews, samples, notes, stats, ok}. `gate`: the release gate's extra rules. `out`: the
- * directory with gender-review.txt (its marks are read for the gate).
+ * The whole check: {problems, reviews, samples, notes, stats, ok}. `gate`: the release gate's extra rules. `review`:
+ * the gender review list whose marks the gate reads (default REVIEW_FILE under `root`).
  */
-export async function check({ root = ROOT, gate = false, out = path.join(ROOT, '.scratch/i18n-qa') } = {}) {
+export async function check({ root = ROOT, gate = false, review = path.join(root, REVIEW_FILE) } = {}) {
   const L = await load(root);
   const rep = new Report();
   for (const n of L.notes) rep.note(n);
@@ -1307,7 +1316,7 @@ export async function check({ root = ROOT, gate = false, out = path.join(ROOT, '
     for (const [f, c] of Object.entries(L.C.COMPLETE)) if (!c) rep.error('gate', `server/content/ru/${f}.js`, '', 'complete', 'not COMPLETE');
     if (!L.M || !L.M.COMPLETE) rep.error('gate', 'server/i18n/ru.js', '', 'complete', 'not COMPLETE');
     if (!L.K || !L.K.COMPLETE) rep.error('gate', 'public/i18n/ru.js', '', 'complete', 'not COMPLETE');
-    const marks = readMarks(path.join(out, 'gender-review.txt'));
+    const marks = readMarks(review);
     for (const r of rep.reviews) {
       const m = marks.get(reviewId(r));
       if (m !== 'ok') rep.error('gate', r.file, r.key, 'review', m === 'fix' ? 'marked fix in the gender review list' : 'not marked in the gender review list');
@@ -1317,11 +1326,15 @@ export async function check({ root = ROOT, gate = false, out = path.join(ROOT, '
   return { problems: rep.problems, errors, reviews: rep.reviews, samples: rep.samples, notes: rep.notes, stats: rep.stats, ok: errors.length === 0 };
 }
 
-/** Writes <out>/gender-review.txt (keeping QA's marks) and <out>/ru-sample.txt. */
-export function write(result, out) {
+/**
+ * Writes the gender review list to `reviewFile` (default <out>/gender-review.txt), keeping QA's marks, and
+ * <out>/ru-sample.txt. The file is rewritten only when its text changes.
+ */
+export function write(result, out, reviewFile = path.join(out, 'gender-review.txt')) {
   fs.mkdirSync(out, { recursive: true });
-  const reviewFile = path.join(out, 'gender-review.txt');
-  fs.writeFileSync(reviewFile, reviewText(result.reviews, readMarks(reviewFile)));
+  fs.mkdirSync(path.dirname(reviewFile), { recursive: true });
+  const text = reviewText(result.reviews, readMarks(reviewFile));
+  if (!fs.existsSync(reviewFile) || fs.readFileSync(reviewFile, 'utf8') !== text) fs.writeFileSync(reviewFile, text);
   fs.writeFileSync(path.join(out, 'ru-sample.txt'), `# Russian as rendered today (section, key, English, Russian); written by tools/i18n-check.js\n${result.samples.join('\n')}\n`);
   return [reviewFile, path.join(out, 'ru-sample.txt')];
 }
@@ -1347,7 +1360,9 @@ async function main(argv) {
   const has = (f) => argv.includes(f);
   const at = argv.indexOf('--out');
   const out = at >= 0 && argv[at + 1] ? path.resolve(argv[at + 1]) : path.join(ROOT, '.scratch/i18n-qa');
-  const result = await check({ gate: has('--gate'), out });
+  const rat = argv.indexOf('--review');
+  const review = rat >= 0 && argv[rat + 1] ? path.resolve(argv[rat + 1]) : path.join(ROOT, REVIEW_FILE);
+  const result = await check({ gate: has('--gate'), review });
   if (has('--json')) {
     process.stdout.write(`${JSON.stringify({ ok: result.ok, stats: result.stats, notes: result.notes, problems: result.problems, reviews: result.reviews.length }, null, 2)}\n`);
   } else {
@@ -1363,7 +1378,7 @@ async function main(argv) {
     console.log(`${result.errors.length} error(s), ${missing.length} missing, ${result.reviews.length} line(s) in the gender review list`);
   }
   if (!has('--no-write')) {
-    const files = write(result, out);
+    const files = write(result, out, review);
     if (!has('--json')) console.log(`wrote ${files.map((f) => path.relative(process.cwd(), f)).join(', ')}`);
   }
   return result.ok ? 0 : 1;

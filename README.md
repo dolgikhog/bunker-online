@@ -276,6 +276,8 @@ expose a dev server publicly**: dev mode refuses to start next to `BUNKER_TRUST_
 - **What it shows:** 2–16 seats side by side, each a real client with its own profile. **New test game** seats P1…PN
   automatically, with an optional **seed** for a reproducible deal.
 - **Controls:** **Add bots**, **Start** and **Fast timers**.
+- **🔊 Sound:** one seat reads the catastrophe at Start (Auto: the focused seat, else P1; a clip that is playing finishes first), whatever its own Narrator
+  switch says; the others stay silent. **▶ Listen** in another seat moves the sound there. Choose **Off** for silence.
 - **Shortcuts:** give any player any special card (e.g. two Airlocks), auto-reveal the round, skip to the next vote,
   force a tie, and **god view** (every hidden card in a table).
 - **Smoke test:** `npm run dev:smoke` runs the table end to end.
@@ -302,6 +304,7 @@ Open `http://localhost:<port>`. `GET /healthz` answers `ok`.
 | `BUNKER_SEED` | random | Seeds the deals, for reproducible tests |
 | `BUNKER_NO_LIMITS` | off | `=1` lifts the rate limits and the per-IP limits. For tests and bots only, **never in production** |
 | `BUNKER_TRUST_PROXY` | off | `=1`: when the TCP peer is loopback, per-IP limits use the last `X-Forwarded-For` entry. Production sets it |
+| `BUNKER_WS_DEFLATE` | off | `=1` compresses the WebSocket messages (permessage-deflate): about 5× fewer bytes, but about 3.5× the CPU per broadcast, so production leaves it off (SPEC §11 X5.15). `=0` turns it off |
 
 CI (`.github/workflows/ci.yml`) runs `npm test` and the e2e run on every pull request and every push to `main`.
 
@@ -317,6 +320,8 @@ Texts live in one place per language (SPEC §11 X5):
 - `public/i18n/core.js` is the shared formatter: plurals, lists and numbers.
 
 A change to an English text needs the same change in Russian. `npm run i18n:check` finds what is missing or broken.
+Russian wording that might be gendered goes to `test/fixtures/i18n-gender-review.txt`, where each line is marked `ok`
+or `fix` by a reviewer; `npm test` and `node tools/i18n-check.js --gate` need every line `ok`.
 
 ### Tests
 | Command | What it runs | Time |
@@ -324,7 +329,7 @@ A change to an English text needs the same change in Russian. `npm run i18n:chec
 | `npm test` | Unit tests plus full-game simulations over real WebSockets, in English, Russian and mixed tables. They spawn their own servers on free ports | ~2 min |
 | `npm run e2e` | A browser end-to-end run: puppeteer-core with `/usr/bin/google-chrome-stable`, a desktop host, a phone player, a spectator and bots. It includes a Russian pass: a mid-game language switch and a Russian late arrival at 360 px. Useful options: `--players 16`, `--headful`, `--slow`, `--url URL` (use a running server), `--screens DIR` (default `reports/screens/e2e`) | ~2–3 min |
 | `npm run i18n:check` | Checks every Russian text against English: keys, placeholders, plurals, no Latin letters, gender-neutral wording. `npm test` runs the same checks | ~1 s |
-| `node tools/bench-broadcast.js` | The broadcast budget at 16 players + 50 spectators: CPU no higher than before X5, and every state ≤ 120 KB | ~45 s |
+| `node tools/bench-broadcast.js` | The broadcast budget at 16 players + 50 spectators: CPU no higher than before X5, and every state ≤ 120 KB. It also times the same broadcast over permessage-deflate and reports the bytes on the wire and the memory per socket (SPEC §11 X5.15). `taskset -c 0` in front of it measures on one core, as on the production VPS | ~45 s (~50 s on one core) |
 
 ### Production
 The live game runs on a small VPS with Ubuntu 24.04. The server's details are kept out of the repository, in

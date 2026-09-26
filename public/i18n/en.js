@@ -58,7 +58,7 @@ export default {
   'landing.step1': 'Get everyone on a voice call (Discord, Telegram…). There is no chat here.',
   'landing.step2': 'One person creates a game and shares the link or the 4-letter code.',
   'landing.step3': 'This page deals the cards, runs the turns and counts the votes.',
-  'landing.footer': 'An online party game in the style of the discussion game “Bunker” («Бункер»). 4–16 players · spectators welcome.',
+  'landing.footer': 'An online party game in the style of the discussion game “Bunker” («Бункер»). 4–\u206016\u00a0players · spectators welcome.',
   'landing.name': 'Your name',
   'landing.namePh': 'e.g. Anna',
   'landing.code': 'Room code',
@@ -927,4 +927,10 @@ export default {
   'narr.pillTitle': 'Listen to the catastrophe',
   'narr.pillSub': '{title} — your browser wants one tap for sound',
   'narr.noThanks': 'No thanks',
+  // a seat of the /dev test table (dev mode only; merged from PR #2, were public/strings.js narrTable*): the table gives
+  // the sound to one seat at a time, and the popover says which (who = a seat's name, P1…P16). The /dev page itself
+  // stays English (X9.3); these are in the seat's own client, so they are translated
+  'narr.tableOn': 'Test table: this seat has the sound. It reads the catastrophe when a game starts.',
+  'narr.tableOther': 'Test table: {who} has the sound. ▶ Listen or the switch here moves it to this seat.',
+  'narr.tableOff': 'Test table: the sound is off. ▶ Listen or the switch here turns it on for this seat.',
 };

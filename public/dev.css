@@ -143,3 +143,11 @@ select.in { padding-right: 4px; }
   .stage { min-height: 70vh; }
   .god-panel { max-height: 60vh; }
 }
+
+/* sound: the one seat that reads the catastrophe (dev.js "sound") */
+.st-snd { margin-left: 6px; color: var(--text-2); }
+.st-snd.is-playing, .st-snd.is-loading { color: var(--green); }
+.st-snd.is-blocked, .st-snd.is-error { color: var(--red); }
+.bdg.snd { color: var(--cyan); border-color: rgba(111, 208, 216, .5); text-transform: none; }
+.bdg.snd.on { color: #0b0b09; background: var(--green); border-color: var(--green); }
+.bdg.snd.blocked { color: var(--red); border-color: rgba(255, 93, 79, .5); }

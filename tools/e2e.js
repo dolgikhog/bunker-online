@@ -13,6 +13,7 @@ import {
   playerById, stepRefOf, validTargets,
 } from './botlib.js';
 import { estimateGame } from '../public/kicks.js';
+import { configFromEnv } from '../server/index.js';
 import { airlockOf, finalCause } from '../public/loglines.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -26,6 +27,8 @@ const HELP = `Bunker Online browser e2e (puppeteer-core + ${CHROME}).
   node tools/e2e.js                                   spawn the server (./public) on a free port and run
   node tools/e2e.js --public-dir clients/a            spawn the server with BUNKER_PUBLIC_DIR=clients/a
   node tools/e2e.js --url http://127.0.0.1:8080       run against a running server
+  BUNKER_WS_DEFLATE=1 node tools/e2e.js               the spawned server offers permessage-deflate (SPEC §11 X5.15);
+                                                      every page's WebSockets must have taken it (without it: none)
 
 Options:
   --url URL          use a running server instead of spawning one
@@ -65,8 +68,10 @@ the host first kicks a bot) and the next game deals them in. Phone layout (X7): 
 the page itself is not scrolled and the action bar ends flush with the bottom of the screen; the final banner is
 brought into view inside the shell on the phone.
 Narrator (public/narrator.js): the phone player turns it on in the lobby; at the start the catastrophe's clip plays on
-that page by itself (Chrome runs with --autoplay-policy=no-user-gesture-required and --mute-audio), the host and the
-spectator (switch off) stay silent, every page shows ▶ Listen, and the reload mid-game does not replay it.
+that page by itself (Chrome keeps its real autoplay policy, only muted: the clicks in the lobby are the gesture), the
+host and the spectator (switch off) stay silent, every page shows ▶ Listen, and the reload mid-game does not replay it.
+The clip is served in byte ranges (Range: bytes=0-1 -> 206, Accept-Ranges: bytes) and is seekable to its end: without
+that, Safari and every iOS browser do not play it.
 Profiles and report links (SPEC §11 X9.1, X10): two tabs of ONE browser context with ?profile=alpha / ?profile=beta join
 one room as two players, each resumes its own seat after a reload, the invite link has no profile, a tab without one
 sees neither seat, and the narrator setting stays per profile. "Report an issue" / "Suggest an idea" are checked on the
@@ -143,7 +148,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const run = {
   server: null, browser: null, bots: [], pages: [], shots: 0, failures: [], warnings: [], consoleErrors: [],
   stats: { hookRereads: 0, hostTurns: 0, bobTurns: 0, hostVotes: 0, bobVotes: 0, defenseTurns: 0, nextClicks: 0, closeVoteClicks: 0, special: null, reload: null, errorToasts: [], sentSteps: {}, twoTap: null, clickThrough: null,
-    estimate: null, popover: null, airlock: null, airlockBadgeChecks: 0, narrator: null, endGame: null, barFlush: 0 },
+    estimate: null, popover: null, airlock: null, airlockBadgeChecks: 0, narrator: null, endGame: null, barFlush: 0, ws: {} },
 };
 
 class StuckError extends Error {}
@@ -261,6 +266,13 @@ async function newPage(context, name, viewport, o = {}) {
     };
   });
   const P = { name, page, viewport, vpName: viewport.width < 600 ? 'mobile' : 'desktop', id: null };
+  // SPEC §11 X5.15: the Sec-WebSocket-Extensions every WebSocket of the page agreed on ('' for none; see wsDeflateCheck)
+  const cdp = await page.createCDPSession();
+  cdp.on('Network.webSocketHandshakeResponseReceived', (e) => {
+    const h = Object.entries((e.response && e.response.headers) || {}).find(([k]) => k.toLowerCase() === 'sec-websocket-extensions');
+    (run.stats.ws[name] ||= []).push(h ? h[1] : '');
+  });
+  await cdp.send('Network.enable');
   page.on('console', (msg) => {
     if (msg.type() !== 'error') return;
     const loc = msg.location() || {};
@@ -1772,8 +1784,9 @@ async function main() {
   }
   run.browser = await puppeteer.launch({
     executablePath: CHROME, headless: !opts.headful, slowMo: SLOW ? 40 : 0, defaultViewport: null,
-    // the narrator's clip plays at the start without a user gesture; muted: media still plays, the speakers stay quiet
-    args: ['--no-first-run', '--no-default-browser-check', '--disable-extensions', '--autoplay-policy=no-user-gesture-required', '--mute-audio'],
+    // the real autoplay policy (no --autoplay-policy override: the narrator must play the way it does for a player, after
+    // the clicks in the lobby); muted: media still plays, the speakers stay quiet
+    args: ['--no-first-run', '--no-default-browser-check', '--disable-extensions', '--mute-audio'],
   });
   const host = await newPage(await run.browser.createBrowserContext(), 'host', DESKTOP);
   const bob = await newPage(await run.browser.createBrowserContext(), 'bob', MOBILE);
@@ -2099,6 +2112,25 @@ async function main() {
   await mockChecks();
   // 11. SPEC §11 X9.1: ?profile= isolation in one browser context
   await profileTest();
+  // 12. SPEC §11 X5.15: permessage-deflate, as the spawned server's BUNKER_WS_DEFLATE says
+  wsDeflateCheck();
+}
+
+/**
+ * SPEC §11 X5.15: Chrome offers permessage-deflate on every WebSocket; a spawned server takes it exactly when its
+ * BUNKER_WS_DEFLATE (this process's environment, passed on) turns it on, always without context takeover. So every
+ * socket a page opened agreed on the same thing, and with deflate on, the whole run above was played over it. A
+ * running server (--url) is only reported.
+ */
+function wsDeflateCheck() {
+  const seen = Object.entries(run.stats.ws);
+  check((run.stats.ws.host || []).length > 0, `the host page's WebSocket handshake was not seen (${JSON.stringify(run.stats.ws)})`);
+  if (!run.server) return;
+  const want = configFromEnv().wsDeflate ? 'permessage-deflate; server_no_context_takeover' : '';
+  for (const [page, list] of seen) {
+    check(list.every((x) => x === want), `${page}: its WebSockets agreed on ${JSON.stringify(list)}, expected ${JSON.stringify(want)} (BUNKER_WS_DEFLATE, SPEC §11 X5.15)`);
+  }
+  log(`WebSockets (SPEC §11 X5.15): ${seen.reduce((n, [, l]) => n + l.length, 0)} handshakes on ${seen.length} pages, all ${JSON.stringify(want)}`);
 }
 
 // SPEC §11 X6: "End game → back to the lobby". The host starts another game; a friend who arrives during it can only
@@ -2598,7 +2630,8 @@ async function checkVoteHold(P) {
 // without it (--public-dir / --url) only gets a warning; the repo's own ./public must have it.
 const narrAudio = (P) => P.page.evaluate(() => {
   const a = document.querySelector('audio[data-testid="narrator-audio"]');
-  return a ? { src: a.getAttribute('src'), paused: a.paused, t: a.currentTime, count: document.querySelectorAll('audio').length } : null;
+  const seekEnd = a && a.seekable.length ? a.seekable.end(a.seekable.length - 1) : 0;
+  return a ? { src: a.getAttribute('src'), paused: a.paused, t: a.currentTime, count: document.querySelectorAll('audio').length, dur: a.duration, seekEnd } : null;
 }).catch(() => null);
 async function narratorLobby(P) {
   const t0 = Date.now();
@@ -2640,6 +2673,16 @@ async function narratorStart(P, others) {
   const a1 = await narrAudio(P);
   const playing = !!a0 && !!a1 && !!a1.src && a1.src.endsWith('/' + clip.src) && !a1.paused && a1.t > a0.t + 0.25;
   check(playing, `${P.name}: narrator on, the game started, but ${clip.src} is not playing by itself (${JSON.stringify({ a0, a1 })})`);
+  // byte ranges: Safari and every iOS browser play media only from a server that answers them (206); Chrome cannot seek
+  // in a clip served whole (its seekable range stays [0, 0])
+  const part = await P.page.evaluate(async (src) => {
+    const r = await fetch(src, { headers: { Range: 'bytes=0-1' }, cache: 'no-store' });
+    const n = (await r.arrayBuffer()).byteLength;
+    return { status: r.status, range: r.headers.get('content-range'), accept: r.headers.get('accept-ranges'), bytes: n };
+  }, clip.src).catch((e) => ({ error: e.message }));
+  check(part.status === 206 && /^bytes 0-1\/\d+$/.test(part.range || '') && part.bytes === 2 && part.accept === 'bytes',
+    `${clip.src} with Range: bytes=0-1 answered ${JSON.stringify(part)}, expected 206, Content-Range bytes 0-1/<size>, 2 bytes, Accept-Ranges: bytes`);
+  check(!!a1 && a1.dur > 0 && a1.seekEnd >= a1.dur - 0.5, `${P.name}: the playing clip is seekable to ${a1 && a1.seekEnd} s of ${a1 && a1.dur} s (the server must answer byte ranges)`);
   const listen = {};
   for (const Q of [P, ...others]) {
     listen[Q.name] = await hookValues(Q, 'narrator-play', 'data-where');
@@ -2651,7 +2694,7 @@ async function narratorStart(P, others) {
     const q = await narrAudio(Q);
     check(!!q && q.paused && !q.src, `${Q.name}: the narrator is off there, but the page has a clip (${JSON.stringify(q)})`);
   }
-  run.stats.narrator = { on: P.name, clip: clip.src, t: a0 && a1 ? [+a0.t.toFixed(2), +a1.t.toFixed(2)] : null, listen, ms: run.stats.narrator.ms + Date.now() - t0 };
+  run.stats.narrator = { on: P.name, clip: clip.src, t: a0 && a1 ? [+a0.t.toFixed(2), +a1.t.toFixed(2)] : null, range: part.status, seekable: a1 ? [+a1.seekEnd.toFixed(1), +(a1.dur || 0).toFixed(1)] : null, listen, ms: run.stats.narrator.ms + Date.now() - t0 };
   log(`narrator: ${JSON.stringify(run.stats.narrator)}`);
 }
 async function reloadTest(P) {

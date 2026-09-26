@@ -385,7 +385,8 @@ export class Checker {
       if (!e || typeof e !== 'object' || !isInt(e.id)) continue;
       if (e.id <= c.logChecked) {
         const was = c.logTexts.get(e.id);
-        if (was !== undefined && was !== e.text && langOf(s) === c.logLang) this.v(`${L}: log entry #${e.id} changed after it was sent: ${short(was)} -> ${short(e.text)}`);
+        if (was === undefined) c.logTexts.set(e.id, e.text); // back in the window after a language switch (below)
+        else if (was !== e.text && langOf(s) === c.logLang) this.v(`${L}: log entry #${e.id} changed after it was sent: ${short(was)} -> ${short(e.text)}`);
         continue;
       }
       c.logTexts.set(e.id, e.text);
@@ -402,9 +403,12 @@ export class Checker {
       }
       if (e.id > max) max = e.id;
     }
-    // a language switch re-renders every entry: its texts are compared from here on in the new language
+    // a language switch re-renders every entry: its texts are compared from here on in the new language. Texts of lines
+    // outside this state's window are forgotten, not kept in the old language: the frame guard (X5.10) moves a window's
+    // start back and forth with the head's size, so a line left off here may come back in the next state
     if (c.logLang !== lang) {
       c.logLang = lang;
+      c.logTexts.clear();
       for (const e of s.log) if (e && isInt(e.id)) c.logTexts.set(e.id, e.text);
     }
     c.logChecked = max;

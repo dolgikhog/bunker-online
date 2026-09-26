@@ -22,7 +22,7 @@ import { validateLogEntry, validateStateView } from './stateview-schema.js';
 import { neutralPublic } from './helpers-sim.js';
 
 const RU_COMPLETE = ruMessages.COMPLETE === true && Object.values(CONTENT_COMPLETE.ru).every(Boolean);
-const NAMES = ['Анна', 'Борис', 'Вера', 'Глеб', 'Дарья', 'Егор', 'Жанна', 'Зоя', 'Иван', 'Кира', 'Лев', 'Мила', 'Нина', 'Олег', 'Пётр', 'Рита',
+const NAMES = ['Анна', 'Борис', 'Вера', 'Глеб', 'Дарья', 'Егор', 'Жанна', 'Зоя', 'Иван', 'Кира', 'Лев', 'Мила', 'Нина', 'Остап', 'Пётр', 'Рита',
   'Соня', 'Тимур', 'Ульяна', 'Фёдор', 'Юля', 'Яков'];
 const ALLOWED = /°C|3D|USB/g;
 const LATIN = /[A-Za-z]/;
