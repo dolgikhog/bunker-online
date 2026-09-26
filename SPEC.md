@@ -1299,3 +1299,65 @@ for r in 1..7:
     - a mixed-language simulation with no violations or leaks;
     - the e2e RU pass: an atomic switch that changes only that page, the game goes on, the choice persists and the
       narrator clip is not cut off; a RU first visit with no Latin and the bar flush at 360×640.
+
+### X9: local test build, profiles and a dev test table with shortcuts (2026-09-26, owner request)
+
+The owner tests alone in one browser. Every incognito window shares one storage, so every tab became the same player.
+
+**1. `?profile=<id>`** (1–16 characters from `[a-z0-9_-]`) works in **every** build, production included.
+- It namespaces **every** storage key the client uses: identity, narrator settings, language, UI preferences, everything. Tabs with different profiles are independent players in one browser.
+- The profile carries across in-app URL changes.
+- The **copyable join link never includes it**. The landing page shows a small "Profile: X" tag when one is set.
+
+**2. Dev mode.** It is on only when the environment sets `BUNKER_DEV=1`. **Production never sets it.**
+- `npm run dev` runs `BUNKER_DEV=1 BUNKER_MIN_PLAYERS=2 PORT=8081 HOST=0.0.0.0 node server/index.js`.
+- On start the server prints an unmistakable `*** DEV MODE — test shortcuts enabled, never expose publicly ***` line.
+- In dev mode, `GET /devinfo` returns `{"dev":true}`. Without dev mode it and every other dev route return 404.
+- A test proves that every dev op is rejected (`not_allowed`) without the flag.
+
+**3. The test table at `/dev`,** served only in dev mode. It is English-only (a tool, exempt from i18n). One page shows N human seats side by side, each an `<iframe>` of the normal client with `?profile=pK`. Controls:
+- **Humans:** 2–16, default 4. **Layout:** a grid of phone-sized frames scaled to fit, or tabs.
+- **New test game:** seat 1 creates the room as host (named P1), and seats 2..N auto-join as P2..PN. Seat K's frame URL is `/?room=CODE&name=PK&profile=pK&autojoin=1`; the client honours `autojoin` **only** when `/devinfo` says dev.
+- **Add bots** (count): in-process server bots join using `tools/botlib.js`.
+- **Start, Fast timers** (5/5/5/5 s), and **Seed**: in dev mode, `create` accepts `seed` so the deal is reproducible.
+- **Open seat in a new tab,** and **Focus a seat** to enlarge one frame.
+- **The shortcuts below as buttons,** with a target-player dropdown fed by the host frame's `window.__bunkerState`.
+
+**4. Dev ops:** `{t:'dev', op, ...}`. Any member of the room may send them, but only in dev mode, and each one is logged in the game log as `[dev] …`.
+
+| op | params | effect |
+|---|---|---|
+| `giveSpecial` | `playerId, effect` | Replaces one unused special of that player with a card of that effect (any §5/X1 effect, including `airlock` and `revive`). The player gets 2 unused cards if they have fewer |
+| `autoReveal` | – | Finishes the current reveal phase: every remaining speaker auto-reveals and ends their turn |
+| `skipToVote` | – | Fast-forwards to the **next vote step**, auto-playing reveals and discussions of rounds with no kicks. If the current round has kicks, it goes straight to its vote. Open airlocks expire normally |
+| `forceTie` | `ids: [a, b, ...]` (≥ 2 candidates) | In an open main ballot, rewrites the votes so that those players tie for most votes, then closes the ballot, which leads to the defense phase |
+| `god` | `on: bool` | Turns a god view on or off for **the requesting socket only**. Its StateView then gains `god: { players: { [id]: { cards: Record<Category,string>, specials: {title,text,effect,used}[] } } }` |
+| `fastTimers` | – | Sets options to 5/5/5/5 s, allowed in any phase |
+| `addBots` | `count` (1–15) | Spawns in-process bots that join the room (lobby: seated; game: spectators) |
+
+**5. Running it locally:** `npm run dev` (or a user-level service) serves the working tree on port 8081, reachable from the local network at `http://<this-machine>:8081/dev`. It is restarted after code changes.
+
+**6. Tests**
+- `?profile` isolation in the e2e: two tabs in one browser context are two players.
+- `/dev` and `/devinfo` return 404 without dev mode, and dev ops are rejected.
+- A puppeteer smoke of the test table: 4 seats, a new game, bots, start, `giveSpecial airlock` to P1 and P2, both play it on P3, P3 is ejected, then `skipToVote`, `forceTie`, and the god view.
+
+### X10: "Report an issue" and a visible version (2026-09-26, owner request)
+
+- **Visible links.** A **"Report an issue"** link and a **"Suggest an idea"** link appear in:
+  - the header menu, in every in-room phase
+  - the Rules / How to play sheet
+  - the final screen
+  - the landing page footer
+
+  They open in a new tab.
+- **Link targets:**
+  - The bug link opens `https://github.com/dolgikhog/bunker-online/issues/new?template=bug.yml&version=<v>&browser=<b>&lang=<EN|RU>&room=<CODE>`, with every value URL-encoded.
+    - `browser` is a short summary such as "Safari 26 · iOS", not the full UA.
+    - `room` is present only when the viewer is in a room.
+  - The idea link opens `…?template=idea.yml&version=<v>&lang=<EN|RU>`.
+- **The version.** `public/version.json` = `{"version":"<git describe --always --dirty>","builtAt":"<ISO>"}`.
+  - `deploy/deploy.sh` writes it at deploy time, and it is git-ignored.
+  - The client fetches it once. It shows `v<version>` quietly in the Rules sheet and the landing footer, and uses it in the links.
+  - If the file is missing, the version is `dev`.
+- **Styling:** these links are small, secondary and never in the way of play. Keep all existing data-testids. The new ids are `report-issue-link`, `suggest-idea-link` and `app-version`.

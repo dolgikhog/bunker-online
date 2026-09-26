@@ -48,6 +48,9 @@ export async function startServer({ seed = 1, minPlayers = 2, noLimits = true, e
   }
   const childEnv = { ...process.env, PORT: '0', HOST: '127.0.0.1', BUNKER_SEED: String(seed), BUNKER_MIN_PLAYERS: String(minPlayers), ...env };
   if (noLimits) childEnv.BUNKER_NO_LIMITS = '1'; else delete childEnv.BUNKER_NO_LIMITS;
+  // SPEC §11 X9: a server under test is in dev mode only when the test asks for it, never because the shell running
+  // `npm test` happens to export BUNKER_DEV
+  if (!Object.hasOwn(env, 'BUNKER_DEV')) delete childEnv.BUNKER_DEV;
   const child = spawn(process.execPath, [entry], { cwd: ROOT, env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
   let out = '';
   let err = '';

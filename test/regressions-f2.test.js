@@ -360,7 +360,7 @@ describe('a throttled network still gets its own seats back (SPEC §11 Z1)', () 
   });
 
   test('real sockets behind the proxy (limits on): 20 wrong codes from the victim\'s address, then its blip and resume', { timeout: 30000 }, async () => {
-    const srv = await startServer({ port: 0, host: '127.0.0.1', noLimits: false, trustProxy: true, minPlayers: 2, seed: 'z1', hostGraceMs: 45000, logger: () => {} });
+    const srv = await startServer({ port: 0, host: '127.0.0.1', dev: false, noLimits: false, trustProxy: true, minPlayers: 2, seed: 'z1', hostGraceMs: 45000, logger: () => {} });
     const socks = [];
     const open = (xff) => new Promise((resolve, reject) => {
       const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/ws`, { headers: { 'X-Forwarded-For': xff } });

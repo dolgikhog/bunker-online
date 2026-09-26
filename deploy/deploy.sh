@@ -29,8 +29,11 @@ if [ "${FORCE:-0}" != 1 ]; then
     fi
   fi
 fi
+SRC="${BUNKER_SRC:-.}"
+# Stamp the build (SPEC X10): shown in the app and prefilled into issue reports. Git-ignored.
+printf '{"version":"%s","builtAt":"%s"}\n' "$(git describe --always --dirty 2>/dev/null || echo unknown)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$SRC/public/version.json"
 rsync -az --delete -e "$SSH" \
   --include='/package.json' --include='/package-lock.json' \
   --include='/server/***' --include='/public/***' \
-  --exclude='*' "${BUNKER_SRC:-.}/" "$TARGET:/opt/bunker/"
+  --exclude='*' "$SRC/" "$TARGET:/opt/bunker/"
 $SSH "$TARGET" 'cd /opt/bunker && chown -R bunker:bunker . && sudo -u bunker npm ci --omit=dev --no-audit --no-fund --silent && systemctl restart bunker && sleep 1 && systemctl is-active bunker && curl -s 127.0.0.1:8080/healthz && echo'

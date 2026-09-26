@@ -90,7 +90,7 @@ async function send(c, msg, pred) {
 }
 
 async function withServer(opts, fn) {
-  const srv = await startServer({ port: 0, host: '127.0.0.1', noLimits: false, minPlayers: 2, seed: 'x8', logger: () => {}, ...opts });
+  const srv = await startServer({ port: 0, host: '127.0.0.1', dev: false, noLimits: false, minPlayers: 2, seed: 'x8', logger: () => {}, ...opts });
   try { await fn(srv); } finally { await srv.close(); }
 }
 

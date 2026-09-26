@@ -204,7 +204,7 @@ describe('a special aimed at a vote does not land on the next step (SPEC §11 R3
 describe('over real WebSockets: a special crossing the last vote of its ballot (SPEC §11 R3)', () => {
   test('the vote lands first → the card made on the open ballot is refused and stays in the hand', { timeout: 30000 }, async () => {
     const specials = { 2: [sp('cancel_vote'), FILLER] };
-    const srv = await startInProcess({ port: 0, host: '127.0.0.1', noLimits: true, minPlayers: 2, seed: 'r2-cross', hostGraceMs: 45000, dealerFactory: () => makeDealer(specials), fixedSpecials: false, logger: () => {} });
+    const srv = await startInProcess({ port: 0, host: '127.0.0.1', dev: false, noLimits: true, minPlayers: 2, seed: 'r2-cross', hostGraceMs: 45000, dealerFactory: () => makeDealer(specials), fixedSpecials: false, logger: () => {} });
     const socks = [];
     try {
       const url = `ws://127.0.0.1:${srv.port}/ws`;

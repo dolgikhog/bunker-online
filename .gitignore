@@ -75,3 +75,6 @@ desktop.ini
 .vscode/
 *.code-workspace
 .claude/
+
+# written by deploy/deploy.sh
+public/version.json

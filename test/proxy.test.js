@@ -102,7 +102,7 @@ async function reply(c, msg, pred = (m) => m.t !== 'state', ms = 3000) {
   }
 }
 async function withServer(trustProxy, fn) {
-  const srv = await startServer({ port: 0, host: '127.0.0.1', noLimits: false, trustProxy, minPlayers: 2, seed: 'x2', hostGraceMs: 45000, logger: () => {} });
+  const srv = await startServer({ port: 0, host: '127.0.0.1', dev: false, noLimits: false, trustProxy, minPlayers: 2, seed: 'x2', hostGraceMs: 45000, logger: () => {} });
   const socks = [];
   const track = async (xff) => { const c = await open(srv.port, xff); socks.push(c.ws); return c; };
   try {

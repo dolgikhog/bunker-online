@@ -6,9 +6,14 @@
 // BUNKER_NO_LIMITS (=1 lifts per-socket rate limits, the per-IP socket cap, the per-IP room cap and the per-IP budget of
 // failed join/resume lookups), BUNKER_TRUST_PROXY (=1: behind a reverse proxy on this host, SPEC §11 X2; a socket whose
 // TCP peer is loopback counts as the last address in its X-Forwarded-For for every per-IP limit).
-// Once listening, prints `BUNKER_LISTENING <port>` and `listening on http://<host>:<port>` to stdout.
+// BUNKER_DEV (=1: dev mode, SPEC §11 X9: test shortcuts, see server/dev.js; never set in production, and refused
+// together with BUNKER_TRUST_PROXY=1 or NODE_ENV=production).
+// Once listening, prints `BUNKER_LISTENING <port>` and `listening on http://<host>:<port>` to stdout, then in dev mode
+// DEV_BANNER.
 // HTTP: GET /healthz -> ok; GET /stats -> {"rooms","activeGames","sockets"} only for a request made on this host (a
-// loopback peer with no X-Forwarded-For, SPEC §11 X8), 404 for everyone else; every other path is a static file.
+// loopback peer with no X-Forwarded-For, SPEC §11 X8), 404 for everyone else; in dev mode only, GET /devinfo ->
+// {"dev":true} and /dev -> public/dev.html (without dev mode these and every public/dev.* file are the plain 404);
+// every other path is a static file.
 
 import http from 'node:http';
 import net from 'node:net';
@@ -30,6 +35,10 @@ const BURST_MAX = 200;
 export const MAX_SOCKETS_PER_IP = 40;
 export const MAX_SOCKETS_PER_SITE = MAX_SOCKETS_PER_IP * SITE_FACTOR;
 const HEARTBEAT_MS = 30_000;
+/** §11 X9: printed on start in dev mode. */
+export const DEV_BANNER = '*** DEV MODE — test shortcuts enabled, never expose publicly ***';
+/** §11 X9: why startServer refuses dev mode on what looks like the production unit. */
+export const DEV_REFUSED = 'BUNKER_DEV=1 together with BUNKER_TRUST_PROXY=1 or NODE_ENV=production looks like production: dev mode refused (test shortcuts must never be public)';
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -80,7 +89,22 @@ export function configFromEnv(env = process.env) {
     hostGraceMs: Math.max(0, intEnv(env.BUNKER_HOST_GRACE_MS, 45000)),
     noLimits: env.BUNKER_NO_LIMITS === '1',
     trustProxy: env.BUNKER_TRUST_PROXY === '1',
+    // §11 X9: exactly "1", like the other switches. `production` only guards against dev mode on the production unit.
+    dev: env.BUNKER_DEV === '1',
+    production: env.NODE_ENV === 'production',
   };
+}
+
+// ---- §11 X9: dev routes -----------------------------------------------------------------------------------------
+
+/**
+ * Whether a decoded pathname is one of dev mode's: /dev, /devinfo, anything under /dev/ or /devinfo/, and every
+ * public/dev.* file (dev.html, dev.js, …). Compared on the first path segment, lower-cased, so //dev.html, /%64ev.html
+ * and /DEV.html (on a case-insensitive disk) are covered too. Without dev mode they all get the plain 404.
+ */
+export function isDevPath(pathname) {
+  const first = String(pathname).split('/').find(Boolean)?.toLowerCase() ?? '';
+  return first === 'dev' || first === 'devinfo' || first.startsWith('dev.');
 }
 
 // ---- §11 X2: the client address behind a reverse proxy -----------------------------------------------------------
@@ -169,12 +193,29 @@ function sendText(res, status, text, extra = {}) {
   res.end(res.req.method === 'HEAD' ? undefined : body);
 }
 
+function sendJson(res, status, obj) {
+  const body = Buffer.from(JSON.stringify(obj), 'utf8');
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': body.length,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.end(res.req.method === 'HEAD' ? undefined : body);
+}
+
 function insideDir(dir, p) {
   return p === dir || p.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep);
 }
 
-function makeStaticHandler(publicDir) {
+/**
+ * The static file server. `dev` (§11 X9): serve /devinfo and /dev (public/dev.html), and let pages of this origin frame
+ * ours (X-Frame-Options SAMEORIGIN instead of DENY: the test table shows each seat's client in an <iframe>). Without it
+ * every dev path is the plain 404, whether or not the file exists.
+ */
+function makeStaticHandler(publicDir, { dev = false } = {}) {
   const root = path.resolve(publicDir);
+  const frameOptions = dev ? 'SAMEORIGIN' : 'DENY';
   return function handle(req, res) {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       sendText(res, 405, 'Method not allowed', { Allow: 'GET, HEAD' });
@@ -188,6 +229,11 @@ function makeStaticHandler(publicDir) {
       return;
     }
     if (pathname === '/healthz') { sendText(res, 200, 'ok'); return; }
+    if (isDevPath(pathname)) {
+      if (!dev) { sendText(res, 404, 'Not found'); return; }
+      if (pathname === '/devinfo') { sendJson(res, 200, { dev: true }); return; }
+      if (pathname === '/dev' || pathname === '/dev/') pathname = '/dev.html';
+    }
     if (pathname.includes('\0') || pathname.includes('\\')) { sendText(res, 400, 'Bad request'); return; }
     if (pathname.endsWith('/')) pathname += 'index.html';
     const segments = pathname.split('/').filter(Boolean);
@@ -211,7 +257,7 @@ function makeStaticHandler(publicDir) {
             'Content-Security-Policy': CSP,
             'X-Content-Type-Options': 'nosniff',
             'Referrer-Policy': 'no-referrer',
-            'X-Frame-Options': 'DENY',
+            'X-Frame-Options': frameOptions,
             'Last-Modified': st.mtime.toUTCString(),
           });
           if (req.method === 'HEAD') { res.end(); return; }
@@ -239,20 +285,28 @@ function rejectUpgrade(socket, status, text) {
 export async function startServer(options = {}) {
   const cfg = { ...configFromEnv(), ...options };
   const log = cfg.logger || ((msg, err) => { process.stderr.write(`[bunker] ${msg}${err ? `: ${err?.stack || err}` : ''}\n`); });
+  // §11 X9: dev mode only on exactly `dev: true` (BUNKER_DEV=1), never next to the production unit's settings. Its code
+  // (server/dev.js, and tools/botlib.js for the bots) is loaded only here, so production never even imports it.
+  const dev = cfg.dev === true;
+  if (dev && (cfg.trustProxy || cfg.production)) throw new Error(DEV_REFUSED);
+  const devModule = dev ? await import('./dev.js') : null;
   const rng = cfg.seed !== null && cfg.seed !== undefined ? mulberry32(seedFromString(cfg.seed)) : null;
   const rooms = new Rooms({
     rng,
     minPlayers: cfg.minPlayers,
     hostGraceMs: cfg.hostGraceMs,
     roomTtlMs: cfg.roomTtlMs ?? undefined,
-    maxRoomsPerIp: cfg.noLimits ? Infinity : (cfg.maxRoomsPerIp ?? undefined),
+    // §11 X9: a dev test table opens a room per "New test game" from one address, and its bots keep rooms busy, so the
+    // per-network room cap (V1) would stop the owner after 5 of them: dev mode lifts it (the 200-room cap stays)
+    maxRoomsPerIp: cfg.noLimits || dev ? Infinity : (cfg.maxRoomsPerIp ?? undefined),
     joinFailBurst: cfg.noLimits ? Infinity : (cfg.joinFailBurst ?? undefined),
     joinFailRefillMs: cfg.joinFailRefillMs ?? undefined,
     dealerFactory: cfg.dealerFactory ?? null,
     fixedSpecials: cfg.fixedSpecials !== false,
     logger: log,
   });
-  const serveStatic = makeStaticHandler(cfg.publicDir);
+  if (devModule) rooms.dev = new devModule.DevTools(rooms, { logger: log, botIdleMs: cfg.devBotIdleMs, botDelay: cfg.devBotDelay });
+  const serveStatic = makeStaticHandler(cfg.publicDir, { dev });
 
   // §11 X8: {rooms, activeGames, sockets} for the deploy script (curl 127.0.0.1:8080/stats on the server). Anyone
   // else, including every request through the proxy, gets the static server's own 404, so /stats looks absent.
@@ -389,6 +443,7 @@ export async function startServer(options = {}) {
       closed = true;
       clearInterval(heartbeat);
       clearInterval(sweeper);
+      if (rooms.dev) rooms.dev.close();
       for (const ws of wss.clients) ws.terminate();
       return new Promise((resolve) => {
         wss.close(() => server.close(() => resolve()));
@@ -405,7 +460,8 @@ if (import.meta.main) {
   startServer(cfg).then((srv) => {
     process.stdout.write(`BUNKER_LISTENING ${srv.port}\n`);
     process.stdout.write(`listening on ${srv.url}\n`);
-    process.stderr.write(`[bunker] public dir ${cfg.publicDir}; min players ${cfg.minPlayers}${cfg.seed !== null ? `; seed ${cfg.seed}` : ''}${cfg.noLimits ? '; limits OFF' : ''}${cfg.trustProxy ? '; trusting X-Forwarded-For from loopback' : ''}\n`);
+    if (cfg.dev) process.stdout.write(`${DEV_BANNER}\n`);
+    process.stderr.write(`[bunker] public dir ${cfg.publicDir}; min players ${cfg.minPlayers}${cfg.seed !== null ? `; seed ${cfg.seed}` : ''}${cfg.noLimits ? '; limits OFF' : ''}${cfg.trustProxy ? '; trusting X-Forwarded-For from loopback' : ''}${cfg.dev ? '; DEV MODE (test shortcuts at /dev)' : ''}\n`);
     const stop = () => { srv.close().finally(() => process.exit(0)); setTimeout(() => process.exit(0), 2000).unref(); };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);

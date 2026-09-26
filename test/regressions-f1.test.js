@@ -289,7 +289,7 @@ describe('IPv6 clients: every per-network limit also counts the /48 (SPEC §11 X
   });
 
   test(`real sockets, proxy on: ${MAX_SOCKETS_PER_IP} per /64 whatever the host part, ${MAX_SOCKETS_PER_SITE} per /48; V2 across the /64s of one /48`, { timeout: 60000 }, async () => {
-    const srv = await startServer({ port: 0, host: '127.0.0.1', noLimits: false, trustProxy: true, minPlayers: 2, seed: 'x5', hostGraceMs: 45000, logger: () => {} });
+    const srv = await startServer({ port: 0, host: '127.0.0.1', dev: false, noLimits: false, trustProxy: true, minPlayers: 2, seed: 'x5', hostGraceMs: 45000, logger: () => {} });
     const socks = [];
     const open = (xff) => new Promise((resolve) => {
       const ws = new WebSocket(`ws://127.0.0.1:${srv.port}/ws`, { headers: { 'X-Forwarded-For': xff } });

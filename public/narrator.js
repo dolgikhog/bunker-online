@@ -17,6 +17,9 @@
  * Clips: audio/narration.json = [{ title, src, voice, durationSec }], matched to catastrophe.title case-insensitively.
  * No clip for a catastrophe -> no narrator controls for that game (the header toggle stays: it is a preference). */
 
+import { pkey } from './profile.js';
+
+// storage keys, namespaced by ?profile= (SPEC §11 X9.1): pkey() in load/save, and in the `storage` event check
 const PREF_KEY = 'bunker.narrator';
 const PLAYED_KEY = 'bunker.narrator.played';
 const BASE = new URL('./', import.meta.url);
@@ -50,10 +53,10 @@ const st = {
 
 /* ------------------------------------------------------------------ storage (never throws) */
 function load(key) {
-  try { const raw = opts.memory ? mem.get(key) : window.localStorage.getItem(key); return raw ? JSON.parse(raw) : null; } catch { return null; }
+  try { const raw = opts.memory ? mem.get(key) : window.localStorage.getItem(pkey(key)); return raw ? JSON.parse(raw) : null; } catch { return null; }
 }
 function save(key, v) {
-  try { const raw = JSON.stringify(v); if (opts.memory) mem.set(key, raw); else window.localStorage.setItem(key, raw); } catch { /* blocked storage */ }
+  try { const raw = JSON.stringify(v); if (opts.memory) mem.set(key, raw); else window.localStorage.setItem(pkey(key), raw); } catch { /* blocked storage */ }
 }
 function savePrefs() { save(PREF_KEY, { on: prefs.on, vol: prefs.vol }); }
 function readPrefs() {
@@ -410,7 +413,7 @@ function onKey(e) {
 }
 // another tab of this browser changed the preferences: follow them (else this tab would save its stale copy over them)
 function onStorage(e) {
-  if (e.key !== PREF_KEY && e.key !== null) return;          // null: the site's storage was cleared
+  if (e.key !== pkey(PREF_KEY) && e.key !== null) return;    // another profile's tab is not ours; null: storage was cleared
   readPrefs();
   if (audio) audio.volume = prefs.vol / 100;
   for (const o of document.querySelectorAll('[data-narr-out]')) o.textContent = prefs.vol + '%';

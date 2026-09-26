@@ -7,6 +7,9 @@
 
 import { KICKS, estimateGame, airlockDeal } from './kicks.js';
 import { airlockLine, parseSpecialLine, cardLine, finalCause, isLeaveLine, voteHistory } from './loglines.js';
+import { PROFILE, pkey, withProfile } from './profile.js';
+import { STR } from './strings.js';
+import { appVersion, loadVersion, issueUrl, ideaUrl } from './feedback.js';
 
 const params = new URLSearchParams(location.search);
 const MOCK = params.has('mock') ? (params.get('mock') || 'index') : null;
@@ -66,7 +69,10 @@ const isConsole = () => mq('(min-width: 1180px)');   // desktop console layout: 
 const isMatrix = () => mq('(min-width: 1024px)');    // the players x categories matrix
 const isNarrow = () => mq('(max-width: 639px)');     // phones
 
-/* ------------------------------------------------------------------ storage (never throws) */
+/* ------------------------------------------------------------------ storage (never throws)
+ * Every key goes through pkey() (SPEC §11 X9.1): with ?profile=<id> each tab of one browser keeps its own identity,
+ * name and preferences, so two tabs with different profiles are two players. These three helpers are the only code in
+ * this file that touches web storage. */
 const memStore = { session: new Map(), local: new Map() };
 function backend(kind) {
   if (MOCK) {
@@ -75,9 +81,9 @@ function backend(kind) {
   }
   return kind === 'session' ? window.sessionStorage : window.localStorage;
 }
-function sGet(kind, key) { try { const raw = backend(kind).getItem(key); return raw ? JSON.parse(raw) : null; } catch { return null; } }
-function sSet(kind, key, val) { try { backend(kind).setItem(key, JSON.stringify(val)); } catch { /* blocked storage */ } }
-function sDel(kind, key) { try { backend(kind).removeItem(key); } catch { /* blocked storage */ } }
+function sGet(kind, key) { try { const raw = backend(kind).getItem(pkey(key)); return raw ? JSON.parse(raw) : null; } catch { return null; } }
+function sSet(kind, key, val) { try { backend(kind).setItem(pkey(key), JSON.stringify(val)); } catch { /* blocked storage */ } }
+function sDel(kind, key) { try { backend(kind).removeItem(pkey(key)); } catch { /* blocked storage */ } }
 function isIdentity(x) {
   return !!x && typeof x === 'object' && typeof x.room === 'string' && CODE_RE.test(x.room) &&
     typeof x.token === 'string' && x.token.length > 0 && typeof x.id === 'string';
@@ -135,6 +141,7 @@ const ui = {
   voteWiped: null,            // {key, text}: the viewer's vote was wiped because its target left (SPEC §3), this ballot
   lastStepSend: null,         // {key, at}: the step this page's last Next / Close vote / End turn was aimed at
   voteHoldUntil: 0,           // a ballot this page's own tap opened: its buttons wait until then (VOTE_HOLD_MS)
+  menuOpen: false,            // the header menu (SPEC §11 X10: Report an issue / Suggest an idea)
 };
 
 /* ------------------------------------------------------------------ tiny DOM builder + morph */
@@ -926,6 +933,7 @@ function resetToLanding(notice) {
   ui.adminInflight = null;
   ui.armed = null;
   ui.rulesOpen = false;
+  ui.menuOpen = false;
   ui.landing.invite = '';
   ui.expanded.clear();
   ui.notice = notice || null;
@@ -949,6 +957,7 @@ function onMessage(m) {
       conn.why = '';
       if (ui.screen !== 'replaced') ui.screen = 'room';
       setUrlRoom(m.room);
+      devPost({ ev: 'joined', room: m.room, id: m.id });
       break;
     }
     case 'state': {
@@ -973,6 +982,7 @@ function onMessage(m) {
 function onError(m) {
   const code = typeof m.code === 'string' && m.code ? m.code : 'error';
   const message = typeof m.message === 'string' && m.message ? m.message : 'Something went wrong.';
+  devPost({ ev: 'error', code, message });
   ui.inflight = null;
   ui.voteInflight = null;
   ui.adminInflight = null;
@@ -1099,6 +1109,7 @@ function onState(s) {
   ui.askedSpectator = null;
   state = s;
   window.__bunkerState = s;
+  devPost({ ev: 'state', state: s });   // the /dev table's seat bridge (dev mode only)
   answerInflight();
   const key = stepKeyOf(s);
   if (key !== ui.stepKey) {
@@ -1557,6 +1568,7 @@ function render() {
   restoreFocus();
   updateTimers();
   syncPop();
+  devStatus();
   if (ui.scrollFinal) {
     ui.scrollFinal = false;
     const fb = root.querySelector('.final-banner');
@@ -1814,6 +1826,34 @@ function tag(text, kind, title) { return h('span', { class: ['tag', kind && 'tag
 function kv(k, v, cls, attrs) {
   return h('div', Object.assign({ class: ['kv', cls] }, attrs || {}), h('span', { class: 'k', text: k }), ' ', v instanceof Node ? v : h('span', { class: 'v', text: v }));
 }
+// SPEC §11 X10: "Report an issue" / "Suggest an idea" (new tab, prefilled GitHub forms) and the quiet version, the same
+// wherever they appear: the header menu, the rules sheet, the final screen and the landing footer. `room` only in a
+// room. Strings: public/strings.js; URLs and the version: public/feedback.js.
+function uiLang() { return document.documentElement.lang || 'en'; }   // EN|RU for the links (the i18n pass sets <html lang>)
+function feedbackLinks(where, room) {
+  const a = (testid, href, text) => h('a', { class: 'rep-link', testid, href, target: '_blank', rel: 'noopener noreferrer', title: STR.newTabHint, 'data-where': where }, text);
+  return h('span', { class: ['rep-links', 'rep-' + where] },
+    a('report-issue-link', issueUrl({ lang: uiLang(), room: room || '' }), STR.reportIssue),
+    a('suggest-idea-link', ideaUrl({ lang: uiLang() }), STR.suggestIdea));
+}
+function versionTag(where) {
+  const v = appVersion();
+  return h('span', { class: 'app-version mono', testid: 'app-version', 'data-version': v, 'data-where': where, title: STR.versionHint, text: STR.versionLine({ v }) });
+}
+// the header menu ("⋯"): the links and the version in every in-room phase, one tap away and never in the way of play
+function vHdrMenu(s) {
+  const open = !!ui.menuOpen;
+  return h('div', { class: ['hdr-menu', open && 'is-open'], key: 'hdr-menu' },
+    h('button', { class: 'btn ghost sm hdr-menu-btn', act: 'hdr-menu', testid: 'header-menu-btn', 'aria-haspopup': 'true', 'aria-expanded': String(open), 'aria-label': STR.menuLabel, title: STR.menuHint },
+      h('span', { class: 'hm-dots', 'aria-hidden': 'true', text: '⋯' })),
+    open && h('div', { class: 'hdr-menu-pop', testid: 'header-menu', role: 'group', 'aria-label': STR.menuTitle },
+      h('div', { class: 'hm-head' },
+        h('span', { class: 'hm-k', text: STR.menuTitle }),
+        h('button', { class: 'hm-x', act: 'hdr-menu', 'aria-label': STR.closeLabel }, '×')),
+      h('p', { class: 'hm-lead', text: STR.menuLead }),
+      feedbackLinks('menu', s ? s.room : ''),
+      h('div', { class: 'hm-foot' }, versionTag('menu'))));
+}
 function connBanner() {
   // an open socket that has not (re)joined yet is still reconnecting: the table on screen is not live
   const st = MOCK ? ui.mockConn : (conn.status === 'open' && joinedOnSocket ? 'open' : conn.status === 'open' && identity ? 'connecting' : conn.status);
@@ -1885,7 +1925,9 @@ function vLanding() {
     h('div', { class: 'hz-strip', 'aria-hidden': 'true' }),
     h('main', { class: 'landing-grid' },
       h('section', { class: 'brand' },
-        h('div', { class: 'brand-kicker' }, hazardSign(), h('span', { text: 'Shelter access terminal' })),
+        h('div', { class: 'brand-kicker' }, hazardSign(), h('span', { text: 'Shelter access terminal' }),
+          // SPEC §11 X9.1: this tab's storage profile (a separate player from tabs with another one)
+          PROFILE && h('span', { class: 'profile-tag mono', testid: 'profile-tag', 'data-profile': PROFILE, title: STR.profileTagHint, text: STR.profileTag({ id: PROFILE }) })),
         h('h1', { class: 'brand-title' }, h('span', { class: 'bt-main', text: 'BUNKER' }), h('span', { class: 'bt-sub', text: 'online' })),
         h('p', { class: 'brand-lede', text: 'A catastrophe has happened. The bunker has beds for only half of you. Reveal who you are, argue your case on voice, and vote on who stays outside.' }),
         vFan()),
@@ -1906,7 +1948,8 @@ function vLanding() {
           h('p', { class: 'fine', text: 'Or join as someone new with the form below.' })),
         form)),
     h('footer', { class: 'landing-foot' },
-      h('span', { text: 'An online party game in the style of the discussion game “Bunker” («Бункер»). 4–16 players · spectators welcome.' })));
+      h('span', { text: 'An online party game in the style of the discussion game “Bunker” («Бункер»). 4–16 players · spectators welcome.' }),
+      h('span', { class: 'foot-meta' }, feedbackLinks('landing', ''), versionTag('landing'))));
 }
 // Decorative: a hand of cards on the table — two backs, two face-up cards and a special.
 function vFan() {
@@ -1987,6 +2030,7 @@ function vHeader(s, d) {
         h('span', { class: 'v you-name', text: s.you.name })),
       narrHook((n) => n.headerControl(s)),   // narrator hook: the header button + its popover
       h('button', { class: 'btn ghost sm rules-btn', act: 'rules', title: 'How to play: the goal, a round, the vote and the specials', 'aria-label': 'How to play' }, 'Rules'),
+      vHdrMenu(s),   // SPEC §11 X10: Report an issue / Suggest an idea
       // phones in play: Leave moves to the foot of the page, away from the jump chips right under it
       isNarrow() && inPlay ? null : vLeaveBtn(s, d, 'header')),
     timer && total > 0 && h('div', { class: 'hdr-progress', 'aria-hidden': 'true' },
@@ -2116,6 +2160,7 @@ function vRoundTrack(s, cls) {
 function vLobby() {
   const s = state;
   const d = derive(s);
+  // the join link never carries ?profile= (SPEC §11 X9.1): a friend who opens it is somebody else
   const link = location.origin + '/?room=' + s.room;
   const n = s.players.length;
   const copyLabel = ui.copied === 'ok' ? 'Copied ✓' : ui.copied === 'manual' ? 'Press Ctrl+C' : 'Copy link';
@@ -2418,7 +2463,9 @@ function vFinalBanner(s, d) {
       h('div', { class: 'fb-col in' }, h('div', { class: 'k', text: 'In the bunker' }),
         h('ul', { class: 'chips' }, f.survivors.map((id) => h('li', { class: 'chip good', key: id, text: nameOf(s, id) })))),
       h('div', { class: 'fb-col out' }, h('div', { class: 'k', text: 'Stayed in the forest' }),
-        h('ul', { class: 'chips' }, f.out.map((id) => { const p = byId(s, id); return h('li', { class: 'chip bad', key: id }, nameOf(s, id), p && p.status === 'left' ? h('span', { class: 'chip-sub', text: ' (left)' }) : null); })))));
+        h('ul', { class: 'chips' }, f.out.map((id) => { const p = byId(s, id); return h('li', { class: 'chip bad', key: id }, nameOf(s, id), p && p.status === 'left' ? h('span', { class: 'chip-sub', text: ' (left)' }) : null); })))),
+    // SPEC §11 X10: a quiet line under the result
+    h('p', { class: 'final-feedback' }, h('span', { class: 'final-fb-lead', text: STR.feedbackLead }), ' ', feedbackLinks('final', s.room)));
 }
 // rail = the always-visible desktop version in the side column; otherwise a one-line summary that expands.
 function vSituation(s, d, rail) {
@@ -3322,7 +3369,9 @@ function vRulesModal() {
           'Back from the Forest brings back anyone who was ejected, whether by a vote or through the airlock.'),
         sec('The end',
           'As soon as the players still in the game fit in the beds, the door closes. Every card is turned face up — was it the right crew?',
-          'Leaving a game is for good: you cannot come back into it.')),
+          'Leaving a game is for good: you cannot come back into it.'),
+        // SPEC §11 X10: the links and the version, quietly, at the foot of the sheet
+        h('p', { class: 'rs-feedback' }, h('span', { class: 'rs-fb-lead', text: STR.feedbackLead }), ' ', feedbackLinks('rules', s ? s.room : ''), ' ', versionTag('rules'))),
       h('div', { class: 'modal-actions' }, h('span', { class: 'grow' }), h('button', { class: 'btn primary', act: 'rules-close' }, 'Got it'))));
 }
 function vModal() {
@@ -3419,7 +3468,7 @@ function vMockIndex() {
       h('div', { class: 'panel-head' }, h('h2', { text: 'Mock scenarios' }), h('span', { class: 'meta', text: String(list.length) })),
       h('p', { class: 'fine', text: 'Fixture StateViews rendered without a server. Buttons work on a small local simulation.' }),
       h('ul', { class: 'mock-list' }, list.map((x) => h('li', { key: x.id },
-        h('a', { href: '?mock=' + encodeURIComponent(x.id), class: 'mono' }, x.id), h('span', { class: 'fine', text: ' — ' + x.title }))))));
+        h('a', { href: withProfile('?mock=' + encodeURIComponent(x.id)), class: 'mono' }, x.id), h('span', { class: 'fine', text: ' — ' + x.title }))))));
 }
 
 /* ------------------------------------------------------------------ actions (event delegation) */
@@ -3507,7 +3556,8 @@ const ACTIONS = {
     ui.armed = null;
     sendAdmin({ t: 'kick', playerId: id });
   },
-  rules(el) { ui.rulesOpen = true; ui.rulesOpener = openerOf(el); ui.picker = null; ui.overlayOpenedAt = Date.now(); },
+  rules(el) { ui.rulesOpen = true; ui.rulesOpener = openerOf(el); ui.picker = null; ui.menuOpen = false; ui.overlayOpenedAt = Date.now(); },
+  'hdr-menu'() { ui.menuOpen = !ui.menuOpen; },
   'rules-close'() { closeOverlay(); },
   'briefing-close'(el) {
     const key = el.getAttribute('data-key') || '';
@@ -3671,6 +3721,14 @@ document.addEventListener('click', (e) => {
   if (SHIELD_ACTS.has(act)) shield();
   scheduleRender();
 });
+// the header menu closes on a click anywhere else, and after one of its links was followed (a timeout, so the link's
+// own navigation runs first)
+document.addEventListener('click', (e) => {
+  if (!ui.menuOpen) return;
+  const t = e.target instanceof Element ? e.target : null;
+  if (t && t.closest('.hdr-menu') && !t.closest('a')) return;
+  setTimeout(() => { if (ui.menuOpen) { ui.menuOpen = false; scheduleRender(); } }, 0);
+});
 document.addEventListener('focusin', (e) => {
   const el = e.target;
   if (el instanceof HTMLInputElement && el.hasAttribute('data-select-all')) setTimeout(() => { try { el.select(); } catch { /* ignore */ } }, 0);
@@ -3725,6 +3783,12 @@ document.addEventListener('change', (e) => {
   if (n !== cur && !send({ t: 'setOptions', options: { [key]: n } })) { delete ui.optDraft[key]; scheduleRender(); }
 });
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && ui.menuOpen && !ui.picker && !ui.rulesOpen) {
+    ui.menuOpen = false;
+    scheduleRender();
+    setTimeout(() => { const b = document.querySelector('[data-testid="header-menu-btn"]'); if (b) try { b.focus({ preventScroll: true }); } catch { /* ignore */ } }, 0);
+    return;
+  }
   if (e.key === 'Escape' && (ui.picker || ui.rulesOpen)) { closeOverlay(); shield(); scheduleRender(); return; }
   if (e.key !== 'Enter') return;
   const el = e.target;
@@ -3764,6 +3828,125 @@ setInterval(() => {
   if (identity && !joinedOnSocket && !stopped && !ui.pending && Date.now() - conn.openedAt > CONNECT_MS) { dropSocket(); onSocketGone(); return; }
   if (Date.now() - conn.lastMsgAt >= PING_EVERY_MS - 500) probe(PING_WAIT_MS, 'keepalive');
 }, PING_EVERY_MS);
+
+/* ------------------------------------------------------------------ dev mode (SPEC §11 X9: BUNKER_DEV=1 servers only)
+ * Two things, both inert unless GET /devinfo answers {"dev":true} (production answers 404, and its X-Frame-Options
+ * forbids framing anyway). /devinfo is only asked when the page could need it: `?autojoin=1`, or inside a frame.
+ *
+ * 1. `?room=CODE&name=PK&profile=pK&autojoin=1` joins that room as PK by itself (or takes this profile's seat in it
+ *    back, when this browser already holds one there). Without dev mode the parameter is ignored.
+ * 2. The seat bridge for the /dev test table (public/dev.js). The table cannot send dev ops itself (they must come
+ *    from a room member), so each seat frame relays for it. Messages go only between this frame and its parent, both
+ *    same-origin (event.source === window.parent, event.origin === location.origin), as { bunkerDev: 1, ... }:
+ *      parent → seat  { cmd: 'hello' }                        re-post the status and the latest state
+ *                     { cmd: 'create', name, seed? }          leave any room this seat is in, then create one as host
+ *                     { cmd: 'leave' }                        leave the room for good, forget the seat, show Landing
+ *                     { cmd: 'start' }                        the host's Start
+ *                     { cmd: 'dev', op, params? }             sends { t: 'dev', op, ...params } on this seat's socket
+ *      seat → parent  { ev: 'ready', href, profile }          once, when the bridge is up
+ *                     { ev: 'status', screen, room, id, online, pending }   whenever one of these changes
+ *                     { ev: 'joined', room, id }              a create / join / resume was accepted
+ *                     { ev: 'state', state }                  every StateView (god view included, X9.4)
+ *                     { ev: 'error', code, message }          every error from the server
+ *    Nothing else is relayed: the bridge is not a general remote control for the page. */
+let devBridge = false;
+let devStatusSig = '';
+function devPost(msg) {
+  if (!devBridge) return;
+  try { window.parent.postMessage({ bunkerDev: 1, profile: PROFILE, ...msg }, location.origin); } catch { /* the table went away */ }
+}
+function devStatus() {
+  if (!devBridge) return;
+  const st = {
+    screen: ui.screen,
+    room: state ? state.room : identity ? identity.room : '',
+    id: state ? state.you.id : identity ? identity.id : '',
+    online: conn.status === 'open' && joinedOnSocket,
+    pending: !!ui.pending,
+  };
+  const sig = JSON.stringify(st);
+  if (sig === devStatusSig) return;
+  devStatusSig = sig;
+  devPost({ ev: 'status', ...st });
+}
+async function devCheck() {
+  let dev = false;
+  try {
+    const res = await fetch('/devinfo', { cache: 'no-store' });
+    if (res.ok) { const j = await res.json(); dev = !!j && j.dev === true; } else await res.text().catch(() => '');   // read the 404 too: an unread body keeps the request open
+  } catch { dev = false; }
+  if (!dev) return;
+  if (window.parent !== window) devBridgeInstall();
+  if (params.get('autojoin') === '1') devAutojoin();
+}
+function devAutojoin() {
+  const room = cleanCode(params.get('room'));
+  const name = cleanName(params.get('name') || '');
+  // already resuming this tab's own seat, or nothing to join
+  if (!CODE_RE.test(room) || ui.screen !== 'landing' || ui.pending) return;
+  const offer = ui.rejoinOffer;
+  if (offer && offer.room === room) { ACTIONS.rejoin(); scheduleRender(); return; }   // e.g. a seat opened in a new tab
+  if (!name) return;
+  ui.landing.name = name;
+  ui.landing.room = room;
+  joinRoom(false);
+  scheduleRender();
+}
+function devLeave() {
+  if (!identity && !state && !ui.pending) return;
+  if (ws && ws.readyState === 1 && joinedOnSocket) { try { ws.send(JSON.stringify({ t: 'leave' })); } catch { /* gone anyway */ } }
+  clearIdentity();
+  dropSocket();
+  clearTimeout(conn.timer);
+  conn.status = 'idle'; conn.attempt = 0;
+  stopped = false;
+  resetToLanding(null);
+  ui.landing.room = '';
+  setUrlRoom(null);
+}
+function devCommand(m) {
+  switch (m.cmd) {
+    case 'hello':
+      devStatusSig = '';
+      devPost({ ev: 'ready', href: location.pathname + location.search });
+      devStatus();
+      if (state) devPost({ ev: 'state', state });
+      break;
+    case 'create': {
+      const name = cleanName(typeof m.name === 'string' ? m.name : '') || 'P1';
+      // an earlier test game's seat leaves it for good (create alone would only detach it, SPEC §6)
+      devLeave();
+      const msg = { t: 'create', name };
+      if ((typeof m.seed === 'string' && m.seed.trim()) || Number.isInteger(m.seed)) msg.seed = typeof m.seed === 'string' ? m.seed.trim() : m.seed;
+      ui.pendingName = name; sSet('local', NAME_KEY, name);
+      ui.landing.name = name;
+      ui.askedSpectator = null;
+      connectWith(msg);
+      break;
+    }
+    case 'leave': devLeave(); break;
+    case 'start': sendTurnAction({ t: 'start' }); break;
+    case 'dev': {
+      if (typeof m.op !== 'string' || !m.op) break;
+      const extra = m.params && typeof m.params === 'object' && !Array.isArray(m.params) ? m.params : {};
+      send({ ...extra, t: 'dev', op: m.op });
+      break;
+    }
+    default: break;
+  }
+  scheduleRender();
+}
+function devBridgeInstall() {
+  if (devBridge) return;
+  devBridge = true;
+  window.addEventListener('message', (e) => {
+    if (e.source !== window.parent || e.origin !== location.origin) return;
+    const m = e.data;
+    if (!m || typeof m !== 'object' || m.bunkerDev !== 1 || typeof m.cmd !== 'string') return;
+    devCommand(m);
+  });
+  devCommand({ cmd: 'hello' });
+}
 
 /* ------------------------------------------------------------------ mock mode */
 let mockApi = null;
@@ -3849,6 +4032,7 @@ function boot() {
         rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom }, vw: document.documentElement.clientWidth, vh: window.innerHeight };
     },
   };
+  loadVersion(scheduleRender);   // SPEC §11 X10: version.json ('dev' without it)
   if (MOCK) { bootMock(); return; }
   const roomParam = cleanCode(params.get('room'));
   ui.landing.room = CODE_RE.test(roomParam) ? roomParam : '';
@@ -3867,5 +4051,7 @@ function boot() {
     ui.rejoinOffer = isIdentity(local) ? local : null;
   }
   render();
+  // SPEC §11 X9: dev mode is asked for only where it could matter (an autojoin link, or a seat of the /dev table)
+  if (params.get('autojoin') === '1' || window.parent !== window) devCheck();
 }
 boot();
