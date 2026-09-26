@@ -4,6 +4,12 @@
 //
 //   import { validateServerMessage, validateStateView } from './stateview-schema.js';
 //   const problems = validateServerMessage(msg);   // [] when the message matches the SPEC exactly
+//   validateServerMessage(msg, { dev: true })      // a dev-mode server (SPEC §11 X9): see below
+//
+// Dev mode (§11 X9) is opt-in: without `{dev: true}` a `god` key is an unexpected key, so every simulation proves that a
+// normal server never sends it. With it, `god` is optional and checked against the view, and a hand may hold more than
+// 2 specials (giveSpecial tops a player up to 2 unused cards and keeps the used ones, which stay in playedSpecials): at
+// most DEV_MAX_HAND, 7 played (one per round) plus 2 unused.
 //
 // Used by the Checker in test/helpers-sim.js (so every simulated state in `npm test` is validated) and by the
 // integration soak. Side-effect free on import (`node --test test/` loads every file in test/).
@@ -15,6 +21,8 @@ const STATUSES = ['alive', 'ejected', 'left'];
 const ERROR_CODES = ['bad_request', 'not_in_room', 'no_room', 'bad_token', 'server_busy', 'room_full', 'not_host', 'wrong_phase',
   'not_your_turn', 'not_allowed', 'replaced'];
 const ROOM_RE = /^[ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/;
+/** §11 X9: the largest hand a dev server can show (7 cards played, one per round, plus 2 unused ones). */
+const DEV_MAX_HAND = 9;
 
 /** §2 KICKS (copied from the SPEC text, not from the server, so the two are checked against each other). */
 const KICKS = {
@@ -70,12 +78,12 @@ function strArray(v) { return Array.isArray(v) && v.every(isStr); }
 function unique(arr) { return new Set(arr).size === arr.length; }
 
 /** Validates one server -> client message. Returns a list of problems ([] = matches the SPEC). */
-export function validateServerMessage(msg) {
+export function validateServerMessage(msg, opts = {}) {
   if (!isObj(msg)) return [`message is not an object: ${short(msg)}`];
   switch (msg.t) {
     case 'state': {
       const { t, ...view } = msg; // eslint-disable-line no-unused-vars
-      return validateStateView(view);
+      return validateStateView(view, opts);
     }
     case 'joined': {
       const p = exactKeys(msg, ['t', 'room', 'id', 'token']).map((x) => `joined: ${x}`);
@@ -100,11 +108,14 @@ export function validateServerMessage(msg) {
   }
 }
 
-/** Validates a StateView (without the wire `t`) field by field against SPEC §7 incl. "Field semantics". */
-export function validateStateView(s) {
+/**
+ * Validates a StateView (without the wire `t`) field by field against SPEC §7 incl. "Field semantics".
+ * `dev: true` validates a dev-mode server's view (§11 X9): an optional `god`, and hands of 2–4 specials.
+ */
+export function validateStateView(s, { dev = false } = {}) {
   const P = [];
   const bad = (m) => P.push(m);
-  for (const x of exactKeys(s, TOP_KEYS)) bad(`StateView: ${x}`);
+  for (const x of exactKeys(s, TOP_KEYS, dev ? ['god'] : [])) bad(`StateView: ${x}`);
   if (!isObj(s)) return P;
 
   const phase = s.phase;
@@ -198,7 +209,8 @@ export function validateStateView(s) {
         bad(`${L}: lobby players must be alive, blank, with 0 counters`);
       }
     } else if (Array.isArray(p.playedSpecials)) {
-      if (p.specialsLeft + p.playedSpecials.length !== 2) bad(`${L}: specialsLeft ${p.specialsLeft} + played ${p.playedSpecials.length} != 2`);
+      const held = p.specialsLeft + p.playedSpecials.length;
+      if (dev ? held < 2 || held > DEV_MAX_HAND : held !== 2) bad(`${L}: specialsLeft ${p.specialsLeft} + played ${p.playedSpecials.length} != 2${dev ? ` (dev: 2..${DEV_MAX_HAND})` : ''}`);
       if (final && Array.isArray(p.unplayedSpecials) && p.unplayedSpecials.length !== p.specialsLeft) bad(`${L}: unplayedSpecials ${p.unplayedSpecials.length} != specialsLeft ${p.specialsLeft}`);
     }
   });
@@ -264,7 +276,7 @@ export function validateStateView(s) {
         }
         if (selfPub && selfPub.revealedCount !== revealed) bad(`revealedCount ${selfPub.revealedCount} != me.cards revealed ${revealed}`);
       }
-      if (!Array.isArray(me.specials) || me.specials.length !== 2) bad(`me.specials must have 2 cards: ${short(me.specials)}`);
+      if (!Array.isArray(me.specials) || (dev ? me.specials.length < 2 || me.specials.length > DEV_MAX_HAND : me.specials.length !== 2)) bad(`me.specials must have 2 cards${dev ? ` (dev: 2..${DEV_MAX_HAND})` : ''}: ${short(me.specials)}`);
       else {
         const uids = [];
         me.specials.forEach((c, i) => {
@@ -287,7 +299,7 @@ export function validateStateView(s) {
         if (selfPub) {
           const used = me.specials.filter((c) => c && c.used).length;
           if (Array.isArray(selfPub.playedSpecials) && used !== selfPub.playedSpecials.length) bad(`me: ${used} used specials but ${selfPub.playedSpecials.length} public playedSpecials`);
-          if (2 - used !== selfPub.specialsLeft) bad(`me: specialsLeft ${selfPub.specialsLeft} != unused ${2 - used}`);
+          if (me.specials.length - used !== selfPub.specialsLeft) bad(`me: specialsLeft ${selfPub.specialsLeft} != unused ${me.specials.length - used}`);
         }
       }
       if (!isBool(me.canPlaySpecial)) bad('me.canPlaySpecial not boolean');
@@ -458,6 +470,47 @@ export function validateStateView(s) {
       if (!isStr(e.text)) bad(`log[${i}].text`);
     });
     if (s.log.length && s.log[0].id < 1) bad('log ids must start at 1');
+  }
+
+  // god (§11 X9, dev mode only): every seated player's cards and specials, consistent with the public view
+  if (dev && Object.hasOwn(s, 'god')) {
+    const g = s.god;
+    for (const x of exactKeys(g, ['players'])) bad(`god: ${x}`);
+    if (isObj(g) && !isObj(g.players)) bad(`god.players not an object: ${short(g.players)}`);
+    else if (isObj(g)) {
+      const ids = Object.keys(g.players);
+      if (lobby && ids.length) bad('god.players must be empty in the lobby (nothing is dealt)');
+      if (!lobby && players.some((p) => isObj(p) && !ids.includes(p.id))) bad('god.players does not list every seated player');
+      for (const id of ids) {
+        const L = `god.players.${id}`;
+        const e = g.players[id];
+        const pub = byId.get(id);
+        if (!pub) bad(`${L}: not a seated player`);
+        for (const x of exactKeys(e, ['cards', 'specials'])) bad(`${L}: ${x}`);
+        if (!isObj(e)) continue;
+        for (const x of exactKeys(e.cards, CATEGORY_IDS)) bad(`${L}.cards: ${x}`);
+        if (isObj(e.cards)) {
+          for (const c of CATEGORY_IDS) {
+            if (!isStr(e.cards[c])) bad(`${L}.cards.${c} is ${short(e.cards[c])}`);
+            else if (pub && isObj(pub.cards) && pub.cards[c] !== null && pub.cards[c] !== e.cards[c]) bad(`${L}.cards.${c} differs from the public card`);
+          }
+        }
+        if (!Array.isArray(e.specials) || e.specials.length < 2 || e.specials.length > DEV_MAX_HAND) { bad(`${L}.specials ${short(e.specials)}`); continue; }
+        e.specials.forEach((c, j) => {
+          for (const x of exactKeys(c, ['title', 'text', 'effect', 'used'])) bad(`${L}.specials[${j}]: ${x}`);
+          if (isObj(c) && (!isStr(c.title) || !isStr(c.text) || !EFFECTS[c.effect] || !isBool(c.used))) bad(`${L}.specials[${j}] types ${short(c)}`);
+        });
+        if (pub) {
+          const used = e.specials.filter((c) => isObj(c) && c.used).length;
+          if (Array.isArray(pub.playedSpecials) && used !== pub.playedSpecials.length) bad(`${L}: ${used} used specials but ${pub.playedSpecials.length} played`);
+          if (e.specials.length - used !== pub.specialsLeft) bad(`${L}: ${e.specials.length - used} unused specials but specialsLeft ${pub.specialsLeft}`);
+        }
+        if (you.id === id && isObj(s.me) && Array.isArray(s.me.specials) && isObj(s.me.cards)) {
+          if (CATEGORY_IDS.some((c) => isObj(s.me.cards[c]) && s.me.cards[c].text !== e.cards?.[c])) bad(`${L}: my own cards differ from me.cards`);
+          if (s.me.specials.length !== e.specials.length || s.me.specials.some((c, j) => !isObj(c) || c.title !== e.specials[j]?.title || c.used !== e.specials[j]?.used)) bad(`${L}: my own specials differ from me.specials`);
+        }
+      }
+    }
   }
 
   // final

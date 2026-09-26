@@ -67,6 +67,12 @@ brought into view inside the shell on the phone.
 Narrator (public/narrator.js): the phone player turns it on in the lobby; at the start the catastrophe's clip plays on
 that page by itself (Chrome runs with --autoplay-policy=no-user-gesture-required and --mute-audio), the host and the
 spectator (switch off) stay silent, every page shows ▶ Listen, and the reload mid-game does not replay it.
+Profiles and report links (SPEC §11 X9.1, X10): two tabs of ONE browser context with ?profile=alpha / ?profile=beta join
+one room as two players, each resumes its own seat after a reload, the invite link has no profile, a tab without one
+sees neither seat, and the narrator setting stays per profile. "Report an issue" / "Suggest an idea" are checked on the
+landing footer, the header menu (lobby, in play, final), the rules sheet and the final screen: prefilled GitHub URLs
+(template, version, a short browser summary, lang, room only in a room; URL-encoded; a new tab), and app-version reads
+v<version.json's version> or vdev.
 Exit code 0 = pass, 1 = failure (message, screenshots FAIL-*.png and state dumps in the screens directory).`;
 
 function parseArgs(argv) {
@@ -182,6 +188,8 @@ async function newPage(context, name, viewport) {
     const loc = msg.location() || {};
     const entry = { page: name, text: msg.text(), url: loc.url || '' };
     if (/favicon\.ico/.test(entry.url) && /404/.test(entry.text)) { run.warnings.push(`${name}: favicon.ico 404 (add <link rel="icon">)`); return; }
+    // SPEC §11 X10: deploy.sh writes public/version.json; a local run has none, and the client then says 'dev'
+    if (/\/version\.json$/.test(entry.url) && /404/.test(entry.text)) return;
     run.consoleErrors.push(entry);
     log(`CONSOLE ERROR on ${name}: ${entry.text} ${entry.url}`);
   });
@@ -1010,6 +1018,173 @@ async function reviveTest(host, bob) {
 function alive(s, id) { const p = playerById(s, id); return !!p && p.status === 'alive'; }
 
 // ---------------------------------------------------------------------------------------------------------------
+// SPEC §11 X10: "Report an issue" / "Suggest an idea" links and the visible version
+
+const ISSUES_NEW = 'https://github.com/dolgikhog/bunker-online/issues/new';
+async function expectedVersion() {
+  if (run.version) return run.version;
+  let v = 'dev';
+  try {
+    const r = await fetch(`${run.baseUrl}/version.json`, { cache: 'no-store' });
+    if (r.ok) { const j = await r.json(); if (j && typeof j.version === 'string' && j.version.trim()) v = j.version.trim(); }
+  } catch { /* none: 'dev' */ }
+  run.version = v;
+  return v;
+}
+/**
+ * The two links shown at `where` (landing | menu | rules | final): exactly one of each visible; the bug form prefilled
+ * with template=bug.yml, version, a short browser summary, lang EN (or RU) and room only in a room; the idea form with
+ * template=idea.yml, version and lang; every value URL-encoded; both open in a new tab.
+ */
+async function checkReportLinks(P, where, room) {
+  const want = await expectedVersion();
+  const got = await P.page.evaluate((w) => {
+    const pick = (id) => [...document.querySelectorAll(`[data-testid="${id}"][data-where="${w}"]`)].filter((e) => window.__e2eVisible(e))
+      .map((e) => ({ href: e.getAttribute('href'), target: e.getAttribute('target'), rel: e.getAttribute('rel') || '', text: e.textContent.trim() }));
+    return { bug: pick('report-issue-link'), idea: pick('suggest-idea-link') };
+  }, where);
+  const tag = `${P.name} @${where}`;
+  check(got.bug.length === 1 && got.idea.length === 1, `${tag}: ${got.bug.length} report-issue-link and ${got.idea.length} suggest-idea-link are visible, expected one each (SPEC §11 X10)`);
+  const b = got.bug[0];
+  const i = got.idea[0];
+  if (b) {
+    const u = new URL(b.href);
+    const q = Object.fromEntries(u.searchParams);
+    check(u.origin + u.pathname === ISSUES_NEW, `${tag}: the bug link goes to ${u.origin + u.pathname}, expected ${ISSUES_NEW}`);
+    check(q.template === 'bug.yml' && q.version === want && q.lang === 'EN', `${tag}: bug link params ${JSON.stringify(q)}; expected template=bug.yml, version=${want}, lang=EN`);
+    check(typeof q.browser === 'string' && q.browser.length <= 40 && /^[A-Z][\w ]*? \d+ · [A-Za-z]+$/.test(q.browser), `${tag}: browser=${JSON.stringify(q.browser)} is not a short "Chrome 131 · Linux" summary`);
+    check(room ? q.room === room : !Object.hasOwn(q, 'room'), `${tag}: room=${JSON.stringify(q.room)}, expected ${room || 'no room parameter'} (present only in a room)`);
+    check(Object.keys(q).every((k) => ['template', 'version', 'browser', 'lang', 'room'].includes(k)), `${tag}: unexpected bug link parameters ${JSON.stringify(Object.keys(q))}`);
+    const raw = b.href.split('?')[1] || '';
+    check(!/[\s+]/.test(raw) && raw.includes(`browser=${encodeURIComponent(q.browser)}`), `${tag}: the bug link's values are not URL-encoded (${raw})`);
+    check(b.target === '_blank' && /\bnoopener\b/.test(b.rel), `${tag}: the bug link must open in a new tab (target ${b.target}, rel ${b.rel})`);
+    check(b.text === 'Report an issue', `${tag}: the bug link reads ${JSON.stringify(b.text)}`);
+  }
+  if (i) {
+    const u = new URL(i.href);
+    const q = Object.fromEntries(u.searchParams);
+    check(u.origin + u.pathname === ISSUES_NEW && q.template === 'idea.yml' && q.version === want && q.lang === 'EN' && Object.keys(q).length === 3,
+      `${tag}: the idea link is ${i.href}; expected ${ISSUES_NEW}?template=idea.yml&version=${want}&lang=EN`);
+    check(i.target === '_blank' && /\bnoopener\b/.test(i.rel), `${tag}: the idea link must open in a new tab (target ${i.target}, rel ${i.rel})`);
+    check(i.text === 'Suggest an idea', `${tag}: the idea link reads ${JSON.stringify(i.text)}`);
+  }
+  (run.stats.reportLinks ||= []).push(`${P.name}@${where}`);
+}
+/** `app-version` at `where` reads v<version> (version.json's, or 'dev' without one). */
+async function checkVersion(P, where) {
+  const want = `v${await expectedVersion()}`;
+  let shown = [];
+  for (let i = 0; i < 20; i++) {
+    shown = await P.page.$$eval(`${sel('app-version')}[data-where="${where}"]`, (els) => els.filter((e) => window.__e2eVisible(e)).map((e) => e.textContent.trim())).catch(() => []);
+    if (shown.length === 1 && shown[0] === want) break;
+    await sleep(100);
+  }
+  check(shown.length === 1 && shown[0] === want, `${P.name} @${where}: app-version shows ${JSON.stringify(shown)}, expected ["${want}"] (SPEC §11 X10)`);
+}
+/** The header menu (every in-room phase): opens from header-menu-btn, holds both links, fits the screen, Esc closes it. */
+async function headerMenuTest(P, room, label) {
+  await click(P, 'header-menu-btn', '', 'the header menu');
+  const menu = await P.page.waitForSelector(sel('header-menu'), { visible: true, timeout: 4000 }).catch(() => null);
+  if (!check(!!menu, `${P.name} (${label}): header-menu-btn did not open the header menu`)) return;
+  await checkReportLinks(P, 'menu', room);
+  await checkVersion(P, 'menu');
+  const r = await menu.evaluate((e) => { const b = e.getBoundingClientRect(); return { l: b.left, r: b.right, b: b.bottom, vw: document.documentElement.clientWidth, vh: window.innerHeight }; });
+  check(r.l >= 0 && r.r <= r.vw + 1 && r.b <= r.vh + 1, `${P.name} (${label}): the header menu is off screen ${JSON.stringify(r)}`);
+  if (P.vpName === 'mobile' && !run.stats.menuShot) { run.stats.menuShot = true; await sleep(300); await shot('header-menu', [P]); }   // after its drop-in
+  await P.page.keyboard.press('Escape');
+  const closed = await P.page.waitForSelector(sel('header-menu'), { hidden: true, timeout: 3000 }).then(() => true, () => false);
+  check(closed, `${P.name} (${label}): Esc did not close the header menu`);
+}
+/** The rules sheet carries both links and the version at its foot. */
+async function rulesLinksTest(P, room) {
+  const btn = await P.page.waitForSelector('.rules-btn:not([disabled])', { visible: true, timeout: 4000 }).catch(() => null);
+  if (!check(!!btn, `${P.name}: no Rules button in the header`)) return;
+  await btn.click();
+  const sheet = await P.page.waitForSelector(sel('rules-sheet'), { visible: true, timeout: 4000 }).catch(() => null);
+  if (!check(!!sheet, `${P.name}: the Rules button did not open the rules sheet`)) return;
+  await checkReportLinks(P, 'rules', room);
+  await checkVersion(P, 'rules');
+  await P.page.keyboard.press('Escape');
+  await P.page.waitForSelector(sel('rules-sheet'), { hidden: true, timeout: 3000 }).catch(() => check(false, `${P.name}: Esc did not close the rules sheet`));
+  await sleep(600);   // K6: the click-through shield after a sheet closes
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// SPEC §11 X9.1: ?profile= makes tabs of ONE browser (one context: one localStorage, per-tab sessionStorage) separate
+// players. Two tabs with different profiles join one room as two players, each resumes its own seat after a reload,
+// the invite link carries no profile, the URL keeps it, a tab without a profile sees neither seat, and the narrator
+// setting of one profile does not leak into the other.
+async function profileTest() {
+  const ctx = await run.browser.createBrowserContext();
+  const A = await newPage(ctx, 'prof-alpha', DESKTOP);
+  const B = await newPage(ctx, 'prof-beta', DESKTOP);
+  // tabs of one window: only the front one renders, and puppeteer's click waits for a rendered frame
+  const front = async (P) => { await P.page.bringToFront(); await sleep(150); };
+  await front(A);
+  await A.page.goto(`${run.baseUrl}/?profile=alpha`, { waitUntil: 'domcontentloaded' });
+  await waitHook(A, 'name-input');
+  const tagA = await A.page.$eval(sel('profile-tag'), (e) => e.textContent.trim()).catch(() => null);
+  check(tagA === 'Profile: alpha', `profile: the landing's tag reads ${JSON.stringify(tagA)}, expected "Profile: alpha" (SPEC §11 X9.1)`);
+  await typeInto(A, 'name-input', 'Ann');
+  await click(A, 'create-btn');
+  const sa = await waitState(A, (s) => s.phase === 'lobby' && s.you.isHost, 'profile alpha in its lobby');
+  const room = sa.room;
+  await front(B);
+  await B.page.goto(`${run.baseUrl}/?room=${room}&profile=beta`, { waitUntil: 'domcontentloaded' });
+  await waitHook(B, 'name-input');
+  const offer = await B.page.$(sel('rejoin-btn'));
+  check(!offer, 'profile: a tab with another profile was offered "Rejoin" for the first profile\'s seat (the identity leaked across profiles)');
+  const tagB = await B.page.$eval(sel('profile-tag'), (e) => e.textContent.trim()).catch(() => null);
+  check(tagB === 'Profile: beta', `profile: the second tab's tag reads ${JSON.stringify(tagB)}`);
+  await typeInto(B, 'name-input', 'Ben');
+  await click(B, 'join-btn');
+  const sb = await waitState(B, (s) => s.phase === 'lobby' && s.you.role === 'player', 'profile beta seated');
+  const both = await waitState(A, (s) => s.players.length === 2, 'two players in the profile room');
+  check(sb.you.id !== sa.you.id && both.players.some((p) => p.id === sb.you.id && p.name === 'Ben') && both.players.some((p) => p.id === sa.you.id && p.name === 'Ann'),
+    `profile: two tabs of one browser with different profiles are not two players: ${JSON.stringify(both.players.map((p) => [p.id, p.name]))}`);
+  await front(A);
+  const link = await A.page.$eval('#invite-link', (e) => e.value).catch(() => null);
+  check(link === `${run.baseUrl}/?room=${room}`, `profile: the invite link is ${JSON.stringify(link)}; it must be exactly ${run.baseUrl}/?room=${room}, without the profile`);
+  const urlA = new URL(A.page.url());
+  check(urlA.searchParams.get('profile') === 'alpha' && urlA.searchParams.get('room') === room, `profile: the page URL lost its profile or room: ${A.page.url()}`);
+  const keys = await A.page.evaluate(() => [Object.keys(localStorage).sort(), Object.keys(sessionStorage).sort()]);
+  check(keys[0].includes('bunker.identity@alpha') && keys[0].includes('bunker.identity@beta') && !keys.flat().some((k) => /^bunker\.[\w.]+$/.test(k)),
+    `profile: storage keys are not namespaced by profile: ${JSON.stringify(keys)}`);
+  // the narrator setting (narrator.js keeps its own keys) follows the profile too
+  await click(A, 'narrator-menu');
+  await click(A, 'narrator-toggle');
+  await A.page.keyboard.press('Escape');
+  await sleep(300);
+  await front(B);
+  const bNarr = await B.page.$eval(sel('narrator-menu'), (e) => e.getAttribute('aria-label') || '').catch(() => '');
+  check(/\(off\)/.test(bNarr), `profile: turning the narrator on under profile alpha turned it on for beta too (${bNarr})`);
+  // reloads: each tab takes its own seat back
+  for (const [P, s0] of [[A, sa], [B, sb]]) {
+    await front(P);
+    await P.page.reload({ waitUntil: 'domcontentloaded' });
+    const s1 = await waitState(P, (s) => s.phase === 'lobby' && s.room === room, `${P.name} to resume after a reload`);
+    check(s1.you.id === s0.you.id, `profile: after a reload ${P.name} is ${s1.you.id}, expected its own seat ${s0.you.id}`);
+  }
+  // a third tab without a profile sees neither seat (no Rejoin offer, no resume)
+  const C = await newPage(ctx, 'prof-none', DESKTOP);
+  await front(C);
+  await C.page.goto(`${run.baseUrl}/?room=${room}`, { waitUntil: 'domcontentloaded' });
+  await waitHook(C, 'name-input');
+  await sleep(500);
+  const cState = await state(C);
+  const cOffer = await C.page.$(sel('rejoin-btn'));
+  const cTag = await C.page.$(sel('profile-tag'));
+  check(!cState && !cOffer && !cTag, `profile: a tab without a profile resumed or was offered a profile's seat (state ${!!cState}, rejoin ${!!cOffer}, tag ${!!cTag})`);
+  for (const P of [A, B]) { await front(P); await shot('profiles', [P]); }
+  // clean up: both leave the lobby (one click there)
+  for (const P of [B, A]) { await front(P); await click(P, 'leave-btn'); await waitHook(P, 'name-input'); }
+  run.stats.profiles = { room, alpha: sa.you.id, beta: sb.you.id, keys: keys[0].filter((k) => k.includes('@')) };
+  log(`profiles: ${JSON.stringify(run.stats.profiles)}`);
+  for (const P of [A, B, C]) { await P.page.close().catch(() => {}); run.pages.splice(run.pages.indexOf(P), 1); }
+  await ctx.close().catch(() => {});
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // main
 
 async function main() {
@@ -1037,6 +1212,9 @@ async function main() {
   await host.page.goto(run.baseUrl + '/', { waitUntil: 'domcontentloaded' });
   await waitHook(host, 'name-input');
   await shot('landing', [host], { alsoMobile: true });
+  await checkReportLinks(host, 'landing', '');   // SPEC §11 X10: the landing footer
+  await checkVersion(host, 'landing');
+  check(!(await host.page.$(sel('profile-tag'))), 'the landing shows a profile tag without ?profile= (SPEC §11 X9.1)');
   await typeInto(host, 'name-input', 'Alice');
   await sleep(PAUSE);
   await click(host, 'create-btn');
@@ -1088,6 +1266,10 @@ async function main() {
   await estimateTest(host, bob, spec);
   await narratorLobby(bob);
   await shot('lobby-full', run.pages, { alsoMobile: true });
+  // SPEC §11 X10: the header menu in the lobby (desktop and phone) and the rules sheet
+  await headerMenuTest(host, code, 'lobby');
+  await headerMenuTest(bob, code, 'lobby');
+  await rulesLinksTest(host, code);
 
   // 5. start
   await sleep(PAUSE);
@@ -1185,7 +1367,11 @@ async function main() {
 
     // d) host driving
     if (hs.phase === 'discussion') {
-      if (!discussionShot) { discussionShot = true; await shot('discussion', run.pages, { alsoMobile: true }); }
+      if (!discussionShot) {
+        discussionShot = true;
+        await shot('discussion', run.pages, { alsoMobile: true });
+        await headerMenuTest(spec, code, 'in play');   // SPEC §11 X10: the header menu in play (the spectator: nothing to hold up)
+      }
       if (!run.stats.twoTap && bob.id && playerById(hs, bob.id) && playerById(hs, bob.id).status === 'alive') await twoTapTest(host, bob);
       // before the first vote step, keep one bot from voting so the host has to use Close vote
       if (!closeVoteDone && !pausedBot && hs.schedule && hs.schedule.nextVoteRound === hs.round && hs.schedule.kicksThisStep > 0) {
@@ -1276,6 +1462,9 @@ async function main() {
     `bob: the final banner was not brought into view inside the shell on the phone (${JSON.stringify(fb)}) (SPEC §11 X7)`);
   await checkBarFlush(bob, 'final');
   await checkFinalReading(fs1);
+  // SPEC §11 X10: the final screen's links (every page), and the header menu there
+  for (const P of run.pages) await checkReportLinks(P, 'final', code);
+  await headerMenuTest(host, code, 'final');
   await sleep(SLOW ? 1500 : 300);
   await shot('final', run.pages, { alsoMobile: true });
   const again = await hookValues(bob, 'play-again-btn', 'data-testid');
@@ -1300,6 +1489,8 @@ async function main() {
   await namesTest();
   // 10. more mock screens (SPEC §11, client-fixer f2)
   await mockChecks();
+  // 11. SPEC §11 X9.1: ?profile= isolation in one browser context
+  await profileTest();
 }
 
 // SPEC §11 X6: "End game → back to the lobby". The host starts another game; a friend who arrives during it can only

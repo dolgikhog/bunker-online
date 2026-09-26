@@ -1861,3 +1861,61 @@ body.modal-open { overflow: hidden; }
   .narr-x:hover { color: var(--text); border-color: var(--line-2); }
   .narr-pill-go:hover, .narr-pill-x:hover { background: rgba(0, 0, 0, .08); }
 }
+
+/* ------------------------------------------------------------ SPEC §11 X9 profile tag, X10 report links + version */
+/* the landing's "Profile: p2" (only with ?profile=): small, next to the kicker, never in the way */
+.brand-kicker:has(.profile-tag) { flex-wrap: wrap; row-gap: 6px; }
+.profile-tag { flex: none; margin-left: auto; padding: 3px 7px 2px; font: 700 10px/1.2 var(--mono); letter-spacing: .08em; text-transform: none; color: var(--cyan, #6fd0d8); border: 1px dashed rgba(111, 208, 216, .55); border-radius: 2px; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+/* the two links and the version: small, secondary, quiet */
+.rep-links { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; }
+.rep-link { font-size: 12px; color: var(--dim); text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px; overflow-wrap: anywhere; }
+.rep-link::after { content: " ↗"; font-size: .9em; color: var(--faint); }
+.rep-link:focus-visible { outline: 2px solid var(--hz); outline-offset: 2px; border-radius: 2px; }
+.app-version { font-size: 11px; color: var(--faint); letter-spacing: .04em; white-space: nowrap; }
+@media (hover: hover) { .rep-link:hover { color: var(--hz); text-decoration-color: var(--hz-line); } }
+@media (pointer: coarse) { .rep-link { display: inline-block; padding: 7px 0; } }   /* a finger-sized target, same look */
+/* landing footer: the credit line, then the links and the version */
+.landing-foot { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.foot-meta { display: inline-flex; flex-wrap: wrap; align-items: baseline; justify-content: center; gap: 4px 14px; }
+/* the rules sheet: one quiet line at its foot */
+.rs-feedback { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; padding-top: 12px; border-top: 1px dashed var(--line-2); font-size: 12px; color: var(--faint); }
+/* the final screen: under the two columns */
+.final-feedback { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-top: 14px; padding-top: 10px; border-top: 1px dashed rgba(255, 255, 255, .12); font-size: 12px; color: var(--faint); }
+/* header menu "⋯": after Rules (phones: on Rules' line; wider: in the flow before Leave) */
+.hdr-menu { order: 17; position: relative; align-self: center; display: flex; margin: 0 0 0 4px; }
+@media (min-width: 640px) { .hdr-menu { order: 0; margin-left: 6px; } }
+.hdr-menu-btn { min-height: 40px; min-width: 36px; padding: 0 8px; color: var(--text-2); }
+.hm-dots { font: 700 16px/1 var(--sans); letter-spacing: 0; }
+.hdr-menu.is-open .hdr-menu-btn { background: var(--raise-2); border-color: var(--hz); color: var(--hz); }
+.hdr-menu-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 6;
+  width: 280px;
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--hz-line);
+  border-top: 3px solid var(--hz);
+  border-radius: 3px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, .7);
+  text-align: left;
+  animation: dropIn .14s ease-out;
+}
+@media (max-width: 639px) {
+  .hdr-menu-pop { position: fixed; top: calc(var(--top-h, 0px) + 6px); left: auto; right: 8px; width: min(300px, calc(100vw - 16px)); }
+}
+.hm-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: -4px -4px -4px 0; }
+.hm-k { font: 700 11.5px/1.2 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--hz); }
+.hm-x { width: 40px; height: 40px; flex: none; display: grid; place-items: center; padding: 0; font: 400 22px/1 var(--sans); color: var(--dim); background: none; border: 1px solid transparent; border-radius: 3px; cursor: pointer; }
+.hm-lead { font-size: 12.5px; line-height: 1.45; color: var(--text-2); }
+.hdr-menu-pop .rep-links { display: grid; gap: 2px; }
+.hdr-menu-pop .rep-link { display: flex; align-items: center; min-height: 40px; padding: 0 10px; font-size: 13.5px; color: var(--text); text-decoration: none; background: var(--raise); border: 1px solid var(--line-2); border-radius: 3px; }
+.hdr-menu-pop .rep-link::after { margin-left: auto; }
+.hm-foot { display: flex; justify-content: flex-end; }
+@media (hover: hover) {
+  .hm-x:hover { color: var(--text); border-color: var(--line-2); }
+  .hdr-menu-pop .rep-link:hover { border-color: var(--hz-line); background: var(--raise-2); }
+}

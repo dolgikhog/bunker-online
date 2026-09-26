@@ -31,6 +31,9 @@
 // believed legal on the very state the server had: that is a bug in the bot or in the server.
 //
 // Determinism: all game choices come from a seeded RNG (`seed`), consumed only when an action is actually sent.
+//
+// Importing this module has no side effects (no sockets, timers, listeners or output until a Bot is used), so the dev
+// server (SPEC §11 X9, server/dev.js) imports it to run in-process bots through a loopback `transport`.
 
 import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
@@ -336,6 +339,11 @@ export class Bot extends EventEmitter {
    *                                         vote/special, as the shipped client does, so a stale action is refused instead of
    *                                         landing on the next turn or ballot (a human host's Next never skips a bot's
    *                                         successor, and a card meant for a vote that just closed is not spent on the next)
+   * @param {(url:string)=>object} [o.transport]  opens the bot's socket instead of `new WebSocket(url)`: any object with the
+   *                                         `ws` shape the bot uses (readyState with OPEN = 1, send(text), close(), terminate(),
+   *                                         and 'open'/'message'/'error'/'close' events). The dev server's in-process bots
+   *                                         (SPEC §11 X9, server/dev.js) pass a loopback socket that talks to the room
+   *                                         registry directly
    * @param {(line:string)=>void} [o.log]
    */
   constructor(o = {}) {
@@ -364,6 +372,7 @@ export class Bot extends EventEmitter {
     this.pongTimeout = o.pongTimeout ?? 5000;
     this.maxRate = o.maxRate ?? Infinity;
     this.stepKeys = o.stepKeys !== false;
+    this.transport = typeof o.transport === 'function' ? o.transport : null;
     this.sentTimes = [];
     this.dropped = 0; // actions whose pong never came (see _expireStale)
 
@@ -422,7 +431,7 @@ export class Bot extends EventEmitter {
     const gen = ++this.socketGen;
     return new Promise((resolve, reject) => {
       let opened = false;
-      const ws = new WebSocket(this.url, { handshakeTimeout: 10000, perMessageDeflate: false });
+      const ws = this.transport ? this.transport(this.url) : new WebSocket(this.url, { handshakeTimeout: 10000, perMessageDeflate: false });
       this.ws = ws;
       ws.on('open', () => { opened = true; resolve(this); });
       ws.on('message', (data, isBinary) => this._onRaw(data, isBinary, gen));

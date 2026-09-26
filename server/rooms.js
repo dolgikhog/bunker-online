@@ -28,6 +28,8 @@ export const SITE_FACTOR = 3;
 export const MAX_ROOMS_PER_SITE = MAX_ROOMS_PER_IP * SITE_FACTOR;
 export const JOIN_FAIL_SITE_BURST = JOIN_FAIL_BURST * SITE_FACTOR;
 const LOOKUP_THROTTLED = 'Too many wrong room codes from your network. Wait a minute, then try again';
+/** §11 X9: the answer to every {t:'dev'} when the server is not in dev mode (BUNKER_DEV=1). */
+export const DEV_OFF = 'Dev mode is off: test shortcuts are not available on this server';
 /** Phases of a game in progress (§11 X8 `activeGames`): a deploy restart would end it. */
 const ACTIVE_PHASES = new Set(['reveal', 'discussion', 'vote', 'defense']);
 const NO_TOKENS = new Map();
@@ -122,6 +124,11 @@ export class Rooms {
     this.logger = logger || (() => {});
     /** @type {Map<string, {code: string, game: any, tokens: Map<string,string>, idToken: Map<string,string>, conns: Map<string, any>, emptySince: number|null}>} */
     this.rooms = new Map();
+    /**
+     * §11 X9: server/dev.js's DevTools in dev mode (index.js sets it), otherwise null. Every dev path in this file is
+     * behind it: {t:'dev'} ops, `create`'s seed, the god view and the in-process bots.
+     */
+    this.dev = null;
   }
 
   // ------------------------------------------------------------------------------------------------ transport hooks
@@ -163,6 +170,9 @@ export class Rooms {
         this.logger('sweep failed', e);
       }
     }
+    if (this.dev) {
+      try { this.dev.sweep(); } catch (e) { this.logger('dev sweep failed', e); }
+    }
   }
 
   /**
@@ -192,6 +202,13 @@ export class Rooms {
     if (typeof text !== 'string') { this._error(conn, fail('bad_request', 'Expected a JSON text frame')); return; }
     let msg;
     try { msg = JSON.parse(text); } catch { this._error(conn, fail('bad_request', 'Malformed JSON')); return; }
+    // §11 X9: {t:'dev', op, ...} exists only in dev mode. Otherwise every such message is not_allowed before any of its
+    // fields is read, whoever sends it, joined or not.
+    if (msg !== null && typeof msg === 'object' && !Array.isArray(msg) && msg.t === 'dev') {
+      if (this.dev) this.dev.handle(conn, msg);
+      else this._error(conn, fail('not_allowed', DEV_OFF));
+      return;
+    }
     const bad = validateMessage(msg);
     if (bad) { this._error(conn, bad); return; }
     switch (msg.t) {
@@ -234,6 +251,13 @@ export class Rooms {
   }
 
   _create(conn, msg) {
+    // §11 X9: in dev mode `create` takes a `seed` (a malformed one is bad_request); without dev mode it is never read.
+    let seed = null;
+    if (this.dev) {
+      const parsed = this.dev.parseSeed(msg.seed);
+      if (!parsed.ok) { this._error(conn, parsed.fail); return; }
+      seed = parsed.seed;
+    }
     if (!sanitizeName(msg.name)) { this._error(conn, fail('bad_request', 'Please enter a name (1–20 characters)')); return; }
     const old = this._soleLobby(conn); // freed below: nobody could ever come back to it
     if (this.rooms.size - (old ? 1 : 0) >= MAX_ROOMS) { this._error(conn, fail('server_busy')); return; }
@@ -258,13 +282,14 @@ export class Rooms {
     }
     const code = this._newCode();
     if (!code) { this._error(conn, fail('server_busy')); return; }
-    const rng = this.rng ? deriveRng(this.rng) : Math.random;
+    const rng = seed !== null ? this.dev.roomRng(seed) : this.rng ? deriveRng(this.rng) : Math.random;
     const game = createGame({
       room: code, rng, now: this.now, minPlayers: this.minPlayers, fixedSpecials: this.fixedSpecials,
       ...(this.dealerFactory ? { dealer: this.dealerFactory(rng) } : {}),
     });
     const res = game.join(msg.name);
     if (!res.ok) { this._error(conn, res); return; }
+    if (seed !== null) this.dev.logSeed(game, seed);
     if (evict) this._deleteRoom(evict);
     this._moveOut(conn, old);
     const room = { code, game, tokens: new Map(), idToken: new Map(), conns: new Map(), emptySince: null, ipKey: key, siteKey: site };
@@ -424,15 +449,26 @@ export class Rooms {
     // instead of holding one of the 200 room slots for the 30-minute idle TTL.
     if (!room.game.spectators.length && !room.game.players.some((p) => p.status !== 'left')) {
       this.rooms.delete(room.code);
+      this._devAfterChange(room);
       return;
     }
     if (room.conns.size === 0 && room.emptySince === null) room.emptySince = this.now();
     this._broadcast(room);
+    this._devAfterChange(room);
+  }
+
+  /** §11 X9: dev mode's bots leave a room no human is left in, and close when their room is gone. */
+  _devAfterChange(room) {
+    if (!this.dev) return;
+    try { this.dev.afterChange(room); } catch (e) { this.logger('dev afterChange failed', e); }
   }
 
   _sendState(room, id, conn) {
     const view = room.game.view(id);
-    if (view) this._send(conn, { t: 'state', ...view });
+    if (!view) return;
+    // §11 X9: the god view, only on the socket that asked for it, and only in dev mode
+    if (this.dev && conn.devGod === true) view.god = this.dev.godView(room.game);
+    this._send(conn, { t: 'state', ...view });
   }
 
   _broadcast(room) {

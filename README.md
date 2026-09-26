@@ -222,6 +222,21 @@ connections and create 5 rooms on the server, and bots slow themselves down to s
 
 ---
 
+### Several players in one browser: `?profile=`
+Every tab of one browser, incognito included, shares storage, so every tab is the same player. Add
+`?profile=<name>` to the address and each profile becomes a separate player, for example `…/?profile=2` and `…/?profile=3`.
+This works on the live site too. The invite link you copy never carries your profile.
+
+### The test table: `npm run dev`
+`npm run dev` starts a **dev-mode** server on port 8081 (`BUNKER_DEV=1`). Open `http://<this-machine>:8081/dev`. **Never
+expose a dev server publicly**: dev mode refuses to start next to `BUNKER_TRUST_PROXY=1` or `NODE_ENV=production`.
+- **What it shows:** 2–16 seats side by side, each a real client with its own profile. **New test game** seats P1…PN
+  automatically, with an optional **seed** for a reproducible deal.
+- **Controls:** **Add bots**, **Start** and **Fast timers**.
+- **Shortcuts:** give any player any special card (e.g. two Airlocks), auto-reveal the round, skip to the next vote,
+  force a tie, and **god view** (every hidden card in a table).
+- **Smoke test:** `npm run dev:smoke` runs the table end to end.
+
 ## Operator
 
 ### Run locally

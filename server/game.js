@@ -255,7 +255,8 @@ function clampInt(v, min, max, dflt) {
 const str = (v, fallback = '') => (typeof v === 'string' ? v : v == null ? fallback : String(v));
 const strList = (v) => (Array.isArray(v) ? v.map((x) => str(x)).filter(Boolean) : []);
 
-function normalizeSpecial(raw) {
+/** A dealt or hand-made special reduced to what the §5 effect table allows (also used by server/dev.js, §11 X9). */
+export function normalizeSpecial(raw) {
   if (!raw || typeof raw !== 'object') return null;
   if (typeof raw.effect !== 'string' || !Object.hasOwn(EFFECTS, raw.effect)) return null;
   const eff = EFFECTS[raw.effect];
