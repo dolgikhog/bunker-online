@@ -15,6 +15,13 @@
  * Seat K's URL is /?room=CODE&name=PK&profile=pK&autojoin=1 (X9.3). Seat 1 creates the room through the bridge
  * ({ cmd: 'create', name: 'P1', seed }): before the first game its frame is /?profile=p1&name=P1.
  *
+ * Sound: every seat would read the catastrophe at once (and each profile's narrator starts off), so the table gives the
+ * narrator's sound to ONE seat ({ cmd: 'sound', on, who } to every seat): the "🔊 Sound" choice, Auto by default = the
+ * focused seat (or the open tab), else P1, never moved by Auto in the middle of a clip. That seat plays at Start as if
+ * its switch were on (the switch its profile saved is left alone); the others stay silent, and a clip stops when its
+ * seat loses the sound. ▶ Listen or the switch in another seat asks for it ({ ev: 'sound', want }): the sound moves
+ * there. The frames carry allow="autoplay", so a click anywhere on this page is the gesture the browser wants.
+ *
  * Test hooks (tools/dev-smoke.js): data-testid="dev-*" on every control; each seat is dev-seat (+data-seat,
  * data-profile, data-player-id, data-status) with an iframe[data-seat]; window.__devTable is a read-only snapshot. */
 
@@ -50,6 +57,7 @@ const NO_BRIDGE_MS = 7000;
 /* ------------------------------------------------------------------ settings */
 const T = {
   n: 4, seed: '', layout: 'grid', size: 'phone', room: '', bots: 2, focus: 0, tab: 1,
+  sound: 'auto',      // which seat has the narrator's sound: 'auto' (soundSeat), 'off', or a seat number
   godFold: false,     // the god view's table folded to its header line (the god view itself stays on)
   ctlHidden: false,   // the controls column hidden (the seats get its width); the top bar's button brings it back
   effect: 'airlock', target: '',
@@ -73,10 +81,11 @@ function loadSettings() {
   T.tab = clampInt(j.tab, 1, MAX_SEATS, 1);
   T.godFold = j.godFold === true;
   T.ctlHidden = j.ctlHidden === true;
+  T.sound = j.sound === 'off' ? 'off' : Number.isInteger(j.sound) && j.sound >= 1 && j.sound <= MAX_SEATS ? j.sound : 'auto';
 }
 function saveSettings() {
   try {
-    localStorage.setItem(SAVE_KEY, JSON.stringify({ n: T.n, seed: T.seed, layout: T.layout, size: T.size, room: T.room, bots: T.bots, focus: T.focus, tab: T.tab, godFold: T.godFold, ctlHidden: T.ctlHidden }));
+    localStorage.setItem(SAVE_KEY, JSON.stringify({ n: T.n, seed: T.seed, layout: T.layout, size: T.size, room: T.room, bots: T.bots, focus: T.focus, tab: T.tab, godFold: T.godFold, ctlHidden: T.ctlHidden, sound: T.sound }));
   } catch { /* storage blocked: settings are per load then */ }
 }
 
@@ -105,7 +114,7 @@ const baseUrl = (k) => `/?profile=p${k}&name=P${k}`;
 const seatUrl = (k) => `/?room=${T.room}&name=P${k}&profile=p${k}&autojoin=1`;
 
 function makeSeat(k) {
-  const seat = { k, profile: `p${k}`, name: `P${k}`, url: '', status: null, state: null, ready: false, blocked: false, noBridge: false, errors: 0, loadTimer: 0 };
+  const seat = { k, profile: `p${k}`, name: `P${k}`, url: '', status: null, state: null, ready: false, blocked: false, noBridge: false, errors: 0, loadTimer: 0, soundSig: '' };
   seat.frame = el('iframe', { class: 'seat-frame', title: `Seat ${k} (P${k})`, name: `seat-${k}`, 'data-seat': k, allow: 'autoplay; clipboard-write', tabindex: '-1' });
   seat.ph = el('div', { class: 'seat-ph' }, el('b', { text: `P${k}` }), el('span', { text: 'joins at the next New test game' }));
   seat.box = el('div', { class: 'seat-box' }, seat.frame, seat.ph);
@@ -126,7 +135,7 @@ function removeSeat(seat) {
 function setSeatUrl(seat, url) {
   seat.url = url || '';
   seat.ready = false; seat.blocked = false; seat.noBridge = false;
-  seat.status = null; seat.state = null;
+  seat.status = null; seat.state = null; seat.soundSig = '';
   seat.cell.classList.toggle('empty', !url);
   seat.frame.src = url || 'about:blank';
 }
@@ -156,6 +165,45 @@ function opSeat() { return hostSeat() || seatsInOrder().find(inRoom) || null; }
 function viewState() { const s = hostSeat() || opSeat(); return s ? s.state : null; }
 function godSeat() { return seatsInOrder().find((s) => inRoom(s) && s.state.god && typeof s.state.god === 'object') || null; }
 
+/* ------------------------------------------------------------------ sound: one seat reads the catastrophe (see the top) */
+// the seat that has the sound (0 = none): Auto is the open tab, or the focused seat, or P1 — but Auto never moves the
+// sound in the middle of a clip: losing the sound stops it, and the new seat only reads at the next Start, so a Focus
+// or a tab switch right after the Start would silence the narration. The seat that reads keeps it until it is done.
+function soundSeat() {
+  if (T.sound === 'off') return 0;
+  const k = T.sound !== 'auto' ? T.sound : T.layout === 'tabs' ? T.tab : T.focus || 1;
+  if (T.sound === 'auto' && soundWas > 0 && soundWas !== k) {
+    const cur = T.seats.get(soundWas);
+    const n = cur ? narrOf(cur) : null;
+    if (n && (n.status === 'playing' || n.status === 'loading')) return soundWas;
+  }
+  return T.seats.has(k) ? k : 0;
+}
+// tells every seat whether it has the sound, once per change (a reloaded seat is told again when its bridge is back);
+// not while New test game sets the seats up (a seat that is not there yet would read as "off" meanwhile)
+let soundWas = -1;
+function syncSound() {
+  if (T.busy) return;
+  const k = soundSeat();
+  if (k !== soundWas) { soundWas = k; logLine(null, k ? `🔊 sound: P${k}${T.sound === 'auto' ? ' (auto)' : ''}` : '🔇 sound off: no seat reads the catastrophe'); }
+  const who = k ? `P${k}` : '';
+  for (const s of seatsInOrder()) {
+    if (!s.ready) continue;
+    const sig = `${s.k === k}|${who}`;
+    if (s.soundSig !== sig && post(s, { cmd: 'sound', on: s.k === k, who })) s.soundSig = sig;
+  }
+}
+// ▶ Listen or the narrator switch in a seat: the sound moves there (or, switched off where it is, goes off)
+function wantSound(seat, want) {
+  const k = soundSeat();
+  if (want && k !== seat.k) T.sound = seat.k;
+  else if (!want && k === seat.k) T.sound = 'off';
+  else return;
+  logLine(seat, want ? `asked for the sound (▶ Listen or its switch)` : 'switched its narrator off', 'op');
+  saveSettings();
+}
+function narrOf(seat) { return seat.status && seat.status.narr ? seat.status.narr : null; }
+
 /* ------------------------------------------------------------------ messages from the seats */
 window.addEventListener('message', (e) => {
   if (e.origin !== location.origin) return;
@@ -165,12 +213,17 @@ window.addEventListener('message', (e) => {
   if (!seat) return;
   switch (m.ev) {
     case 'ready':
-      seat.ready = true; seat.noBridge = false;
+      seat.ready = true; seat.noBridge = false; seat.soundSig = '';
       clearTimeout(seat.loadTimer);
       break;
-    case 'status':
-      seat.status = { screen: String(m.screen || ''), room: String(m.room || ''), id: String(m.id || ''), online: !!m.online, pending: !!m.pending };
+    case 'status': {
+      const narr = m.narr && typeof m.narr === 'object' ? { on: m.narr.on === true, status: String(m.narr.status || '') } : null;
+      seat.status = { screen: String(m.screen || ''), room: String(m.room || ''), id: String(m.id || ''), online: !!m.online, pending: !!m.pending, narr };
       if (seat.status.screen === 'landing') seat.state = null;
+      break;
+    }
+    case 'sound':
+      if (typeof m.want === 'boolean') wantSound(seat, m.want);
       break;
     case 'joined':
       logLine(seat, `joined ${m.room} as ${m.id}`);
@@ -227,8 +280,9 @@ async function newGame() {
     T.tie.clear();
     if (T.focus > n) T.focus = 0;
     if (T.tab > n) T.tab = 1;
-    // 2. seats beyond n go away
+    // 2. seats beyond n go away (and the sound with them)
     for (const s of seatsInOrder()) if (s.k > n) removeSeat(s);
+    if (typeof T.sound === 'number' && T.sound > n) T.sound = 'auto';
     // 3. seat 1 creates the room as P1 (the host), through its bridge
     const s1 = T.seats.get(1) || makeSeat(1);
     if (!s1.url || !s1.ready) {
@@ -369,7 +423,8 @@ function update() {
       el('span', { class: 'st-sep', text: '·' }), el('span', { text: `${players.length} seated, ${(vs.spectators || []).length} watching` }),
       el('span', { class: 'st-sep', text: '·' }), el('span', { text: `host ${host ? `P${host.k}` : (players.find((p) => p.id === vs.hostId) || { name: '—' }).name}` }),
     ] : el('span', { class: 'st-dim', text: T.busy ? 'working…' : T.room ? 'waiting for the seats…' : 'no game yet: set the seats and press New test game' }),
-    T.room ? el('a', { class: 'st-link', href: `/?room=${T.room}&profile=watch`, target: '_blank', rel: 'noopener', title: 'A spectator (or a late arrival) in a new tab, with its own profile' }, 'watch ↗') : null);
+    T.room ? el('a', { class: 'st-link', href: `/?room=${T.room}&profile=watch`, target: '_blank', rel: 'noopener', title: 'A spectator (or a late arrival) in a new tab, with its own profile' }, 'watch ↗') : null,
+    soundStatus());
   // buttons
   ui.newGame.disabled = T.busy;
   ui.newGame.textContent = T.busy ? 'Working…' : 'New test game';
@@ -403,6 +458,10 @@ function update() {
   const inMain = !!(vs && vs.phase === 'vote' && vs.vote && vs.vote.stage === 'main');
   gate(ui.forceTie, ready && inMain && T.tie.size >= 2, !ready ? noSeat : !inMain ? 'Only while a main ballot is open (Skip to vote first)' : 'Tick 2 or more candidates');
   ui.tieHint.textContent = inMain ? `${T.tie.size} picked: the ballot closes as a tie between them` : 'Needs an open main ballot (Skip to vote first)';
+  // sound: the choice (its Auto names the seat it is now), then tell the seats
+  const sk = soundSeat();
+  fillSelect(ui.sound, [['auto', `Auto (${T.sound === 'auto' && sk ? `P${sk}` : 'focused, else P1'})`], ...seatsInOrder().map((s) => [String(s.k), `P${s.k}`]), ['off', 'Off']], String(T.sound));
+  syncSound();
   // god view
   const gs = godSeat();
   ui.god.textContent = gs ? 'God view: on · turn off' : 'God view: off · turn on';
@@ -415,6 +474,15 @@ function update() {
   renderLog();
   // test snapshot
   window.__devTable = snapshot();
+}
+function soundStatus() {
+  const k = soundSeat();
+  const seat = k ? T.seats.get(k) : null;
+  const n = seat ? narrOf(seat) : null;
+  const what = n && ['playing', 'loading', 'blocked', 'error'].includes(n.status) ? n.status : '';
+  const why = { blocked: ' · blocked: tap ▶ in the seat', error: ' · error', playing: ' · playing', loading: ' · loading' }[what] || '';
+  return el('span', { class: ['st-snd', what && `is-${what}`], testid: 'dev-sound-status', 'data-seat': k, 'data-status': what || 'idle', title: 'The one seat that reads the catastrophe aloud (🔊 Sound in the controls)' },
+    k ? `🔊 sound: P${k}${why}` : '🔇 sound: off');
 }
 function renderSeatHead(s) {
   const st = inRoom(s) ? s.state : null;
@@ -429,6 +497,12 @@ function renderSeatHead(s) {
   if (st && st.vote && st.vote.voters.includes(st.you.id) && !st.vote.voted.includes(st.you.id)) badges.push(el('span', { class: 'bdg vote', text: 'votes' }));
   if (st && (st.airlocks || []).some((a) => a.targetId === st.you.id)) badges.push(el('span', { class: 'bdg air', text: 'airlock' }));
   if (s.status && s.status.screen === 'room' && !s.status.online) badges.push(el('span', { class: 'bdg off', text: 'offline' }));
+  const narr = narrOf(s);
+  const playingHere = !!narr && (narr.status === 'playing' || narr.status === 'loading');
+  if (s.k === soundSeat() || playingHere) {
+    badges.push(el('span', { class: ['bdg', 'snd', playingHere && 'on', narr && narr.status === 'blocked' && 'blocked'], testid: 'dev-seat-sound', 'data-seat': s.k,
+      text: playingHere ? '🔊 playing' : narr && narr.status === 'blocked' ? '🔊 tap ▶' : '🔊' }));
+  }
   const open = s.url ? (T.room ? seatUrl(s.k) : baseUrl(s.k)) : null;
   const sig = JSON.stringify([status, st && st.you.name, badges.map((b) => b.textContent), open, T.focus === s.k, T.layout]);
   if (s.head.dataset.sig === sig) return;
@@ -519,7 +593,9 @@ function snapshot() {
       k: s.k, profile: s.profile, url: s.url, ready: s.ready, blocked: s.blocked, noBridge: s.noBridge,
       screen: s.status ? s.status.screen : '', id: s.state ? s.state.you.id : '', name: s.state ? s.state.you.name : '',
       isHost: !!(s.state && s.state.you.isHost), phase: s.state ? s.state.phase : '', errors: s.errors, god: !!(s.state && s.state.god),
+      narr: narrOf(s),
     })),
+    sound: soundSeat(), soundMode: T.sound,
     hostSeat: hostSeat() ? hostSeat().k : 0,
     log: T.log.map((l) => `${l.who} ${l.text}`),
   };
@@ -539,6 +615,11 @@ function build() {
   ui.size = el('select', { class: 'in', testid: 'dev-size', on: { change: () => { T.size = ui.size.value; saveSettings(); layout(); } } },
     Object.entries(SIZES).map(([id, s]) => el('option', { value: id, text: s.label })));
   ui.size.value = T.size;
+  ui.sound = el('select', { class: 'in', testid: 'dev-sound', on: { change: () => {
+    const v = ui.sound.value;
+    T.sound = v === 'auto' || v === 'off' ? v : clampInt(v, 1, MAX_SEATS, 1);
+    saveSettings(); schedule();
+  } } });
   // every op button carries its hint in data-hint: update() shows it as the title, or why the button is off right now
   ui.start = el('button', { class: 'b primary', testid: 'dev-start', 'data-hint': 'The host seat presses Start', on: { click: () => { const s = hostSeat(); if (s) { post(s, { cmd: 'start' }); logLine(s, '→ start', 'op'); } } } }, 'Start');
   ui.fast = el('button', { class: 'b', testid: 'dev-fast-timers', 'data-hint': 'Every timer 5 s, in any phase', on: { click: () => sendDev('fastTimers') } }, 'Fast timers');
@@ -572,7 +653,8 @@ function build() {
       section('Table',
         el('div', { class: 'row' }, field('Humans', ui.n), field('Seed', ui.seed)),
         ui.newGame,
-        el('div', { class: 'row' }, field('Layout', el('div', { class: 'segs' }, ui.layoutBtns)), field('Frames', ui.size))),
+        el('div', { class: 'row' }, field('Layout', el('div', { class: 'segs' }, ui.layoutBtns)), field('Frames', ui.size)),
+        field('🔊 Sound', ui.sound, 'The one seat that reads the catastrophe at Start (all at once would echo). Auto: the focused seat or open tab, else P1 (a clip that is playing finishes first). ▶ Listen in a seat moves the sound there.')),
       section('Game',
         el('div', { class: 'row' }, ui.start, ui.fast),
         el('div', { class: 'row end' }, field('Bots', ui.bots), ui.addBots)),

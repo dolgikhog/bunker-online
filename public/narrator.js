@@ -12,12 +12,14 @@
  *                                         back in the lobby, in another room or game, and when the room is left
  *   headerControl(state)                  the header button + its popover (toggle, volume, listen)
  *   titleRow(titleEl, state, where)       wraps a catastrophe title with its ▶ Listen button (or returns it as is)
+ * and, in a seat of the /dev test table only (its dev bridge in app.js), devSound() and devState() (see there).
  *
  * Returned nodes are plain DOM elements (the host morphs them into its tree; the wrappers carry data-key).
  * Clips: audio/narration.json = [{ title, src, voice, durationSec }], matched to catastrophe.title case-insensitively.
  * No clip for a catastrophe -> no narrator controls for that game (the header toggle stays: it is a preference). */
 
 import { pkey } from './profile.js';
+import { STR } from './strings.js';
 
 // storage keys, namespaced by ?profile= (SPEC §11 X9.1): pkey() in load/save, and in the `storage` event check
 const PREF_KEY = 'bunker.narrator';
@@ -40,6 +42,7 @@ let pill = null;              // the "▶ Listen to the catastrophe" prompt show
 let playSeq = 0;
 let started = false;
 let clockSkew = null;         // max(serverNow - Date.now()) over the states seen: this device's offset to the server
+let table = null;             // a /dev test table seat: { on, who, want } from devSound(); null everywhere else
 const st = {
   seen: null,                 // the last state sync() got
   game: null,                 // { room, title (lower case), label } of the game on screen
@@ -65,6 +68,8 @@ function readPrefs() {
   const v = p && typeof p === 'object' ? Number(p.vol) : NaN;
   prefs.vol = Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : 100;
 }
+// on: this profile's own switch, or on the test table the table's choice (it never touches the saved switch)
+function isOn() { return table ? table.on : prefs.on; }
 function wasPlayed(key) { const a = load(PLAYED_KEY); return Array.isArray(a) && a.includes(key); }
 function markPlayed(key) {
   const a = load(PLAYED_KEY);
@@ -217,6 +222,7 @@ function setVolume(v) {
   for (const o of document.querySelectorAll('[data-narr-out]')) o.textContent = n + '%';
 }
 function toggle() {
+  if (table) { table.want(!table.on); return; }   // the test table decides; it answers with devSound()
   prefs.on = !prefs.on;
   savePrefs();
   if (prefs.on) {
@@ -276,7 +282,7 @@ export function sync(s) {
   // Autoplay only on the transition this page saw itself: lobby -> round 1 of the same room, and only while that start
   // is fresh. A reload mid-game starts without a lobby state; a page that was offline (or frozen) in the lobby gets
   // the news late: neither autoplays. The key keeps it to once per game (also across tabs of one browser).
-  if (game && prefs.on && prev && prev.room === s.room && prev.phase === 'lobby' && s.round === 1 && !s.overtime && s.phase !== 'final') {
+  if (game && isOn() && prev && prev.room === s.room && prev.phase === 'lobby' && s.round === 1 && !s.overtime && s.phase !== 'final') {
     const key = gameKey(s);
     const age = startAge(s);
     if ((age === null || age <= FRESH_MS) && !wasPlayed(key)) {
@@ -317,7 +323,7 @@ export function titleRow(titleEl, s, where) {
 }
 export function headerControl(s) {
   if (!started) return null;
-  const on = prefs.on;
+  const on = isOn();
   const live = playing();
   const inGame = !!(s && s.phase !== 'lobby');
   return el('div', { class: ['narr-hdr', on && 'is-on', live && 'is-live', st.menu && 'is-open', inGame ? 'in-game' : 'in-lobby'], 'data-key': 'narr-hdr' },
@@ -330,7 +336,7 @@ export function headerControl(s) {
     st.menu ? popover(s) : null);
 }
 function popover(s) {
-  const on = prefs.on;
+  const on = isOn();
   const c = currentClip();
   const inGame = !!(s && s.phase !== 'lobby');
   let note = st.hint;
@@ -341,6 +347,7 @@ function popover(s) {
       el('span', { class: 'narr-pop-k', text: 'Narrator' }),
       el('button', { class: 'narr-x', 'data-narr': 'close', 'aria-label': 'Close', title: 'Close' }, '×')),
     el('p', { class: 'narr-pop-lead', text: 'A dramatic British voice reads the catastrophe aloud when the game starts. Only on this device — turn it on if you want it.' }),
+    table ? el('p', { class: 'narr-pop-note', 'data-testid': 'narrator-table-note', text: table.on ? STR.narrTableOn : table.who ? STR.narrTableOther({ who: table.who }) : STR.narrTableOff }) : null,
     el('button', { class: ['narr-switch', on && 'is-on'], role: 'switch', 'aria-checked': String(on), 'data-narr': 'toggle', 'data-testid': 'narrator-toggle' },
       el('span', { class: 'narr-switch-t', text: 'Read the catastrophe at game start' }),
       el('span', { class: 'narr-track', 'aria-hidden': 'true' }, el('span', { class: 'narr-knob' })),
@@ -394,7 +401,7 @@ function onClick(e) {
     case 'menu': st.menu = !st.menu; if (st.menu) st.hint = ''; break;
     case 'close': st.menu = false; focusMenuButton(); break;
     case 'toggle': toggle(); break;
-    case 'play': if (playing()) stop(); else play(false); break;
+    case 'play': if (playing()) stop(); else { play(false); if (table && !table.on) table.want(true); } break;
     case 'unblock': play(false); break;
     case 'dismiss': st.blocked = false; break;
     default: return;
@@ -418,6 +425,24 @@ function onStorage(e) {
   if (audio) audio.volume = prefs.vol / 100;
   for (const o of document.querySelectorAll('[data-narr-out]')) o.textContent = prefs.vol + '%';
   changed();
+}
+
+/* ------------------------------------------------------------------ the /dev test table (SPEC §11 X9.3)
+ * Every seat of the table is a page of this client in one browser tab: several narrators would read the same
+ * catastrophe at once. So the table gives the sound to one seat, through the seat's dev bridge (public/app.js):
+ *   devSound({ on, who }, want)   on: this seat has the sound, and plays at the game start as if its switch were on
+ *                                 (the switch this profile saved is left as it is); who: the seat that has it ('' =
+ *                                 none); want(bool): ask the table for the sound (▶ Listen here, or the switch).
+ *                                 Losing the sound stops a clip, so one seat plays at a time.
+ *   devState()                    { on, status } for the table's seat header: idle | loading | playing | error | blocked */
+export function devSound(v, want) {
+  if (!started || !v || typeof v !== 'object') return;
+  table = { on: v.on === true, who: typeof v.who === 'string' ? v.who : '', want: typeof want === 'function' ? want : () => {} };
+  if (!table.on) { st.pendingAuto = ''; if (playing() || st.blocked) stop(); }
+  changed();
+}
+export function devState() {
+  return { on: isOn(), status: st.blocked && !playing() ? 'blocked' : st.status };
 }
 
 export function init(o = {}) {

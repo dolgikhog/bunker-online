@@ -65,8 +65,10 @@ the host first kicks a bot) and the next game deals them in. Phone layout (X7): 
 the page itself is not scrolled and the action bar ends flush with the bottom of the screen; the final banner is
 brought into view inside the shell on the phone.
 Narrator (public/narrator.js): the phone player turns it on in the lobby; at the start the catastrophe's clip plays on
-that page by itself (Chrome runs with --autoplay-policy=no-user-gesture-required and --mute-audio), the host and the
-spectator (switch off) stay silent, every page shows ▶ Listen, and the reload mid-game does not replay it.
+that page by itself (Chrome keeps its real autoplay policy, only muted: the clicks in the lobby are the gesture), the
+host and the spectator (switch off) stay silent, every page shows ▶ Listen, and the reload mid-game does not replay it.
+The clip is served in byte ranges (Range: bytes=0-1 -> 206, Accept-Ranges: bytes) and is seekable to its end: without
+that, Safari and every iOS browser do not play it.
 Profiles and report links (SPEC §11 X9.1, X10): two tabs of ONE browser context with ?profile=alpha / ?profile=beta join
 one room as two players, each resumes its own seat after a reload, the invite link has no profile, a tab without one
 sees neither seat, and the narrator setting stays per profile. "Report an issue" / "Suggest an idea" are checked on the
@@ -1200,8 +1202,9 @@ async function main() {
   }
   run.browser = await puppeteer.launch({
     executablePath: CHROME, headless: !opts.headful, slowMo: SLOW ? 40 : 0, defaultViewport: null,
-    // the narrator's clip plays at the start without a user gesture; muted: media still plays, the speakers stay quiet
-    args: ['--no-first-run', '--no-default-browser-check', '--disable-extensions', '--autoplay-policy=no-user-gesture-required', '--mute-audio'],
+    // the real autoplay policy (no --autoplay-policy override: the narrator must play the way it does for a player, after
+    // the clicks in the lobby); muted: media still plays, the speakers stay quiet
+    args: ['--no-first-run', '--no-default-browser-check', '--disable-extensions', '--mute-audio'],
   });
   const host = await newPage(await run.browser.createBrowserContext(), 'host', DESKTOP);
   const bob = await newPage(await run.browser.createBrowserContext(), 'bob', MOBILE);
@@ -1971,7 +1974,8 @@ async function checkVoteHold(P) {
 // without it (--public-dir / --url) only gets a warning; the repo's own ./public must have it.
 const narrAudio = (P) => P.page.evaluate(() => {
   const a = document.querySelector('audio[data-testid="narrator-audio"]');
-  return a ? { src: a.getAttribute('src'), paused: a.paused, t: a.currentTime, count: document.querySelectorAll('audio').length } : null;
+  const seekEnd = a && a.seekable.length ? a.seekable.end(a.seekable.length - 1) : 0;
+  return a ? { src: a.getAttribute('src'), paused: a.paused, t: a.currentTime, count: document.querySelectorAll('audio').length, dur: a.duration, seekEnd } : null;
 }).catch(() => null);
 async function narratorLobby(P) {
   const t0 = Date.now();
@@ -2010,6 +2014,16 @@ async function narratorStart(P, others) {
   const a1 = await narrAudio(P);
   const playing = !!a0 && !!a1 && !!a1.src && a1.src.endsWith('/' + clip.src) && !a1.paused && a1.t > a0.t + 0.25;
   check(playing, `${P.name}: narrator on, the game started, but ${clip.src} is not playing by itself (${JSON.stringify({ a0, a1 })})`);
+  // byte ranges: Safari and every iOS browser play media only from a server that answers them (206); Chrome cannot seek
+  // in a clip served whole (its seekable range stays [0, 0])
+  const part = await P.page.evaluate(async (src) => {
+    const r = await fetch(src, { headers: { Range: 'bytes=0-1' }, cache: 'no-store' });
+    const n = (await r.arrayBuffer()).byteLength;
+    return { status: r.status, range: r.headers.get('content-range'), accept: r.headers.get('accept-ranges'), bytes: n };
+  }, clip.src).catch((e) => ({ error: e.message }));
+  check(part.status === 206 && /^bytes 0-1\/\d+$/.test(part.range || '') && part.bytes === 2 && part.accept === 'bytes',
+    `${clip.src} with Range: bytes=0-1 answered ${JSON.stringify(part)}, expected 206, Content-Range bytes 0-1/<size>, 2 bytes, Accept-Ranges: bytes`);
+  check(!!a1 && a1.dur > 0 && a1.seekEnd >= a1.dur - 0.5, `${P.name}: the playing clip is seekable to ${a1 && a1.seekEnd} s of ${a1 && a1.dur} s (the server must answer byte ranges)`);
   const listen = {};
   for (const Q of [P, ...others]) {
     listen[Q.name] = await hookValues(Q, 'narrator-play', 'data-where');
@@ -2021,7 +2035,7 @@ async function narratorStart(P, others) {
     const q = await narrAudio(Q);
     check(!!q && q.paused && !q.src, `${Q.name}: the narrator is off there, but the page has a clip (${JSON.stringify(q)})`);
   }
-  run.stats.narrator = { on: P.name, clip: clip.src, t: a0 && a1 ? [+a0.t.toFixed(2), +a1.t.toFixed(2)] : null, listen, ms: run.stats.narrator.ms + Date.now() - t0 };
+  run.stats.narrator = { on: P.name, clip: clip.src, t: a0 && a1 ? [+a0.t.toFixed(2), +a1.t.toFixed(2)] : null, range: part.status, seekable: a1 ? [+a1.seekEnd.toFixed(1), +(a1.dur || 0).toFixed(1)] : null, listen, ms: run.stats.narrator.ms + Date.now() - t0 };
   log(`narrator: ${JSON.stringify(run.stats.narrator)}`);
 }
 async function reloadTest(P) {

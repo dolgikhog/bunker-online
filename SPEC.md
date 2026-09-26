@@ -553,6 +553,12 @@ every `error` now carries a `code` and one new code (`replaced`) exists; no §0 
   `index.html` is `no-store`, other files `no-cache`; the exact §9 CSP plus `nosniff`, `X-Frame-Options: DENY`,
   `Referrer-Policy: no-referrer`. WebSocket upgrades only on `/ws` (else 404); the per-IP cap answers 429; a 30 s ping/pong
   heartbeat drops dead sockets.
+- S9 §9 static (2026-09-26, "the audio is not playing on the test build"): files answer byte ranges like the production
+  proxy does, since Safari and every iOS browser play no media without them and Chrome cannot seek. `Accept-Ranges: bytes`
+  on every file; a GET with one range (`a-b`, `a-`, `-n`) → 206 with `Content-Range`; a malformed `bytes` range, one past
+  the end, or `-0` → 416 with `Content-Range: bytes */size`; several ranges or another unit → 200, the whole file
+  (multipart is not implemented); HEAD ignores Range; an `If-Range` other than the file's `Last-Modified` → 200. Every
+  S8 rule and header holds for 206 and 416 too (`test/static.test.js`).
 
 **2026-09-24, tests.** What the simulations and tools rely on; no protocol change.
 - T1 §7 ordering: each socket's messages are handled in order, and every `state` a message causes is sent before the reply to
@@ -1321,6 +1327,7 @@ The owner tests alone in one browser. Every incognito window shares one storage,
 - **Add bots** (count): in-process server bots join using `tools/botlib.js`.
 - **Start, Fast timers** (5/5/5/5 s), and **Seed**: in dev mode, `create` accepts `seed` so the deal is reproducible.
 - **Open seat in a new tab,** and **Focus a seat** to enlarge one frame.
+- **🔊 Sound** (2026-09-26): the narrator's sound goes to **one** seat, since all the seats would read the catastrophe at once, and each profile's own switch starts off. Auto (the default) is the focused seat or open tab, else P1, and it never moves in the middle of a clip (a Focus or a tab switch right after the Start would stop the narration: the seat that reads keeps the sound until its clip ends); or a fixed seat; or Off. That seat plays at Start as if its switch were on, without changing the switch its profile saved. The other seats stay silent, and a seat that loses the sound stops its clip. ▶ Listen or the switch in another seat moves the sound there. The seat frames carry `allow="autoplay"`, so a click on the table counts as the gesture browsers want.
 - **The shortcuts below as buttons,** with a target-player dropdown fed by the host frame's `window.__bunkerState`.
 
 **4. Dev ops:** `{t:'dev', op, ...}`. Any member of the room may send them, but only in dev mode, and each one is logged in the game log as `[dev] …`.
@@ -1340,7 +1347,7 @@ The owner tests alone in one browser. Every incognito window shares one storage,
 **6. Tests**
 - `?profile` isolation in the e2e: two tabs in one browser context are two players.
 - `/dev` and `/devinfo` return 404 without dev mode, and dev ops are rejected.
-- A puppeteer smoke of the test table: 4 seats, a new game, bots, start, `giveSpecial airlock` to P1 and P2, both play it on P3, P3 is ejected, then `skipToVote`, `forceTie`, and the god view.
+- A puppeteer smoke of the test table: 4 seats, a new game, bots, start, `giveSpecial airlock` to P1 and P2, both play it on P3, P3 is ejected, then `skipToVote`, `forceTie`, and the god view. Then the sound, under Chrome's real autoplay policy: one seat reads the catastrophe at Start, and ▶ Listen and the switch move it.
 
 ### X10: "Report an issue" and a visible version (2026-09-26, owner request)
 

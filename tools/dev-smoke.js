@@ -28,7 +28,12 @@ P1 and P2 → Auto-reveal and the host's Next (in P1's frame) reach round 2 → 
 through their own seat frames (the Play flow) → P3 is thrown out → Skip to vote → Force tie between two candidates →
 the defense → God view shows every hidden card in the side panel (and only on the seat that asked). Also: Focus and Tabs
 layouts, every op's "[dev]" log line, and on a server WITHOUT BUNKER_DEV: /dev and /devinfo are 404 and ?autojoin=1 is
-ignored. Screenshots go to the screens directory. Exit code 0 = pass, 1 = failure.`;
+ignored. Sound (the narrator; Chrome keeps its real autoplay policy, only muted): every seat frame has
+allow="autoplay"; at the Start ONE seat reads the catastrophe (Auto = P1), and focusing another seat in the middle of
+the clip does not stop it; then a second test game with the sound on P3, whose frame nothing but the table touched:
+P3 plays by itself and nobody else does; ▶ Listen in P2 moves the sound there (P3 stops), the switch in P4 moves it
+again (P2 stops) and leaves P4's saved switch alone. Screenshots go to the screens directory. Exit code 0 = pass,
+1 = failure.`;
 
 function parseArgs(argv) {
   const o = { seed: 'smoke-1', timeout: 20000, screens: path.join(ROOT, 'reports', 'screens', 'devtools') };
@@ -217,6 +222,14 @@ async function main() {
   const lobby = await seatState(page, 1);
   check(lobby.log.some((e) => /^\[dev\] .*seed/.test(e.text) && e.text.includes(opts.seed)), `no "[dev] … seed ${opts.seed}" line in the log`);
   log(`room ${room}: P1..P4 = ${JSON.stringify(ids)}`);
+  // sound: every frame may autoplay (a click on the table is then the gesture), and Auto gives the sound to P1
+  const allow = await page.$$eval('iframe[data-seat]', (els) => els.map((e) => e.getAttribute('allow') || ''));
+  check(allow.length === 4 && allow.every((a) => /(^|;)\s*autoplay\b/.test(a)), `a seat frame lacks allow="autoplay": ${JSON.stringify(allow)}`);
+  t = await waitTable(page, (x) => x.sound === 1 && x.seats.every((q) => q.narr && q.narr.on === (q.k === 1)), 'the sound on P1 (Auto), every other seat silent');
+  const sndSel = await page.$eval(sel('dev-sound'), (e) => ({ value: e.value, text: e.options[e.selectedIndex].textContent }));
+  check(t.soundMode === 'auto' && sndSel.value === 'auto' && /P1/.test(sndSel.text), `the 🔊 Sound choice reads ${JSON.stringify(sndSel)} (mode ${t.soundMode}), expected Auto (P1)`);
+  const sndTop = await page.$eval(sel('dev-sound-status'), (e) => e.textContent);
+  check(/sound: P1/.test(sndTop), `the top bar says ${JSON.stringify(sndTop)}, expected "🔊 sound: P1"`);
   await shot(page, 'lobby-4-seats');
 
   // 2. bots, Start, fast timers
@@ -228,6 +241,7 @@ async function main() {
   await devClick(page, 'dev-start');
   await waitSeat(page, 1, (s) => s.phase === 'reveal' && s.round === 1, 'the game to start');
   for (const k of [2, 3, 4]) await waitSeat(page, k, (s) => s.phase === 'reveal' && !!s.me, `P${k} to see the game`);
+  await waitSound(page, 1, 'the Start (Auto: P1)');
   await shot(page, 'started');
 
   // 3. giveSpecial airlock to P1 and P2 (a target dropdown fed by the host's state, an effect dropdown)
@@ -256,6 +270,8 @@ async function main() {
   await shot(page, 'airlock-open-by-P1');
   await devClick(page, 'dev-seat-focus', '[data-seat="2"]');
   await sleep(300);
+  // Auto follows the focus, but not in the middle of P1's clip (moving the sound would stop it)
+  await waitSound(page, 1, 'focusing P2 in the middle of the clip (Auto keeps the sound on the seat that reads)');
   await playAirlock(page, 2, p3);
   const sealed = await waitSeat(page, 1, (s) => s.players.find((p) => p.id === p3).status === 'ejected', 'P3 to be thrown out by the second Airlock');
   const sealLine = sealed.log.find((e) => e.kind === 'eject' && /sealed the airlock/.test(e.text));
@@ -346,8 +362,45 @@ async function main() {
   t = await table(page);
   check(t.seats.every((s) => s.errors === 0), `a seat reported errors: ${JSON.stringify(t.log.filter((l) => /✖/.test(l)))}`);
 
+  // 9b. one seat reads the catastrophe: a new test game with the sound on P3 (its frame reloads, and from here on only the
+  // table's own page is evaluated and clicked until the Start: P3's autoplay rests on allow="autoplay" and that click)
+  await page.select(sel('dev-sound'), '3');
+  await devClick(page, 'dev-new-game');
+  t = await waitTable(page, (x) => x.room && x.room !== room && !x.busy && x.seats.length === 4 && x.seats.every((q) => q.phase === 'lobby' && q.id && q.ready), '4 seats in the lobby of a second test game');
+  await waitTable(page, (x) => x.sound === 3 && x.soundMode === 3 && x.seats.every((q) => q.narr && q.narr.on === (q.k === 3)), 'the sound on P3');
+  await devClick(page, 'dev-start');
+  await waitTable(page, (x) => x.seats.every((q) => q.phase === 'reveal'), 'the second test game to start');
+  await waitSound(page, 3, 'the Start with the sound on P3');
+  await shot(page, 'sound-P3');
+  // ▶ Listen in P2 moves the sound there; P3 stops
+  await seatClick(page, 2, 'narrator-play', '', 'P2\'s ▶ Listen');
+  await waitSound(page, 2, '▶ Listen in P2');
+  // the switch in P4 moves it again; P2 stops; P4's own saved switch stays as it was (unset)
+  await seatClick(page, 4, 'narrator-menu', '', 'P4\'s narrator button');
+  const note4 = await (await seatFrame(page, 4)).$eval(sel('narrator-table-note'), (e) => e.textContent).catch(() => '');
+  check(/P2 has the sound/.test(note4), `P4's narrator popover says ${JSON.stringify(note4)}, expected that P2 has the sound`);
+  await seatClick(page, 4, 'narrator-toggle', '', 'P4\'s narrator switch');
+  t = await waitTable(page, (x) => x.sound === 4 && x.seats.every((q) => q.narr && q.narr.on === (q.k === 4) && !['playing', 'loading'].includes(q.narr.status)), 'the sound on P4 after its switch (P2 stopped)');
+  await shot(page, 'sound-P4-switch');
+  const saved4 = await page.evaluate(() => localStorage.getItem('bunker.narrator@p4'));
+  check(saved4 === null, `the table changed P4's saved narrator switch: ${saved4}`);
+  await seatClick(page, 4, 'narrator-menu', '', 'P4\'s narrator button (close)');
+  run.stats.sound = { start: 'P3', listen: 'P2', switch: 'P4' };
+  log('sound: P3 read the catastrophe at the Start, ▶ Listen moved it to P2, the switch to P4; never two at once');
+
   // 10. without BUNKER_DEV: no /dev, no /devinfo, and ?autojoin=1 is ignored (SPEC §11 X9.2/X9.3)
   await noDevChecks();
+}
+
+/** Seat k reads the catastrophe (its narrator plays) and no other seat plays anything; read from the table's snapshot. */
+async function waitSound(page, k, what) {
+  const t = await waitTable(page, (x) => x.sound === k && x.seats.every((q) => q.narr && (q.k === k ? q.narr.status === 'playing' : !q.narr.on && !['playing', 'loading'].includes(q.narr.status))),
+    `P${k} alone to play the catastrophe after ${what}`);
+  const top = await page.$eval(sel('dev-sound-status'), (e) => ({ text: e.textContent, status: e.getAttribute('data-status') }));
+  check(top.status === 'playing' && top.text.includes(`P${k}`), `the top bar says ${JSON.stringify(top)} while P${k} plays`);
+  const badge = await page.$eval(sel('dev-seat-sound', `[data-seat="${k}"]`), (e) => e.textContent).catch(() => '');
+  check(/playing/.test(badge), `P${k}'s header badge reads ${JSON.stringify(badge)}, expected "🔊 playing"`);
+  return t;
 }
 
 async function playAirlock(page, k, targetId) {
