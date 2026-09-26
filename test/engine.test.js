@@ -1059,7 +1059,7 @@ describe('§5 special cards', () => {
     ok(g.handle(ids[0], { t: 'start' }));
     const [a, b] = P(g, ids[0]).specials.map((s) => s.uid);
     const v = g.view(ids[0]);
-    assert.deepEqual(v.me.specials[0], { uid: a, title: 'T:bunker_add_feature', text: P(g, ids[0]).specials[0].text, effect: 'bunker_add_feature', target: 'none', category: null, timing: 'anytime', minRound: 1, used: false });
+    assert.deepEqual(v.me.specials[0], { uid: a, id: 'bunker_add_feature', title: 'T:bunker_add_feature', text: P(g, ids[0]).specials[0].text, effect: 'bunker_add_feature', target: 'none', category: null, timing: 'anytime', minRound: 1, used: false });
     err(g.handle(specs[0], { t: 'special', uid: a }), 'not_allowed');
     err(g.handle(ids[1], { t: 'special', uid: a }), 'not_allowed'); // not their card
     ok(g.handle(ids[0], { t: 'special', uid: a, targetId: ids[3], category: 'health' })); // extra fields ignored for none
@@ -1368,7 +1368,7 @@ describe('redaction (§7, §9)', () => {
     for (const p of g.players) {
       const pv = v.players.find((x) => x.id === p.id);
       for (const c of CATEGORY_IDS) assert.equal(pv.cards[c], p.cards[c].text);
-      assert.deepEqual(pv.unplayedSpecials, p.specials.filter((s) => !s.used).map((s) => ({ title: s.title, text: s.text })));
+      assert.deepEqual(pv.unplayedSpecials, p.specials.filter((s) => !s.used).map((s) => ({ id: s.id, title: s.title, text: s.text })));
       assert.equal(pv.revealedCount, CATEGORY_IDS.filter((c) => p.cards[c].revealed).length);
     }
     assert.ok(v.players.some((p) => p.revealedCount < 8));

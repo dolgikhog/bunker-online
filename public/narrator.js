@@ -14,18 +14,24 @@
  *   titleRow(titleEl, state, where)       wraps a catastrophe title with its ▶ Listen button (or returns it as is)
  *
  * Returned nodes are plain DOM elements (the host morphs them into its tree; the wrappers carry data-key).
- * Clips: audio/narration.json = [{ title, src, voice, durationSec }], matched to catastrophe.title case-insensitively.
+ * Clips: audio/narration.json = [{ title, src, voice, durationSec }], matched to the catastrophe's content id (SPEC §11
+ * X5.2: catastrophe.id = the clip's file name, audio/catastrophes/<id>.mp3), or, for a state without one (a mock, a
+ * server from before X5), to catastrophe.title case-insensitively. The narration is English only: in Russian the
+ * English clip plays and the narr.* words say so (design §9.5). Every title the narrator shows is the state's
+ * catastrophe title, in the viewer's language; the manifest's English title is only the fallback lookup.
+ * The game on screen is known by its room and the catastrophe's id (never its title, which a language switch changes):
+ * a switch mid-game neither stops a clip that is playing nor loses the first round's autoplay.
  * No clip for a catastrophe -> no narrator controls for that game (the header toggle stays: it is a preference). */
 
 import { pkey } from './profile.js';
+// SPEC §11 X5.7: every text goes through i18n (narr.* in public/i18n/en.js, ru.js). `tr` because `t` names events here.
+import { t as tr, onLang } from './i18n/index.js';
 
 // storage keys, namespaced by ?profile= (SPEC §11 X9.1): pkey() in load/save, and in the `storage` event check
 const PREF_KEY = 'bunker.narrator';
 const PLAYED_KEY = 'bunker.narrator.played';
 const BASE = new URL('./', import.meta.url);
 const MANIFEST_URL = new URL('audio/narration.json', BASE).href;
-const TEXT_LOBBY_ON = 'Narrator on — you’ll hear the catastrophe when the game starts.';
-const TEXT_GAME_ON = 'Narrator on — it reads the catastrophe when a game starts. Press ▶ Listen to hear this one now.';
 // a game start seen later than this (the page got the news late: a reconnect after the phone was locked in the lobby,
 // a frozen background tab waking up) is not announced by itself — ▶ Listen is there for it
 const FRESH_MS = 15000;
@@ -34,6 +40,7 @@ let opts = { onChange() {}, notify() {}, memory: false };
 const mem = new Map();
 const prefs = { on: false, vol: 100 };
 let clips = null;             // Map<lower-case title, {title, src, voice, durationSec}> once narration.json is in
+let clipsById = new Map();    // the same clips by content id (the src file name without .mp3)
 let audio = null;             // the one <audio> element (outside the host's tree, so a re-render never touches it)
 let volumeWorks = true;       // false where media volume is fixed (iOS Safari): the slider is replaced by a note
 let pill = null;              // the "▶ Listen to the catastrophe" prompt shown when the browser refused to autoplay
@@ -42,13 +49,13 @@ let started = false;
 let clockSkew = null;         // max(serverNow - Date.now()) over the states seen: this device's offset to the server
 const st = {
   seen: null,                 // the last state sync() got
-  game: null,                 // { room, title (lower case), label } of the game on screen
+  game: null,                 // { room, id, key (id, else the lower-case title), label (the title shown) } of the game
   status: 'idle',             // idle | loading | playing | error
-  forTitle: '',               // lower-case title of the clip loaded in the element
+  forKey: '',                 // the key of the game whose clip is loaded in the element
   blocked: false,             // autoplay was refused: show the prompt
-  pendingAuto: '',            // the game start happened before narration.json arrived: play when it does
+  pendingAuto: '',            // the game start happened before narration.json arrived: play when it does (its key)
   menu: false,                // the header popover is open
-  hint: '',                   // the popover's status line
+  hint: '',                   // the popover's status line: an i18n key (narr.hint*), rendered when drawn
 };
 
 /* ------------------------------------------------------------------ storage (never throws) */
@@ -108,11 +115,16 @@ function glyph(kind) {
 }
 
 /* ------------------------------------------------------------------ clips */
-function clipFor(title) {
-  if (!clips || typeof title !== 'string') return null;
-  return clips.get(title.trim().toLowerCase()) || null;
+// The clip for a catastrophe: by its content id, else (no id: a mock, a server from before X5) by its English title.
+function clipFor(id, title) {
+  if (!clips) return null;
+  if (typeof id === 'string' && id) return clipsById.get(id) || null;
+  return typeof title === 'string' ? clips.get(title.trim().toLowerCase()) || null : null;
 }
-function currentClip() { return st.game ? clipFor(st.game.title) : null; }
+function catClip(c) { return c ? clipFor(c.id, c.title) : null; }
+function currentClip() { return st.game ? clipFor(st.game.id, st.game.label) : null; }
+// the catastrophe's title as the state gives it (the viewer's language)
+function shownTitle(s) { return s && s.catastrophe && typeof s.catastrophe.title === 'string' ? s.catastrophe.title : ''; }
 function clipUrl(c) { return new URL(c.src, BASE).href; }
 // fetched when the module is evaluated (index.html preloads the module), so the ▶ Listen buttons are known before the
 // first game state arrives and never pop in after it
@@ -123,17 +135,23 @@ async function loadManifest() {
   try {
     const list = await manifestReq;
     const m = new Map();
+    const byId = new Map();
     for (const x of Array.isArray(list) ? list : []) {
       if (!x || typeof x.title !== 'string' || typeof x.src !== 'string') continue;
       // same-origin relative paths only
       if (/^[a-z][a-z0-9+.-]*:|^\/\//i.test(x.src)) continue;
-      m.set(x.title.trim().toLowerCase(), { title: x.title, src: x.src, voice: x.voice || '', durationSec: Number(x.durationSec) || 0 });
+      const clip = { title: x.title, src: x.src, voice: x.voice || '', durationSec: Number(x.durationSec) || 0 };
+      m.set(x.title.trim().toLowerCase(), clip);
+      const base = /([^/]+)\.[a-z0-9]+$/i.exec(x.src);
+      if (base) byId.set(base[1], clip);
     }
     clips = m;
+    clipsById = byId;
   } catch {
     clips = new Map();          // no narration available: no controls, no errors
+    clipsById = new Map();
   }
-  if (st.pendingAuto && st.game && st.pendingAuto === st.game.title) { st.pendingAuto = ''; play(true); }
+  if (st.pendingAuto && st.game && st.pendingAuto === st.game.key) { st.pendingAuto = ''; play(true); }
   changed();
 }
 
@@ -149,7 +167,7 @@ function play(auto) {
   const url = clipUrl(c);
   const token = ++playSeq;
   st.blocked = false;
-  st.forTitle = st.game.title;
+  st.forKey = st.game.key;
   if (st.status === 'error' || audio.error) st.hint = '';   // a new try: drop the old failure message
   if (audio.src !== url) {
     audio.preload = 'auto';
@@ -173,12 +191,12 @@ function play(auto) {
     if (name === 'NotAllowedError') {         // no user gesture yet: offer a button instead
       st.status = 'idle';
       st.blocked = !!auto || st.blocked;
-      if (!auto) st.hint = 'Your browser blocked the sound. Tap ▶ Listen again.';
+      if (!auto) st.hint = 'narr.hintBlocked';
     } else if (name === 'AbortError') {
       st.status = 'idle';
     } else {
       st.status = 'error';
-      st.hint = 'The narration could not be played on this device.';
+      st.hint = 'narr.hintCantPlay';
     }
     changed();
   });
@@ -200,7 +218,7 @@ function reset() {
   st.blocked = false;
   st.pendingAuto = '';
   st.status = 'idle';
-  st.forTitle = '';
+  st.forKey = '';
   if (audio && audio.getAttribute('src')) {
     audio.pause();
     audio.removeAttribute('src');
@@ -221,28 +239,34 @@ function toggle() {
   savePrefs();
   if (prefs.on) {
     const inLobby = !st.game;
-    st.hint = inLobby || !currentClip() ? TEXT_LOBBY_ON : TEXT_GAME_ON;
-    opts.notify(st.hint);
+    st.hint = inLobby || !currentClip() ? 'narr.hintLobbyOn' : 'narr.hintGameOn';
+    opts.notify(tr(st.hint));
   } else {
-    st.hint = 'Narrator off. The ▶ Listen button still plays it on demand.';
+    st.hint = 'narr.hintOff';
     stop();
   }
 }
 
 /* ------------------------------------------------------------------ the page tells us what is on screen */
-// The game's start marker: the log id of the server's "…Catastrophe: <title>…" system line (Play again keeps the log
-// and ids only grow, so it differs per game); plus the room and the title.
+// The game's start marker: the log id of the server's `log.gameBegins` line ("The game begins: … Catastrophe: …"; a line
+// without a key is found by its English text). Play again keeps the log and ids only grow, so it differs per game.
 function startLine(s) {
   const log = Array.isArray(s.log) ? s.log : [];
   for (let i = log.length - 1; i >= 0; i--) {
     const e = log[i];
-    if (e && e.kind === 'system' && typeof e.text === 'string' && e.text.includes('Catastrophe:')) return e;
+    if (!e || e.kind !== 'system') continue;
+    if (typeof e.key === 'string' && e.key) { if (e.key === 'log.gameBegins') return e; continue; }
+    if (typeof e.text === 'string' && e.text.includes('Catastrophe:')) return e;
   }
   return null;
 }
+// The catastrophe as the narrator knows a game by it: its content id, else (a mock, a server from before X5) its title.
+function catKey(c) { return c && typeof c.id === 'string' && c.id ? c.id : String(c && c.title ? c.title : '').trim().toLowerCase(); }
+// Marks a game as played once (per browser): its room, its start line and its catastrophe, never a title that a
+// language switch would change.
 function gameKey(s) {
   const e = startLine(s);
-  return `${s.room}|${e ? String(e.id) : ''}|${String(s.catastrophe.title).trim().toLowerCase()}`;
+  return `${s.room}|${e ? String(e.id) : ''}|${catKey(s.catastrophe)}`;
 }
 // ms since the game started by the server's clock, as this page sees it now (null = unknown, e.g. a mock state)
 function startAge(s) {
@@ -261,13 +285,14 @@ export function sync(s) {
     const o = s.serverNow - Date.now();
     clockSkew = clockSkew === null ? o : Math.max(clockSkew, o);
   }
-  const title = s && s.catastrophe && typeof s.catastrophe.title === 'string' ? s.catastrophe.title : '';
+  const title = shownTitle(s);
   const inGame = !!s && s.phase !== 'lobby' && !!title;
-  const game = inGame ? { room: s.room, title: title.trim().toLowerCase(), label: title } : null;
-  const same = !!game && !!st.game && st.game.room === game.room && st.game.title === game.title;
+  const game = inGame ? { room: s.room, id: typeof s.catastrophe.id === 'string' && s.catastrophe.id ? s.catastrophe.id : null, key: catKey(s.catastrophe), label: title } : null;
+  // (the same game in another language is the same game: the key is the catastrophe's id)
+  const same = !!game && !!st.game && st.game.room === game.room && st.game.key === game.key;
   if (!same) {
     // back in the lobby (Play again), another room or game, or the room was left: silence
-    if (st.forTitle || st.blocked || playing()) reset();
+    if (st.forKey || st.blocked || playing()) reset();
     st.pendingAuto = '';
     if (!s) st.menu = false;
   }
@@ -281,7 +306,7 @@ export function sync(s) {
     const age = startAge(s);
     if ((age === null || age <= FRESH_MS) && !wasPlayed(key)) {
       markPlayed(key);
-      if (clips) play(true); else st.pendingAuto = game.title;
+      if (clips) play(true); else st.pendingAuto = game.key;
     }
   }
   updatePill();
@@ -289,19 +314,20 @@ export function sync(s) {
 
 /* ------------------------------------------------------------------ UI pieces for the host's tree */
 function listenLabel() {
-  if (st.status === 'loading') return 'Loading…';
-  if (st.status === 'playing') return 'Stop';
-  return 'Listen';
+  if (st.status === 'loading') return tr('narr.loading');
+  if (st.status === 'playing') return tr('narr.stop');
+  return tr('narr.listen');
 }
-function listenButton(c, where, testid) {
+// title: the catastrophe's title as the state shows it (the viewer's language)
+function listenButton(c, title, where, testid) {
   if (!c) return null;
   const on = playing();
   return el('button', {
     class: ['narr-listen', on && 'is-on', st.status === 'loading' && 'is-loading', st.status === 'error' && 'is-error'],
     'data-narr': 'play', 'data-where': where, 'data-testid': testid, 'data-state': st.status,
     'aria-pressed': String(on),
-    title: on ? 'Stop the narration' : `Hear “${c.title}” read aloud (about ${Math.round(c.durationSec) || 40} s)`,
-    'aria-label': on ? 'Stop the narration' : `Listen to the catastrophe, ${c.title}`,
+    title: on ? tr('narr.stopTitle') : tr('narr.hearTitle', { title, secs: Math.round(c.durationSec) || 40 }),
+    'aria-label': on ? tr('narr.stopTitle') : tr('narr.listenAria', { title }),
   }, glyph(on ? 'stop' : 'play'), el('span', { class: 'narr-listen-t', text: listenLabel() }));
 }
 export function titleRow(titleEl, s, where) {
@@ -309,11 +335,11 @@ export function titleRow(titleEl, s, where) {
   // narration.json not in yet: hold the button's place (invisible), so it never pops in and pushes the text down
   if (clips === null) {
     return el('div', { class: 'narr-title-row', 'data-key': 'narr-row-' + where }, titleEl,
-      el('span', { class: 'narr-listen is-pending', 'aria-hidden': 'true' }, glyph('play'), el('span', { class: 'narr-listen-t', text: 'Listen' })));
+      el('span', { class: 'narr-listen is-pending', 'aria-hidden': 'true' }, glyph('play'), el('span', { class: 'narr-listen-t', text: tr('narr.listen') })));
   }
-  const c = clipFor(s.catastrophe.title);
+  const c = catClip(s.catastrophe);
   if (!c) return titleEl;
-  return el('div', { class: 'narr-title-row', 'data-key': 'narr-row-' + where }, titleEl, listenButton(c, where, 'narrator-play'));
+  return el('div', { class: 'narr-title-row', 'data-key': 'narr-row-' + where }, titleEl, listenButton(c, shownTitle(s), where, 'narrator-play'));
 }
 export function headerControl(s) {
   if (!started) return null;
@@ -324,38 +350,39 @@ export function headerControl(s) {
     el('button', {
       class: 'btn ghost sm narr-btn', 'data-narr': 'menu', 'data-testid': 'narrator-menu',
       'aria-haspopup': 'dialog', 'aria-expanded': String(st.menu),
-      title: on ? 'Narrator is on: the catastrophe is read aloud when a game starts' : 'Narrator is off: turn it on to hear the catastrophe read aloud',
-      'aria-label': `Narrator (${on ? 'on' : 'off'})`,
-    }, speaker(on || live), el('span', { class: 'narr-btn-t', text: 'Narrator' })),
+      title: on ? tr('narr.menuOnTitle') : tr('narr.menuOffTitle'),
+      'aria-label': on ? tr('narr.menuAriaOn') : tr('narr.menuAriaOff'),
+    }, speaker(on || live), el('span', { class: 'narr-btn-t', text: tr('narr.name') })),
     st.menu ? popover(s) : null);
 }
 function popover(s) {
   const on = prefs.on;
   const c = currentClip();
   const inGame = !!(s && s.phase !== 'lobby');
-  let note = st.hint;
-  if (!note && playing() && c) note = `Playing “${c.title}”.`;
-  if (!note) note = on ? (inGame ? 'On: it plays when the next game starts.' : TEXT_LOBBY_ON) : 'Off: nothing plays by itself.';
-  return el('div', { class: 'narr-pop', role: 'dialog', 'aria-label': 'Narrator', 'data-key': 'narr-pop' },
+  const title = st.game ? st.game.label : '';
+  let note = st.hint ? tr(st.hint) : '';
+  if (!note && playing() && c) note = tr('narr.playing', { title });
+  if (!note) note = on ? (inGame ? tr('narr.noteOnNext') : tr('narr.hintLobbyOn')) : tr('narr.noteOff');
+  return el('div', { class: 'narr-pop', role: 'dialog', 'aria-label': tr('narr.name'), 'data-key': 'narr-pop' },
     el('div', { class: 'narr-pop-head' },
-      el('span', { class: 'narr-pop-k', text: 'Narrator' }),
-      el('button', { class: 'narr-x', 'data-narr': 'close', 'aria-label': 'Close', title: 'Close' }, '×')),
-    el('p', { class: 'narr-pop-lead', text: 'A dramatic British voice reads the catastrophe aloud when the game starts. Only on this device — turn it on if you want it.' }),
+      el('span', { class: 'narr-pop-k', text: tr('narr.name') }),
+      el('button', { class: 'narr-x', 'data-narr': 'close', 'aria-label': tr('common.close'), title: tr('common.close') }, '×')),
+    el('p', { class: 'narr-pop-lead', text: tr('narr.lead') }),
     el('button', { class: ['narr-switch', on && 'is-on'], role: 'switch', 'aria-checked': String(on), 'data-narr': 'toggle', 'data-testid': 'narrator-toggle' },
-      el('span', { class: 'narr-switch-t', text: 'Read the catastrophe at game start' }),
+      el('span', { class: 'narr-switch-t', text: tr('narr.switch') }),
       el('span', { class: 'narr-track', 'aria-hidden': 'true' }, el('span', { class: 'narr-knob' })),
-      el('span', { class: 'narr-switch-v', text: on ? 'On' : 'Off' })),
+      el('span', { class: 'narr-switch-v', text: on ? tr('narr.on') : tr('narr.off') })),
     volumeWorks
       ? el('label', { class: 'narr-vol' },
-        el('span', { class: 'narr-vol-k', text: 'Volume' }),
-        el('input', { type: 'range', min: 0, max: 100, step: 1, value: prefs.vol, class: 'narr-range', 'data-narr': 'volume', 'data-testid': 'narrator-volume', 'aria-label': 'Narrator volume' }),
+        el('span', { class: 'narr-vol-k', text: tr('narr.volume') }),
+        el('input', { type: 'range', min: 0, max: 100, step: 1, value: prefs.vol, class: 'narr-range', 'data-narr': 'volume', 'data-testid': 'narrator-volume', 'aria-label': tr('narr.volumeAria') }),
         el('span', { class: 'narr-vol-v', 'data-narr-out': '', text: prefs.vol + '%' }))
       // iOS: a page cannot set media volume, so a slider would do nothing
       : el('div', { class: 'narr-vol', 'data-testid': 'narrator-volume-fixed' },
-        el('span', { class: 'narr-vol-k', text: 'Volume' }),
-        el('span', { class: 'narr-vol-na', text: 'Use your device’s volume buttons.' })),
-    c ? el('div', { class: 'narr-pop-play' }, listenButton(c, 'menu', 'narrator-play-menu'), el('span', { class: 'narr-pop-clip', text: c.title })) : null,
-    inGame && clips && !c ? el('p', { class: 'narr-pop-note', text: 'No narration for this catastrophe.' }) : null,
+        el('span', { class: 'narr-vol-k', text: tr('narr.volume') }),
+        el('span', { class: 'narr-vol-na', text: tr('narr.volumeFixed') })),
+    c ? el('div', { class: 'narr-pop-play' }, listenButton(c, title, 'menu', 'narrator-play-menu'), el('span', { class: 'narr-pop-clip', text: title })) : null,
+    inGame && clips && !c ? el('p', { class: 'narr-pop-note', text: tr('narr.noClip') }) : null,
     el('p', { class: ['narr-pop-note', st.status === 'error' && 'is-error'], role: 'status', text: note }));
 }
 
@@ -364,20 +391,36 @@ function updatePill() {
   if (!pill) return;
   const c = st.blocked ? currentClip() : null;
   const show = !!c && !playing();
-  if (pill.hidden === !show && (!show || pill.getAttribute('data-title') === c.title)) return;
+  const title = st.game ? st.game.label : '';
+  // (its fixed words follow the language: the pill lives outside the host's re-rendered tree)
+  pillWords();
+  if (pill.hidden === !show && (!show || pill.getAttribute('data-title') === title)) return;
   pill.hidden = !show;
   if (show) {
-    pill.setAttribute('data-title', c.title);
+    pill.setAttribute('data-title', title);
     const sub = pill.querySelector('.narr-pill-sub');
-    if (sub) sub.textContent = `${c.title} — your browser wants one tap for sound`;
+    if (sub) sub.textContent = tr('narr.pillSub', { title });
   }
 }
+// sets a text or an attribute only when it differs (the pill is not morphed: no churn for screen readers)
+function setText(node, v) { if (node && node.textContent !== v) node.textContent = v; }
+function setAttr(node, k, v) { if (node && node.getAttribute(k) !== v) node.setAttribute(k, v); }
+function pillWords() {
+  if (!pill) return;
+  setAttr(pill, 'aria-label', tr('narr.pillRegion'));
+  setText(pill.querySelector('.narr-pill-t'), tr('narr.pillTitle'));
+  const x = pill.querySelector('.narr-pill-x');
+  setAttr(x, 'aria-label', tr('narr.noThanks'));
+  setAttr(x, 'title', tr('narr.noThanks'));
+  const c = !pill.hidden ? currentClip() : null;
+  if (c) setText(pill.querySelector('.narr-pill-sub'), tr('narr.pillSub', { title: st.game ? st.game.label : '' }));
+}
 function makePill() {
-  pill = el('div', { class: 'narr-pill', role: 'region', 'aria-label': 'Narration', hidden: true },
+  pill = el('div', { class: 'narr-pill', role: 'region', 'aria-label': tr('narr.pillRegion'), hidden: true },
     el('button', { class: 'narr-pill-go', 'data-narr': 'unblock', 'data-testid': 'narrator-unblock' },
       glyph('play'),
-      el('span', { class: 'narr-pill-text' }, el('span', { class: 'narr-pill-t', text: 'Listen to the catastrophe' }), el('span', { class: 'narr-pill-sub' }))),
-    el('button', { class: 'narr-pill-x', 'data-narr': 'dismiss', 'aria-label': 'No thanks', title: 'No thanks' }, '×'));
+      el('span', { class: 'narr-pill-text' }, el('span', { class: 'narr-pill-t', text: tr('narr.pillTitle') }), el('span', { class: 'narr-pill-sub' }))),
+    el('button', { class: 'narr-pill-x', 'data-narr': 'dismiss', 'aria-label': tr('narr.noThanks'), title: tr('narr.noThanks') }, '×'));
   document.body.appendChild(pill);
 }
 
@@ -436,7 +479,7 @@ export function init(o = {}) {
     if (ev.type === 'playing') st.status = 'playing';
     else if (ev.type === 'waiting' && !audio.paused) st.status = 'loading';
     else if (ev.type === 'pause' || ev.type === 'ended') { if (st.status !== 'error') st.status = 'idle'; }
-    else if (ev.type === 'error') { st.status = 'error'; st.hint = 'The narration could not be loaded.'; }
+    else if (ev.type === 'error') { st.status = 'error'; st.hint = 'narr.hintLoadFailed'; }
     changed();
   };
   for (const t of ['playing', 'waiting', 'pause', 'ended', 'error']) audio.addEventListener(t, onMedia);
@@ -446,6 +489,8 @@ export function init(o = {}) {
   document.addEventListener('input', onInput);
   document.addEventListener('keydown', onKey);
   if (!opts.memory) window.addEventListener('storage', onStorage);
+  // a language switch without a new state (the landing page, offline): the pill's words follow it too
+  onLang(() => updatePill());
   loadManifest();
 }
 

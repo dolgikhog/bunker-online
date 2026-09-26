@@ -325,6 +325,8 @@ html.app-shell body { overscroll-behavior: none; }
 .hcell .v { font: 700 14px/1.15 var(--mono); color: var(--text); white-space: nowrap; }
 .hcell .v.code { color: var(--hz); letter-spacing: .12em; }
 .phase-cell .v { color: var(--hz); }
+/* a long phase name that would wrap the header's last buttons gives way (app.js fitHeader sets the size) */
+.phase-cell .v.squeezed { display: block; overflow: hidden; text-overflow: ellipsis; letter-spacing: -.02em; }
 .ph-vote.phase-cell .v, .ph-defense.phase-cell .v { color: var(--red-2); }
 .ph-final.phase-cell .v { color: var(--green); }
 .round-cell.ot .v { color: var(--orange); }
@@ -358,7 +360,13 @@ html.app-shell body { overscroll-behavior: none; }
 .timer-cell .v { font-size: 18px; font-variant-numeric: tabular-nums; }
 .timer-cell.low .v { color: var(--hz); }
 .timer-cell.over .v { color: var(--red); }
-.timer-cell.over .k::after { content: " · time's up"; color: var(--red); }
+/* the clock's row: the clock and, once it has run out, "time's up" (hdr.timeUp) beside it, in the label's type and red.
+   Outside the label, which ellipsizes a long name ("Konstantin's turn"): the tag stays whole */
+.timer-cell .tv { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+.timer-cell .over-tag { display: none; font: 700 9.5px/1.15 var(--mono); letter-spacing: .1em; text-transform: uppercase; white-space: nowrap; color: var(--red); }
+.timer-cell.over .over-tag { display: inline; }
+/* phones: the cell is 64–104 px wide, too narrow for the tag; the red 0:00 says it alone */
+@media (max-width: 639px) { .timer-cell.over .over-tag { display: none; } }
 .you-cell { display: none; }
 .you-name { max-width: 160px; overflow: hidden; text-overflow: ellipsis; }
 .leave { order: 18; align-self: center; margin: 0 0 0 auto; min-height: 40px; padding: 5px 10px; font-size: 10.5px; }
@@ -655,7 +663,8 @@ html.app-shell body { overscroll-behavior: none; }
 .cval { display: block; font-size: 13px; line-height: 1.3; overflow-wrap: anywhere; }
 .card.up .cval { font-weight: 600; }
 .facedown { display: none; }
-.card.hidden .cval::before { content: "hidden"; font: 600 10px/1.3 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+/* (the word is the cell's own aria-label, board.hiddenAria, in the page's language: CSS holds no English) */
+.card.hidden .cval::before { content: attr(aria-label); font: 600 10px/1.3 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
 .card.up.fresh { animation: flipDown .55s cubic-bezier(.2, .7, .3, 1.2) both; box-shadow: 0 0 0 2px var(--hz), 0 0 16px rgba(245, 197, 24, .35); transform-origin: 50% 0; }
 .card.up.fresh::before { content: ""; position: absolute; inset: 0; border-radius: 3px; background: linear-gradient(105deg, transparent 30%, rgba(255, 255, 255, .8) 48%, transparent 66%); background-size: 250% 100%; animation: glint 1.1s ease-out .2s both; pointer-events: none; }
 .card.up.late { background-image: linear-gradient(180deg, #fff3c4, #f3dc8a 60%, #e5c96a); }
@@ -837,9 +846,13 @@ html.app-shell body { overscroll-behavior: none; }
 .special.ready { border: 3px solid transparent; background: linear-gradient(180deg, #2c281b, #1c1a13) padding-box, repeating-linear-gradient(-45deg, var(--hz) 0 7px, #16150f 7px 14px) border-box; padding: 8px 9px; }
 .special.used { opacity: .5; }
 .sp-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
-.sp-title { font: 800 14.5px/1.2 var(--sans); }
+/* a title too long to share its line with the state label («Дипломатический иммунитет», «Продажный охранник» at
+   1280–1440) leaves the label the next line, at the right, and wraps between its words when it is wider than the card */
+.sp-top { flex-wrap: wrap; row-gap: 2px; }
+.sp-title { font: 800 14.5px/1.2 var(--sans); min-width: 0; }
+.sp-top .card-chip.cc-lg .cc-t { white-space: normal; overflow-wrap: anywhere; hyphens: auto; }
 .special.ready .sp-title { color: var(--hz-2); }
-.sp-state { font: 700 9px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
+.sp-state { flex: none; margin-left: auto; white-space: nowrap; font: 700 9px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
 .sp-state.ready { color: var(--hz); }
 .sp-text { font-size: 12.5px; color: var(--text-2); margin: 5px 0 4px; line-height: 1.4; }
 .sp-meta { font: 10px/1.4 var(--mono); color: var(--dim); }
@@ -993,6 +1006,10 @@ body.modal-open { overflow: hidden; }
 }
 .modal::before { content: ""; display: block; height: 4px; margin: 0 -16px 14px; background: var(--hazard); border-radius: 8px 8px 0 0; }
 .modal-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+/* the title takes what × leaves: a long special title («Дипломатический иммунитет») wraps, and × stays on the sheet */
+.modal-head > div { flex: 1 1 auto; min-width: 0; }
+.modal-head > .toast-x { flex: none; margin-left: -12px; }   /* (the title may run under × box's empty left edge) */
+.modal-title .card-chip.cc-xl .cc-t { white-space: normal; overflow-wrap: anywhere; hyphens: auto; }
 .modal-title { font: 800 22px/1.2 var(--sans); color: var(--hz); margin-top: 4px; }
 .modal-card-text { font-size: 14px; color: var(--text-2); margin-top: 6px; line-height: 1.45; }
 .modal-card-meta { font: 11px/1.4 var(--mono); color: var(--dim); margin-top: 4px; }
@@ -1337,7 +1354,16 @@ body.modal-open { overflow: hidden; }
   .hc-text { font-size: 13px; }
   .specials-panel .special { margin: 8px 8px 4px; }
   .timer-cell .k { max-width: 150px; }
+  /* one row that never wraps: if it still runs short, the "next vote" cell gives way with an ellipsis (its title has
+     the whole text, and the round track beside it shows the plan) instead of every cell shrinking and wrapping its
+     label onto a second line (a 10 px taller header) */
+  .hdr-row > .hcell { flex-shrink: 0; }
+  .hdr-row > .nv-cell { flex-shrink: 1; min-width: 64px; }
+  .nv-cell .k, .nv-cell .v { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 }
+/* in play the language switch takes ~70 px of the one-row header: up to 1599 px the brand keeps only its trefoil
+   there (as it already does below 1440), so nothing else has to give way */
+@media (min-width: 1440px) and (max-width: 1599px) { .shell.game .hdr-brand .hb-word { display: none; } }
 @media (min-width: 1180px) and (max-width: 1439px) {
   .body { grid-template-columns: minmax(0, 1fr) 280px; }
   .toasts { width: 256px; }
@@ -1918,4 +1944,139 @@ body.modal-open { overflow: hidden; }
 @media (hover: hover) {
   .hm-x:hover { color: var(--text); border-color: var(--line-2); }
   .hdr-menu-pop .rep-link:hover { border-color: var(--hz-line); background: var(--raise-2); }
+}
+
+/* ------------------------------------------------------------ the language switch (SPEC §11 X5.7; design §9.3) */
+/* one button, EN | RU, the current language lit: on the landing page above the brand, and in the header right before
+   Rules. Never disabled. (After the narrator section on purpose: its rules place Rules on phones, these override them.) */
+.lang-switch {
+  appearance: none;
+  display: inline-flex;
+  align-items: stretch;
+  flex: none;
+  padding: 0;
+  margin: 0;
+  min-height: 32px;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: transparent;
+  font: 700 10.5px/1 var(--mono);
+  letter-spacing: .08em;
+  color: var(--dim);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.lang-switch .ls-opt { display: inline-flex; align-items: center; justify-content: center; padding: 0 7px; }
+.lang-switch .ls-opt.on { background: var(--hz-soft); color: var(--hz); }
+.lang-switch .ls-opt + .ls-opt { border-left: 1px solid var(--line-2); }
+.lang-switch:focus-visible { outline: 2px solid var(--hz); outline-offset: 2px; }
+/* a switch in a room waits for the server's answer (a slow link): after a moment the button pulses until it lands */
+.lang-switch.is-pending { animation: lsPending 1.1s ease-in-out .6s infinite; }
+@keyframes lsPending { 50% { opacity: .45; } }
+@media (hover: hover) { .lang-switch:hover { border-color: var(--hz-line); color: var(--text-2); } }
+/* the header: in the first row, right before Rules */
+.ls-header { order: 17; align-self: center; margin: 0 0 0 auto; min-height: 40px; }
+.narr-hdr ~ .ls-header { margin-left: 6px; }
+.ls-header ~ .rules-btn { margin-left: 6px; }
+@media (min-width: 640px) { .ls-header { order: 0; margin-left: 6px; } }
+/* phones: a 2-letter pill (the language a tap switches to), 44 px wide. In the lobby it is in the top row, before
+   Rules. In play that row is full (room, round, phase, beds, Rules, ⋯: one more pill wrapped Rules onto a third header
+   row), so there it ends the row below, after the jump chips and before the narrator. The timer cell gives way (the
+   row never wraps: the header keeps its height), so its label sits above the clock, where it has the cell's whole
+   width («Ход: Оля», "Kai's turn", "Discussion": beside the clock it kept 2–3 letters) */
+@media (max-width: 639px) {
+  .ls-header { min-width: 44px; justify-content: center; }
+  .ls-header .ls-opt.on { display: none; }
+  .ls-header .ls-opt { padding: 0 10px; }
+  .ls-header .ls-opt + .ls-opt { border-left: 0; }
+  .shell.game .ls-header { order: 21; margin: 0 0 0 4px; }
+  .hdr-row:has(> .narr-hdr.in-game):has(> .ls-header) > .timer-cell { flex-basis: 64px; }   /* (80 px for the narrator alone) */
+  .shell.game .timer-cell { flex-direction: column; align-items: stretch; justify-content: center; gap: 2px; padding: 3px 4px; }
+  .shell.game .timer-cell .v { line-height: 1.05; }
+}
+/* tablets in play: the first row wraps easily, so the switch sits at the right end of the row of jump chips, left of the
+   narrator (taken out of the flow like it: no row ever wraps because of it) */
+@media (min-width: 640px) and (max-width: 1179px) {
+  .hdr-row:has(> .jump) { position: relative; }
+  .hdr-row:has(> .jump) > .ls-header { position: absolute; right: 8px; bottom: 4px; margin: 0; }
+  .hdr-row:has(> .jump):has(> .narr-hdr.in-game) > .ls-header { right: 56px; }
+}
+/* phones in the lobby: the top row keeps room, phase, the narrator, the pill, Rules, ⋯ and Leave on one line: up to
+   440 px the narrator's button is its icon (as at 360 px before), and on small phones the gaps and the buttons'
+   padding give way a little */
+@media (max-width: 440px) { .shell.lobby .narr-hdr.in-lobby .narr-btn-t { display: none; } }
+@media (max-width: 420px) {
+  .shell.lobby .ls-header { min-width: 40px; }
+  .shell.lobby .ls-header .ls-opt { padding: 0 8px; }
+  .shell.lobby .narr-hdr ~ .ls-header, .shell.lobby .ls-header ~ .rules-btn { margin-left: 4px; }
+  .shell.lobby .rules-btn ~ .leave { margin-left: 6px; }
+  .shell.lobby .rules-btn, .shell.lobby .hdr .leave { padding: 4px 6px; }
+}
+/* the landing page: a row of its own above the brand, right-aligned (on screen at 360 × 640, above the form) */
+.landing-top { display: flex; justify-content: flex-end; width: min(1140px, 100%); margin: 0 auto; padding: 10px 16px 0; }
+@media (min-width: 900px) { .landing-top { padding: 14px 32px 0; } }
+.ls-landing { min-height: 36px; }
+.ls-landing .ls-opt { padding: 0 11px; }
+
+/* Russian (design §14): the condensed display faces have no Cyrillic on Apple devices ("DIN Condensed"), so a Russian
+   heading would fall back letter by letter to a wider font while its digits stayed condensed. In ru the display face
+   is the system font, heavier and tighter, the same on every device. */
+html:lang(ru) { --display: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif; }
+html:lang(ru) .stamp-tag { font-weight: 800; letter-spacing: .06em; }
+html:lang(ru) .sg-title { font-weight: 800; font-size: 21px; letter-spacing: .02em; }
+html:lang(ru) .fc-title { font-weight: 800; font-size: 21px; letter-spacing: .01em; }
+html:lang(ru) .fb-title { font-weight: 800; letter-spacing: .01em; }
+html:lang(ru) .brief-title { letter-spacing: 0; }
+/* Russian header words run longer ("Голосование", "Правила", "Койки / в игре"): on phones the top row's cells, labels
+   and Rules button give up a little padding and tracking, so the row keeps Rules and ⋯ in more phases (phones and
+   small tablets) */
+@media (max-width: 799px) {
+  html:lang(ru) .hdr-row > .hcell { padding-left: 4px; padding-right: 4px; }
+  html:lang(ru) .hdr-row > .hcell .k { letter-spacing: .02em; }
+  html:lang(ru) .hdr-row > .rules-btn { padding-left: 6px; padding-right: 6px; letter-spacing: .02em; }
+}
+@media (max-width: 420px) {
+  html:lang(ru) .hdr-row > .hcell .v { font-size: 12.5px; }
+}
+/* Russian host buttons on small phones: «Закрыть голосование» wrapped onto two lines in its half of the bar (141 px),
+   which pushed the vote buttons below the bar's fold in a 16-player vote. A little smaller and tighter, it fits. */
+@media (max-width: 420px) {
+  html:lang(ru) .bar-host .b-main { font-size: 11px; letter-spacing: .02em; }
+}
+/* Russian special titles in the table's status column (desktop matrix, about 100 px wide): «Сыворотка правды»,
+   «Вечерние курсы» kept 7 letters. In ru the column is a little wider (each card column gives up 2–3 px), so most
+   titles fit on their line and the status line («через 3 · 5/8») stops wrapping, and a longer title takes a second
+   line («Украденный / дневник»), breaking between words (a word too long for the line is hyphenated where the browser
+   has a Russian dictionary, «Рентгенов-ские», and else breaks inside it) */
+@media (min-width: 1024px) {
+  html:lang(ru) .brow { grid-template-columns: minmax(150px, 1.45fr) repeat(8, minmax(0, 1fr)) minmax(118px, 1.22fr); }
+  html:lang(ru) .board.with-adm .brow { grid-template-columns: minmax(172px, 1.6fr) repeat(8, minmax(0, 1fr)) minmax(112px, 1.15fr); }
+  html:lang(ru) .prow .st .sp-chip.card-chip { align-items: flex-start; }
+  html:lang(ru) .prow .st .sp-chip.card-chip .cc-ico { margin-top: 3px; }
+  html:lang(ru) .prow .st .sp-chip.card-chip .cc-t {
+    white-space: normal; overflow-wrap: anywhere; hyphens: auto;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
+}
+@media (min-width: 1180px) and (max-width: 1439px) {
+  html:lang(ru) .board.with-adm .brow { grid-template-columns: minmax(166px, 1.5fr) repeat(8, minmax(0, 1fr)) minmax(108px, 1.08fr); }
+}
+@media (min-width: 1500px) {
+  html:lang(ru) .brow { grid-template-columns: minmax(160px, 1.4fr) repeat(8, minmax(0, 1fr)) minmax(130px, 1.22fr); }
+  html:lang(ru) .board.with-adm .brow { grid-template-columns: minmax(180px, 1.5fr) repeat(8, minmax(0, 1fr)) minmax(126px, 1.22fr); }
+}
+
+/* ------------------------------------------------------------ touch screens: finger-sized targets (≥ 40 px) */
+/* Buttons whose height sets their row's grow a little; small chips and links keep their look and get a transparent hit
+   area around them instead (::before), so nothing moves. */
+@media (pointer: coarse) {
+  .ls-landing { min-height: 40px; }
+  .brief-head .btn { min-height: 40px; }
+  .card-chip:not(.in-text), .hand-sp-link, .aa-who, .rep-link, .hdr-menu-btn { position: relative; }
+  .sp-chip.card-chip { overflow: visible; }   /* (its title ellipsizes itself: .cc-t) */
+  .card-chip:not(.in-text)::before, .hand-sp-link::before, .aa-who::before, .rep-link::before {
+    content: ""; position: absolute; left: 0; right: 0; top: 50%; height: 40px; min-height: 100%; transform: translateY(-50%);
+  }
+  /* ⋯ (36 px wide): its row is full on phones, so it keeps its width and its hit area reaches into the gaps beside it */
+  .hdr-menu-btn::before { content: ""; position: absolute; top: 0; bottom: 0; left: -3px; right: -3px; }
 }

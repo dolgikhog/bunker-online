@@ -1,6 +1,15 @@
 /* Bunker Online — reading the server's log lines (no DOM: app.js imports it, and test/client-loglines.test.js runs it
  * against real engine logs).
  *
+ * Two paths (SPEC §11 X5.3; reports/i18n-design.md §8):
+ *   - the key path: an entry with `key` (a server/i18n message key) and `params` (its language-neutral wire params:
+ *     player ids, category ids, the round prefix {r, ot}, nested messages {key, params}). Everything below reads the
+ *     key and the params, never the text, which is in the viewer's language and may be Russian. `parts` (typed segments
+ *     whose texts join to `text`) carry the chips; flashParts() and partsText() read them.
+ *   - the legacy path: an entry without `key` (a mock fixture, a server from before X5, the deploy window) is read from
+ *     its English text as before, by the exact shapes below. The text functions stay exported for it.
+ *
+ * The legacy text path:
  * Player names are free text (SPEC §6/N1: letters, digits, punctuation and symbols, so quotes, “…”, «…» and even 🚪 are
  * allowed), and they sit inside the lines. So a line is never classified by a character or a quoted word that a name
  * could carry, only by the exact shapes the server writes, with the names in them matched as whole names:
@@ -34,6 +43,111 @@ export function airlockLine(text, logKind) {
   m = AIR_JAM.exec(text);
   if (m) return { kind: 'jam', at: DOOR.length + 'The '.length, target: m[1] };
   return null;
+}
+/** The legacy text reader under the name the design gives it (reports/i18n-design.md §8.4). */
+export { airlockLine as airlockLineText };
+
+/* ------------------------------------------------------------------ the key path (SPEC §11 X5.3) */
+
+/** Whether an entry carries a message key (and so is read by it, never by its text). */
+export function keyed(e) {
+  return !!e && typeof e.key === 'string' && e.key !== '' && !!e.params && typeof e.params === 'object';
+}
+/** The three airlock lines by key (SPEC §11 X1): params a (who started it), by (who sealed it), t (the target). */
+export const AIR_KEYS = Object.freeze({ 'log.airlockSeal': 'seal', 'log.airlockStart': 'start', 'log.airlockJam': 'jam' });
+/** A player who left a game, or was kicked from it (SPEC §11 L2): param p. */
+export const LEAVE_KEYS = Object.freeze(['log.leftGame', 'log.kicked']);
+const CANCEL_RESULTS = ['res.cancelNow', 'res.cancelRest'];
+
+/** The name a player part of the line gives for `id` (the name when the line was logged), or ''. */
+export function partName(e, id) {
+  for (const x of (e && Array.isArray(e.parts) ? e.parts : [])) if (x && typeof x === 'object' && x.t === 'player' && x.id === id) return String(x.v);
+  return '';
+}
+
+/**
+ * Which airlock line an entry is: `{kind: 'seal'|'start'|'jam', ...}` or null. By key: `{kind, a, t, by}` (ids; by is
+ * a list), plus the names `byName` and `target` read from the line's own player parts. Without a key: the text reader
+ * above (`{kind, at, by, target}` with names), checked against the entry's kind.
+ */
+export function airlockOf(e) {
+  if (!e) return null;
+  if (keyed(e)) {
+    const kind = AIR_KEYS[e.key];
+    if (!kind) return null;
+    const p = e.params;
+    return { kind, a: p.a ?? null, t: p.t ?? null, by: Array.isArray(p.by) ? p.by : [], byName: partName(e, p.a), target: partName(e, p.t) };
+  }
+  return airlockLine(e.text, e.kind);
+}
+
+/** "{player} left the game" / "{player} was removed by the host": by key (param p), else the legacy text shapes. */
+export function leaveOf(e, names) {
+  if (!e) return null;
+  if (keyed(e)) return LEAVE_KEYS.includes(e.key) ? { id: e.params.p ?? null, kicked: e.key === 'log.kicked' } : null;
+  return isLeaveLine(e, names) ? { id: null, kicked: typeof e.text === 'string' && e.text.endsWith(' was removed by the host') } : null;
+}
+
+/** SPEC §11 X6: the host's End game line (`log.endGame`; the text 'The host ended the game' without a key). */
+export function isEndGameLine(e) {
+  if (!e || e.kind !== 'system') return false;
+  return keyed(e) ? e.key === 'log.endGame' : e.text === 'The host ended the game';
+}
+/** A game's first line ("The game begins: …", `log.gameBegins`). */
+export function isGameStartLine(e) {
+  if (!e || e.kind !== 'system') return false;
+  return keyed(e) ? e.key === 'log.gameBegins' : typeof e.text === 'string' && /^The game (begins|started)\b/.test(e.text);
+}
+/** Round 1's reveal line ("Round 1 of 7 — reveal phase …", `log.roundReveal` with r = 1): a game's briefing starts there. */
+export function isRoundOneLine(e) {
+  if (!e || e.kind !== 'system') return false;
+  return keyed(e) ? e.key === 'log.roundReveal' && e.params.r === 1 : typeof e.text === 'string' && /^Round 1 of /.test(e.text);
+}
+/** A host change ("… is now the host", `log.host`): `{id, why}` (why: the nested reason's key, or null), else null. */
+export function hostChangeOf(e) {
+  if (!e || e.kind !== 'info') return null;
+  if (keyed(e)) {
+    if (e.key !== 'log.host') return null;
+    const w = e.params.why;
+    return { id: e.params.p ?? null, why: w && typeof w === 'object' && typeof w.key === 'string' ? w : null };
+  }
+  return typeof e.text === 'string' && / is now the host$/.test(e.text) ? { id: null, why: null } : null;
+}
+
+/** A round prefix param {r, ot} as the round it names (1..7, or 'OT'), or null. */
+function roundOf(rp) {
+  if (!rp || typeof rp !== 'object') return null;
+  return rp.ot ? 'OT' : Number.isInteger(rp.r) ? rp.r : null;
+}
+
+/**
+ * The card a speaker revealed on this turn (the bar names it): the last `log.reveal` of player `id` in round
+ * `round`/`overtime`, looking back no further than the start of the phase (a system line). `{cat, entry, value}`
+ * (value: the card's text as the line shows it), or null. Key path only; see app.js for the legacy text reader.
+ */
+export function revealOf(log, id, round, overtime) {
+  const want = overtime ? 'OT' : round;
+  for (let i = (log || []).length - 1; i >= 0; i--) {
+    const e = log[i];
+    if (!e || e.kind === 'system') break;
+    if (!keyed(e) || e.key !== 'log.reveal' || e.params.p !== id || roundOf(e.params.rp) !== want) continue;
+    const v = (Array.isArray(e.parts) ? e.parts : []).find((x) => x && typeof x === 'object' && x.t === 'value');
+    return { cat: e.params.cat, entry: e, value: v ? String(v.v) : '' };
+  }
+  return null;
+}
+
+/** A part's text: a plain string, or a typed segment's `v`. */
+export function partText(x) { return typeof x === 'string' ? x : x && typeof x === 'object' ? String(x.v ?? '') : ''; }
+/** The text of a list of parts (design §8.1: the parts of an entry join to exactly its text). */
+export function partsText(parts) { return (Array.isArray(parts) ? parts : []).map(partText).join(''); }
+/**
+ * A line as a flash (and the final banner) tells it (design §8.2): without the round prefix and without the special's
+ * own rules text (both stay in the log). The parts that are left, or null for an entry without parts.
+ */
+export function flashParts(e) {
+  if (!e || !Array.isArray(e.parts) || !keyed(e)) return null;
+  return e.parts.filter((x) => !(x && typeof x === 'object' && (x.t === 'prefix' || x.t === 'cardtext')));
 }
 
 const ROUND_HEAD = /^(?:(?:Round \d+|Overtime) — )?/;
@@ -113,6 +227,21 @@ export function voteHistory(log) {
   let cur = null;
   const at = (r) => { if (!h.has(r)) h.set(r, { out: 0, cancelled: false, due: 0 }); return h.get(r); };
   for (const e of log || []) {
+    // the key path: the same events, read from keys and params (the round from the line's round prefix)
+    if (keyed(e)) {
+      const k = e.key;
+      const p = e.params;
+      if (k === 'log.gameBegins') { h.clear(); cur = null; continue; }
+      if (k === 'log.roundReveal' && Number.isInteger(p.r)) { cur = p.r; at(cur); continue; }
+      if (k === 'log.overtime') { cur = 'OT'; at(cur); continue; }
+      if (cur === null) continue;
+      if (k === 'log.eject') { at(cur).out += 1; continue; }
+      if (roundOf(p.rp) !== cur) continue;
+      if ((k === 'log.discussion' && p.mode === 'vote') || k === 'log.voteStep') at(cur).due = Number(p.k) || 0;
+      else if (k === 'log.voteSkipped' || k === 'log.allImmune') at(cur).cancelled = true;
+      else if (k === 'log.special' && p.result && CANCEL_RESULTS.includes(p.result.key)) at(cur).cancelled = true;
+      continue;
+    }
     if (!e || typeof e.text !== 'string') continue;
     const t = e.text;
     let m;
@@ -138,9 +267,14 @@ export function voteHistory(log) {
   return h;
 }
 
-/** "{player} left the game" or "{player} was removed by the host" (SPEC §11 L2), for one of `names`. */
+/**
+ * "{player} left the game" or "{player} was removed by the host" (SPEC §11 L2): by key (`log.leftGame`,
+ * `log.kicked`), or, without one, the exact text for one of `names`.
+ */
 export function isLeaveLine(e, names) {
-  if (!e || e.kind !== 'info' || typeof e.text !== 'string') return false;
+  if (!e || e.kind !== 'info') return false;
+  if (keyed(e)) return LEAVE_KEYS.includes(e.key);
+  if (typeof e.text !== 'string') return false;
   return (names || []).some((n) => e.text === `${n} left the game` || e.text === `${n} was removed by the host`);
 }
 
@@ -154,16 +288,17 @@ export function finalCause(s) {
   const log = (s && s.log) || [];
   const names = ((s && s.players) || []).map((p) => p.name);
   let i = log.length - 1;
-  while (i >= 0 && log[i].kind !== 'system') i--;
+  // (by key: the last `log.doorCloses`; without one, the last system line, as the door's line always is)
+  while (i >= 0 && !(keyed(log[i]) ? log[i].key === 'log.doorCloses' : log[i].kind === 'system')) i--;
   for (let j = i - 1; j >= 0 && j >= i - 12; j--) {
     const e = log[j];
-    const air = airlockLine(e.text, e.kind);
+    const air = airlockOf(e);
     if (air && air.kind === 'seal') return { kind: 'special', entry: e, airlock: true };
     if (air) continue;
     if (e.kind === 'eject') {
       // (a plain "is ejected" line right after a seal would still be the seal's)
       const prev = j > 0 ? log[j - 1] : null;
-      if (prev && (airlockLine(prev.text, prev.kind) || {}).kind === 'seal') return { kind: 'special', entry: prev, airlock: true };
+      if (prev && (airlockOf(prev) || {}).kind === 'seal') return { kind: 'special', entry: prev, airlock: true };
       return { kind: 'vote', entry: e };
     }
     if (e.kind === 'special') return { kind: 'special', entry: e };

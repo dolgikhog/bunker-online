@@ -1,9 +1,20 @@
 // server/rooms.js — room registry, identities & tokens, per-recipient broadcast, host grace, cleanup (SPEC.md §6, §7, §9).
-// Transport-agnostic: a "conn" is any object with send(obj). index.js wraps each WebSocket in one.
+// Transport-agnostic: a "conn" is any object with send(obj); one that also has sendChunks([Buffer, Buffer]) gets its
+// states as the UTF-8 chunks of a ready JSON frame (index.js sends them as fragments of one WebSocket message), and one
+// with sendText(string) as the JSON text.
+//
+// §11 X5.1 languages: every socket has `conn.lang` ('en' until a hello's `lang` or a setLang says otherwise). setLang
+// is accepted at any time, like ping: before joining it only sets conn.lang (no reply); with an identity it also sets
+// the member's language and sends that socket one state. Errors, `kicked.reason` and the `replaced` error are
+// rendered in the receiving socket's language. States are rendered by the engine in the member's language; the log,
+// the same for every recipient of one language, is serialized and UTF-8 encoded once per language and log version and
+// spliced into each frame (`log` last on the wire, report §3.8). Over LOG_WIRE_BUDGET its oldest entries go without
+// `parts` (report §14), and a frame that would still pass FRAME_BUDGET leaves its oldest entries off.
 
 import crypto from 'node:crypto';
 import { createGame, validateMessage, sanitizeName, fail } from './game.js';
 import { deriveRng } from './rng.js';
+import { renderText, normLang } from './i18n/index.js';
 
 export const ROOM_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
 export const MAX_ROOMS = 200;
@@ -27,9 +38,187 @@ export const JOIN_FAIL_REFILL_MS = 3000;
 export const SITE_FACTOR = 3;
 export const MAX_ROOMS_PER_SITE = MAX_ROOMS_PER_IP * SITE_FACTOR;
 export const JOIN_FAIL_SITE_BURST = JOIN_FAIL_BURST * SITE_FACTOR;
-const LOOKUP_THROTTLED = 'Too many wrong room codes from your network. Wait a minute, then try again';
-/** §11 X9: the answer to every {t:'dev'} when the server is not in dev mode (BUNKER_DEV=1). */
-export const DEV_OFF = 'Dev mode is off: test shortcuts are not available on this server';
+/** §11 X9: the answer to every {t:'dev'} when the server is not in dev mode (BUNKER_DEV=1), in English (err.devOff). */
+export const DEV_OFF = renderText('en', 'err.devOff');
+/** Hellos whose own `lang` applies before they are handled (§11 X5.1). */
+const HELLOS = new Set(['create', 'join', 'resume']);
+
+/**
+ * §11 X5.2 (report §3.8, the §14 fallback): a state's size on the wire, FRAME_BUDGET bytes of UTF-8 per recipient at
+ * most. Two steps, both on the log (the rest of the frame, "the head", is the view itself and is never trimmed):
+ * 1. The parts cut. Every entry carries `parts` unless the log's JSON would then pass LOG_WIRE_BUDGET bytes; the
+ *    oldest entries then go without them, as {id, ts, kind, text, key, params}, and clients render those from `text`
+ *    (the path an entry without parts always takes). The newest PARTS_MIN entries always keep their parts: flashes, the
+ *    final banner and the current turn read them. `parts` are half of a full log's bytes; without the cut a Russian
+ *    state in the final is ~170 KB per recipient.
+ * 2. The frame guard. LOG_WIRE_BUDGET leaves ~36 KB for the head, and the newest PARTS_MIN entries keep their parts
+ *    whatever they cost, so with long Cyrillic names (NAME_MAX letters, 2 bytes each) and a special-heavy game the bare
+ *    entries alone can nearly fill the log's budget, and a Russian final reached ~138 KB. When this recipient's head
+ *    plus the cut log would pass FRAME_BUDGET, the parts cut is redone against what the head leaves (never below
+ *    PARTS_MIN), and then the oldest entries are left off, as few as the frame needs and never the newest PARTS_MIN: the
+ *    log is then the newest entries that fit, a shorter window of the same log (the engine already keeps only the last
+ *    200). It only happens when a frame would pass the budget, so an English table (1 byte a letter) keeps its window.
+ * Only which entries keep their parts and where the window starts depend on the budgets: the entries are the ones the
+ * engine made, in its order, and every recipient whose frame fits gets the very same log.
+ */
+export const FRAME_BUDGET = 120 * 1024;
+export const LOG_WIRE_BUDGET = 84 * 1024;
+export const PARTS_MIN = 20;
+/** The bytes a frame adds to its head and its log's JSON: `,"log":` (the head's closing `}` is reused). */
+const LOG_SPLICE = Buffer.byteLength(',"log":');
+
+/** An entry without its parts, cached per entry (entries are frozen and never change once logged). */
+const BARE = new WeakMap();
+function bareEntry(e) {
+  if (!e || typeof e !== 'object' || !Object.hasOwn(e, 'parts')) return e;
+  let b = BARE.get(e);
+  if (b === undefined) {
+    b = Object.freeze({ id: e.id, ts: e.ts, kind: e.kind, text: e.text, key: e.key, params: e.params });
+    BARE.set(e, b);
+  }
+  return b;
+}
+
+/** An entry's JSON size in UTF-8 bytes, with and without its parts (cached per frozen entry). */
+const SIZES = new WeakMap();
+const jsonBytes = (x) => Buffer.byteLength(JSON.stringify(x) ?? 'null');
+function entrySizes(e) {
+  const frozen = !!e && typeof e === 'object' && Object.isFrozen(e);
+  let s = frozen ? SIZES.get(e) : undefined;
+  if (s === undefined) {
+    const b = bareEntry(e);
+    const full = jsonBytes(e);
+    s = { full, bare: b === e ? full : jsonBytes(b) };
+    if (frozen) SIZES.set(e, s);
+  }
+  return s;
+}
+
+/**
+ * Where the §14 cut falls for a log that may take `logBudget` bytes of UTF-8 (Infinity: only the parts cut): `keep`, how
+ * many of the newest entries keep their parts; `drop`, how many of the oldest are left off (the frame guard); `bytes`,
+ * the resulting log's JSON size. The parts cut aims at min(LOG_WIRE_BUDGET, logBudget); only a log still over
+ * logBudget with its newest PARTS_MIN entries' parts loses entries. When the parts cut alone fits logBudget, the plan is
+ * exactly the parts cut's (the frame guard changes nothing for a frame within FRAME_BUDGET).
+ */
+function planCut(log, logBudget = Infinity, sizes = log.map(entrySizes)) {
+  const n = log.length;
+  let bytes = 2 + Math.max(0, n - 1); // the brackets and the commas
+  for (const s of sizes) bytes += s.bare;
+  const partsBudget = Math.min(LOG_WIRE_BUDGET, logBudget);
+  let keep = 0;
+  for (let i = n - 1; i >= 0; i--) {
+    const extra = sizes[i].full - sizes[i].bare;
+    if (keep >= PARTS_MIN && bytes + extra > partsBudget) break;
+    bytes += extra;
+    keep++;
+  }
+  let drop = 0;
+  while (bytes > logBudget && n - drop > keep) bytes -= sizes[drop++].bare + 1; // the entry and its comma
+  return { keep, drop, bytes };
+}
+
+/** The wire log a plan gives: the entries from `drop` on, those older than the newest `keep` without their parts. */
+function applyCut(log, { keep, drop, bytes }) {
+  const cut = log.length - keep;
+  if (cut === 0 && drop === 0) return { log, bytes, json: null, tail: null };
+  const out = [];
+  for (let i = drop; i < log.length; i++) out.push(i < cut ? bareEntry(log[i]) : log[i]);
+  return { log: Object.freeze(out), bytes, json: null, tail: null };
+}
+
+/**
+ * What goes on the wire for one view's log array, for a frame whose log may take `logBudget` bytes. The engine hands
+ * every recipient of one language the same frozen array until the log changes (report §3.8), so everything derived from
+ * it is cached per array: the cut log, its JSON (kept only when a transport asks for text) and its UTF-8 bytes. The
+ * parts cut alone (`def`) serves every frame it fits; the frame guard's cuts are cached by where they fall, so
+ * recipients whose heads need the same cut share one encoding too.
+ */
+const WIRE = new WeakMap();
+const cacheable = (log) => Array.isArray(log) && Object.isFrozen(log);
+function wireOf(log, logBudget = Infinity) {
+  if (!cacheable(log)) {
+    const w = applyCut(log, planCut(log));
+    return w.bytes <= logBudget ? w : applyCut(log, planCut(log, logBudget));
+  }
+  let c = WIRE.get(log);
+  if (c === undefined) {
+    const sizes = log.map(entrySizes);
+    c = { sizes, def: applyCut(log, planCut(log, Infinity, sizes)), guarded: null };
+    WIRE.set(log, c);
+  }
+  if (c.def.bytes <= logBudget) return c.def;
+  const plan = planCut(log, logBudget, c.sizes);
+  const k = `${plan.keep}:${plan.drop}`;
+  c.guarded ??= new Map();
+  let w = c.guarded.get(k);
+  if (w === undefined) {
+    w = applyCut(log, plan);
+    c.guarded.set(k, w);
+  }
+  return w;
+}
+
+/**
+ * A view's log as it is sent: the §14 parts cut (see LOG_WIRE_BUDGET), and, given the bytes the frame leaves for its
+ * log (FRAME_BUDGET minus the head, see logBudgetFor), the frame guard.
+ */
+export function wireLog(log, logBudget = Infinity) {
+  if (!Array.isArray(log)) return log;
+  return wireOf(log, logBudget).log;
+}
+
+/** The bytes of UTF-8 a frame whose head (the view without its log, as JSON) takes `headBytes` leaves for its log. */
+export function logBudgetFor(headBytes) {
+  return FRAME_BUDGET - headBytes - LOG_SPLICE;
+}
+
+/** The JSON of a wire log, serialized once per cut of a log array (so once per language per log version). */
+function jsonOf(w) {
+  if (w.json === null) w.json = JSON.stringify(w.log);
+  return w.json;
+}
+
+/**
+ * The end of every frame that carries this wire log: `,"log":`, the log's JSON and the frame's closing `}`, as UTF-8,
+ * encoded once per cut. Every recipient of one language is sent the very same bytes (no per-recipient encoding or copy).
+ */
+function tailOf(w) {
+  if (w.tail === null) w.tail = Buffer.from(`,"log":${w.json ?? JSON.stringify(w.log)}}`);
+  return w.tail;
+}
+
+/**
+ * A state frame as JSON text: the view without its log, then the wire log (serialized once per language) spliced last,
+ * within FRAME_BUDGET (the frame guard, see LOG_WIRE_BUDGET).
+ */
+export function stateFrame(view) {
+  const { log, ...rest } = view;
+  const head = JSON.stringify({ t: 'state', ...rest });
+  if (!Array.isArray(log)) return `${head.slice(0, -1)},"log":${JSON.stringify(log)}}`;
+  return `${head.slice(0, -1)},"log":${jsonOf(wireOf(log, logBudgetFor(Buffer.byteLength(head))))}}`;
+}
+
+/**
+ * The same frame as two UTF-8 chunks whose concatenation is stateFrame(view): this recipient's head (the view without
+ * its log, and without the closing `}`), then the log's shared tail (tailOf). index.js sends them as two fragments of
+ * one WebSocket text message, so a broadcast encodes the head per recipient and the log once per language.
+ */
+export function stateFrameChunks(view) {
+  const { log, ...rest } = view;
+  const head = Buffer.from(JSON.stringify({ t: 'state', ...rest }));
+  const tail = Array.isArray(log) ? tailOf(wireOf(log, logBudgetFor(head.length))) : Buffer.from(`,"log":${JSON.stringify(log)}}`);
+  return [head.subarray(0, head.length - 1), tail];
+}
+
+/** A state as an object, for a transport that takes objects: the same wire log as the frame would carry. */
+export function stateMessage(view) {
+  const { log, ...rest } = view;
+  const out = { t: 'state', ...view };
+  if (Array.isArray(log)) out.log = wireLog(log, logBudgetFor(Buffer.byteLength(JSON.stringify({ t: 'state', ...rest }))));
+  return out;
+}
+
 /** Phases of a game in progress (§11 X8 `activeGames`): a deploy restart would end it. */
 const ACTIVE_PHASES = new Set(['reveal', 'discussion', 'vote', 'defense']);
 const NO_TOKENS = new Map();
@@ -135,6 +324,7 @@ export class Rooms {
   open(conn) {
     conn.roomCode = null;
     conn.playerId = null;
+    conn.lang = normLang(conn.lang) ?? 'en';
   }
 
   close(conn) {
@@ -147,7 +337,7 @@ export class Rooms {
       this._message(conn, text);
     } catch (e) {
       this.logger('message handler failed', e);
-      this._error(conn, fail('bad_request', 'Something went wrong'));
+      this._error(conn, fail('bad_request', 'err.generic'));
     }
   }
 
@@ -194,25 +384,36 @@ export class Rooms {
     try { conn.send(obj); } catch (e) { this.logger('send failed', e); }
   }
 
+  /** An error in the socket's language (§11 X5.1): a failure's key rendered, or its ready message when it has none. */
   _error(conn, res) {
-    this._send(conn, { t: 'error', code: res.code, message: res.message });
+    this._send(conn, { t: 'error', code: res.code, message: this._text(conn, res.key, res.params, res.message) });
+  }
+
+  /** `key` rendered in the socket's language (`fallback` when there is no key). */
+  _text(conn, key, params, fallback = '') {
+    if (!key) return fallback;
+    return renderText(normLang(conn.lang) ?? 'en', key, params || {});
   }
 
   _message(conn, text) {
-    if (typeof text !== 'string') { this._error(conn, fail('bad_request', 'Expected a JSON text frame')); return; }
+    if (typeof text !== 'string') { this._error(conn, fail('bad_request', 'err.jsonFrame')); return; }
     let msg;
-    try { msg = JSON.parse(text); } catch { this._error(conn, fail('bad_request', 'Malformed JSON')); return; }
+    try { msg = JSON.parse(text); } catch { this._error(conn, fail('bad_request', 'err.malformedJson')); return; }
+    const isObj = msg !== null && typeof msg === 'object' && !Array.isArray(msg);
     // §11 X9: {t:'dev', op, ...} exists only in dev mode. Otherwise every such message is not_allowed before any of its
     // fields is read, whoever sends it, joined or not.
-    if (msg !== null && typeof msg === 'object' && !Array.isArray(msg) && msg.t === 'dev') {
+    if (isObj && msg.t === 'dev') {
       if (this.dev) this.dev.handle(conn, msg);
-      else this._error(conn, fail('not_allowed', DEV_OFF));
+      else this._error(conn, fail('not_allowed', 'err.devOff'));
       return;
     }
+    // §11 X5.1: a hello's own valid `lang` applies before the hello is handled, so its answer (an error too) is in it
+    if (isObj && HELLOS.has(msg.t) && normLang(msg.lang)) conn.lang = msg.lang;
     const bad = validateMessage(msg);
     if (bad) { this._error(conn, bad); return; }
     switch (msg.t) {
       case 'ping': this._send(conn, { t: 'pong' }); return;
+      case 'setLang': this._setLang(conn, msg.lang); return;
       case 'create': this._create(conn, msg); return;
       case 'join': this._join(conn, msg); return;
       case 'resume': this._resume(conn, msg); return;
@@ -230,6 +431,18 @@ export class Rooms {
       return;
     }
     this._afterChange(room, msg.t === 'kick' ? msg.playerId : null);
+  }
+
+  /**
+   * §11 X5.1 setLang: always the socket's language; with an identity also the member's, answered with one state to this
+   * socket only (a language is not a public change: nobody else gets anything). Before joining there is no reply.
+   */
+  _setLang(conn, lang) {
+    conn.lang = lang;
+    const room = conn.roomCode ? this.rooms.get(conn.roomCode) : null;
+    if (!room || !conn.playerId || room.conns.get(conn.playerId) !== conn) return;
+    room.game.setLang(conn.playerId, lang);
+    this._sendState(room, conn.playerId, conn);
   }
 
   _randInt(n) {
@@ -258,7 +471,7 @@ export class Rooms {
       if (!parsed.ok) { this._error(conn, parsed.fail); return; }
       seed = parsed.seed;
     }
-    if (!sanitizeName(msg.name)) { this._error(conn, fail('bad_request', 'Please enter a name (1–20 characters)')); return; }
+    if (!sanitizeName(msg.name)) { this._error(conn, fail('bad_request', 'err.nameRequired')); return; }
     const old = this._soleLobby(conn); // freed below: nobody could ever come back to it
     if (this.rooms.size - (old ? 1 : 0) >= MAX_ROOMS) { this._error(conn, fail('server_busy')); return; }
     // Per-network cap: one client must not be able to hold every room slot. At the cap, the oldest abandoned
@@ -276,7 +489,7 @@ export class Rooms {
       evict = full[0].mine.filter((r) => r.conns.size === 0 && isLoneLobby(r))
         .sort((a, b) => (a.emptySince ?? 0) - (b.emptySince ?? 0))[0] || null;
       if (!evict || full.some((level) => level.mine.length - (level.mine.includes(evict) ? 1 : 0) >= level.cap)) {
-        this._error(conn, fail('server_busy', 'Too many rooms are open from your network. Leave one of them, or try again later'));
+        this._error(conn, fail('server_busy', 'err.tooManyRooms'));
         return;
       }
     }
@@ -287,7 +500,7 @@ export class Rooms {
       room: code, rng, now: this.now, minPlayers: this.minPlayers, fixedSpecials: this.fixedSpecials,
       ...(this.dealerFactory ? { dealer: this.dealerFactory(rng) } : {}),
     });
-    const res = game.join(msg.name);
+    const res = game.join(msg.name, { lang: conn.lang });
     if (!res.ok) { this._error(conn, res); return; }
     if (seed !== null) this.dev.logSeed(game, seed);
     if (evict) this._deleteRoom(evict);
@@ -327,12 +540,12 @@ export class Rooms {
   }
 
   _join(conn, msg) {
-    if (!sanitizeName(msg.name)) { this._error(conn, fail('bad_request', 'Please enter a name (1–20 characters)')); return; }
-    if (this._lookupThrottled(conn)) { this._error(conn, fail('server_busy', LOOKUP_THROTTLED)); return; }
+    if (!sanitizeName(msg.name)) { this._error(conn, fail('bad_request', 'err.nameRequired')); return; }
+    if (this._lookupThrottled(conn)) { this._error(conn, fail('server_busy', 'err.lookupThrottled')); return; }
     const room = this.rooms.get(normalizeCode(msg.room));
-    if (!room) { this._lookupFailed(conn); this._error(conn, fail('no_room', 'There is no room with that code')); return; }
+    if (!room) { this._lookupFailed(conn); this._error(conn, fail('no_room', 'err.noRoomJoin')); return; }
     const old = this._soleLobby(conn);
-    const res = room.game.join(msg.name, { spectator: msg.spectator === true });
+    const res = room.game.join(msg.name, { spectator: msg.spectator === true, lang: conn.lang });
     if (!res.ok) { this._error(conn, res); return; }
     this._moveOut(conn, old !== room ? old : null);
     this._admit(room, conn, res.id);
@@ -387,9 +600,13 @@ export class Rooms {
     const valid = !!id && room.game.isActive(id);
     // §11 Z1: a throttled network still gets its own seats back. Only a valid room *and* token passes (a 144-bit token
     // cannot be guessed); anything else gets the same server_busy whether or not the room exists, and spends nothing.
-    if (!valid && this._lookupThrottled(conn)) { this._error(conn, fail('server_busy', LOOKUP_THROTTLED)); return; }
-    if (!room) { this._lookupFailed(conn); this._error(conn, fail('no_room', 'That room no longer exists')); return; }
+    if (!valid && this._lookupThrottled(conn)) { this._error(conn, fail('server_busy', 'err.lookupThrottled')); return; }
+    if (!room) { this._lookupFailed(conn); this._error(conn, fail('no_room', 'err.noRoomResume')); return; }
     if (!valid) { this._lookupFailed(conn); this._error(conn, fail('bad_token')); return; }
+    // §11 X5.1: a resume with `lang` sets the member's language (conn.lang is set already); without it, the member keeps
+    // theirs and the socket takes it over, so kicked.reason and errors match the member
+    if (normLang(msg.lang)) room.game.setLang(id, msg.lang);
+    else conn.lang = room.game.langOf(id) ?? conn.lang;
     if (conn.roomCode === room.code && conn.playerId === id && room.conns.get(id) === conn) {
       this._send(conn, { t: 'joined', room: room.code, id, token: msg.token });
       this._sendState(room, id, conn);
@@ -402,7 +619,7 @@ export class Rooms {
       old.roomCode = null;
       old.playerId = null;
       room.conns.delete(id);
-      this._send(old, { t: 'error', code: 'replaced', message: 'This seat was opened in another tab or window' });
+      this._send(old, { t: 'error', code: 'replaced', message: this._text(old, 'err.replacedTab') });
     }
     this._attach(room, conn, id);
     this._send(conn, { t: 'joined', room: room.code, id, token: msg.token });
@@ -443,7 +660,7 @@ export class Rooms {
       room.conns.delete(id);
       conn.roomCode = null;
       conn.playerId = null;
-      if (id === kickedId) this._send(conn, { t: 'kicked', reason: 'The host removed you from the room' });
+      if (id === kickedId) this._send(conn, { t: 'kicked', reason: this._text(conn, 'kick.reason') });
     }
     // Nobody is left in it at all (in a game, `left` players stay listed but can never come back): free the code now
     // instead of holding one of the 200 room slots for the 30-minute idle TTL.
@@ -468,7 +685,17 @@ export class Rooms {
     if (!view) return;
     // §11 X9: the god view, only on the socket that asked for it, and only in dev mode
     if (this.dev && conn.devGod === true) view.god = this.dev.godView(room.game);
-    this._send(conn, { t: 'state', ...view });
+    // §11 X5.2: the log (the same for every recipient of one language) is serialized and encoded once per language and
+    // spliced into each frame. A transport that takes chunks (index.js: one WebSocket message in two fragments) gets
+    // the frame as UTF-8 with the log's bytes shared; one that takes text gets the JSON text.
+    try {
+      if (typeof conn.sendChunks === 'function') { conn.sendChunks(stateFrameChunks(view)); return; }
+      if (typeof conn.sendText === 'function') { conn.sendText(stateFrame(view)); return; }
+    } catch (e) {
+      this.logger('send failed', e);
+      return;
+    }
+    this._send(conn, stateMessage(view));
   }
 
   _broadcast(room) {

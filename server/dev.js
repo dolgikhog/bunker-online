@@ -39,8 +39,10 @@
 // is not a §5/X1 effect, ids not 2..16 strings, a bad seed), not_in_room, room_full (addBots with no seat or spectator
 // place left), wrong_phase, not_allowed (a player who is not seated or has left, a tie that cannot be made, …).
 //
-// Every user-facing string of dev mode (log lines, error messages, the fallback card) is in DEV_TEXT, so the i18n pass
-// (§11 X5) can move them in one go.
+// Log lines and errors go through the message catalogue (§11 X5.3/X5.4): `log.dev.*` and `err.dev.*` keys in
+// server/i18n/{en,ru}.js with language-neutral params, so every member reads them in their own language and rooms.js
+// sends an error in the socket's language. DEV_TEXT keeps the English wording in one place; test/i18n-golden-engine
+// pins it to the catalogue's English, so both stay identical.
 
 import { EventEmitter } from 'node:events';
 import { AIRLOCK_CARD, REVIVE_CARD, createDealer } from './content.js';
@@ -59,7 +61,10 @@ export const BOT_DELAY_MS = 500;
 /** The address in-process bots count as (rooms.js uses it only for per-network limits, which bots never reach). */
 export const BOT_IP = 'dev-bot';
 
-/** Every user-facing string of dev mode, for the i18n pass (§11 X5). The /dev page itself is English-only. */
+/**
+ * Every user-facing string of dev mode in English, as the catalogue renders it (the golden test pins the two together).
+ * The ops log and fail by key; only the fallback card is used from here. The /dev page itself is English-only.
+ */
 export const DEV_TEXT = Object.freeze({
   errors: Object.freeze({
     badMessage: 'Expected a JSON object',
@@ -99,7 +104,6 @@ export const DEV_TEXT = Object.freeze({
 });
 
 const T = DEV_TEXT;
-const E = T.errors;
 const IN_GAME = new Set(['reveal', 'discussion', 'vote', 'defense']);
 /** Effects giveSpecial accepts in its schema: every §5/X1 effect (the retired `eject` passes the schema, then is refused). */
 const GIVE_EFFECTS = Object.freeze(Object.keys(EFFECTS));
@@ -128,17 +132,17 @@ const OP_FIELDS = {
 
 /** null when `msg` is a well-formed dev op, otherwise its bad_request. Unknown extra keys are ignored (§7). */
 export function validateDevMessage(msg) {
-  if (msg === null || typeof msg !== 'object' || Array.isArray(msg) || msg.t !== 'dev') return fail('bad_request', E.badMessage);
-  if (typeof msg.op !== 'string' || !Object.hasOwn(OP_FIELDS, msg.op)) return fail('bad_request', E.badOp);
+  if (msg === null || typeof msg !== 'object' || Array.isArray(msg) || msg.t !== 'dev') return fail('bad_request', 'err.expectedObject');
+  if (typeof msg.op !== 'string' || !Object.hasOwn(OP_FIELDS, msg.op)) return fail('bad_request', 'err.dev.badOp');
   for (const [key, spec] of Object.entries(OP_FIELDS[msg.op])) {
     const optional = spec.endsWith('?');
     const check = FIELD_CHECKS[optional ? spec.slice(0, -1) : spec];
     const v = Object.hasOwn(msg, key) ? msg[key] : undefined;
     if (v === undefined || (optional && v === null)) {
       if (optional) continue;
-      return fail('bad_request', E.missing(key));
+      return fail('bad_request', 'err.missingField', { field: key });
     }
-    if (!check(v)) return fail('bad_request', E.invalid(key));
+    if (!check(v)) return fail('bad_request', 'err.invalidField', { field: key });
   }
   return null;
 }
@@ -154,7 +158,7 @@ export function parseSeed(v) {
     if (!s) return { ok: true, seed: null };
     if (s.length <= SEED_MAX) return { ok: true, seed: s };
   } else if (Number.isSafeInteger(v)) return { ok: true, seed: String(v) };
-  return { ok: false, fail: fail('bad_request', E.badSeed) };
+  return { ok: false, fail: fail('bad_request', 'err.dev.badSeed') };
 }
 
 /** The rng of a room created with `seed` (the same function BUNKER_SEED uses, so "42" and 42 deal alike). */
@@ -254,16 +258,15 @@ export function createDevOps() {
   let givenSeq = 0;
   const rotation = new Map(); // effect -> how many cards of it were given
 
-  const byName = (game, id) => game._name(id);
 
   const ops = {
     giveSpecial(game, by, { playerId, effect }) {
-      if (game.phase === 'lobby') return fail('wrong_phase', E.noGame);
-      if (!IN_GAME.has(game.phase)) return fail('wrong_phase', E.gameOver);
-      if (effect === 'eject') return fail('not_allowed', E.ejectRetired);
+      if (game.phase === 'lobby') return fail('wrong_phase', 'err.dev.noGame');
+      if (!IN_GAME.has(game.phase)) return fail('wrong_phase', 'err.dev.gameOver');
+      if (effect === 'eject') return fail('not_allowed', 'err.dev.ejectRetired');
       const p = game._player(playerId);
-      if (!p || !p.cards) return fail('not_allowed', E.noPlayer);
-      if (p.status === 'left') return fail('not_allowed', E.playerLeft(p.name));
+      if (!p || !p.cards) return fail('not_allowed', 'err.dev.noPlayer');
+      if (p.status === 'left') return fail('not_allowed', 'err.dev.playerLeft', { p: game._pref(p) });
       const cards = contentCards(effect);
       const n = rotation.get(effect) || 0;
       rotation.set(effect, n + 1);
@@ -276,22 +279,22 @@ export function createDevOps() {
       else p.specials.push(card);
       given.set(card, ++givenSeq);
       for (let guard = 0; p.specials.filter((s) => !s.used).length < 2 && guard < 2; guard++) p.specials.push(game._drawSpecial());
-      game._log('info', T.log.giveSpecial(byName(game, by), p.name, card.title));
+      game._log('info', 'log.dev.giveSpecial', { a: game._ref(by), t: game._pref(p), card: game._spParam(card) });
       return ok();
     },
 
     autoReveal(game, by) {
-      if (game.phase !== 'reveal') return fail('wrong_phase', E.notReveal);
-      game._log('info', T.log.autoReveal(byName(game, by), game._rp()));
+      if (game.phase !== 'reveal') return fail('wrong_phase', 'err.dev.notReveal');
+      game._log('info', 'log.dev.autoReveal', { a: game._ref(by), rp: game._rpRef() });
       finishReveal(game);
       return ok();
     },
 
     skipToVote(game, by) {
-      if (game.phase === 'lobby') return fail('wrong_phase', E.noGame);
-      if (game.phase === 'final') return fail('wrong_phase', E.gameOver);
-      if (game.phase === 'vote') return fail('wrong_phase', E.ballotOpen);
-      game._log('info', T.log.skipToVote(byName(game, by)));
+      if (game.phase === 'lobby') return fail('wrong_phase', 'err.dev.noGame');
+      if (game.phase === 'final') return fail('wrong_phase', 'err.dev.gameOver');
+      if (game.phase === 'vote') return fail('wrong_phase', 'err.dev.ballotOpen');
+      game._log('info', 'log.dev.skipToVote', { a: game._ref(by) });
       // Every running game has a vote ahead, so the guard never trips; it only keeps a future rule from looping forever.
       for (let guard = 0; guard < 500 && game.phase !== 'vote' && game.phase !== 'final'; guard++) {
         if (game.phase === 'reveal') finishReveal(game);
@@ -304,19 +307,19 @@ export function createDevOps() {
 
     forceTie(game, by, { ids }) {
       const v = game.vote;
-      if (game.phase !== 'vote' || !v || !game.step) return fail('wrong_phase', E.noBallot);
-      if (v.stage !== 'main') return fail('not_allowed', E.revote);
-      if (new Set(ids).size !== ids.length) return fail('not_allowed', E.duplicate);
+      if (game.phase !== 'vote' || !v || !game.step) return fail('wrong_phase', 'err.dev.noBallot');
+      if (v.stage !== 'main') return fail('not_allowed', 'err.dev.revote');
+      if (new Set(ids).size !== ids.length) return fail('not_allowed', 'err.dev.duplicate');
       for (const id of ids) {
         const p = game._player(id);
-        if (!p) return fail('not_allowed', E.noPlayer);
-        if (p.status !== 'alive') return fail('not_allowed', E.notAlive(p.name));
-        if (!v.candidates.includes(id)) return fail('not_allowed', E.immune(p.name));
+        if (!p) return fail('not_allowed', 'err.dev.noPlayer');
+        if (p.status !== 'alive') return fail('not_allowed', 'err.dev.notAlive', { p: game._pref(p) });
+        if (!v.candidates.includes(id)) return fail('not_allowed', 'err.dev.immune', { p: game._pref(p) });
       }
       const tied = game._bySeat(ids);
       const plan = planTie(v.voters, (x) => (game.voteMods.doubleVote.has(x) ? 2 : 1), tied);
-      if (!plan) return fail('not_allowed', E.impossible);
-      game._log('info', T.log.forceTie(byName(game, by), game._names(tied)));
+      if (!plan) return fail('not_allowed', 'err.dev.impossible');
+      game._log('info', 'log.dev.forceTie', { a: game._ref(by), ids: game._refs(tied) });
       v.votes = plan;
       game._closeBallot();
       return ok();
@@ -325,7 +328,7 @@ export function createDevOps() {
     fastTimers(game, by) {
       for (const k of Object.keys(game.options)) game.options[k] = DEV_TIMER_SECONDS;
       if (game.timer) game.timer.endsAt = Math.min(game.timer.endsAt, game._time() + DEV_TIMER_SECONDS * 1000);
-      game._log('info', T.log.fastTimers(byName(game, by), DEV_TIMER_SECONDS));
+      game._log('info', 'log.dev.fastTimers', { a: game._ref(by), secs: DEV_TIMER_SECONDS });
       return ok();
     },
   };
@@ -334,12 +337,12 @@ export function createDevOps() {
     /** Runs one engine op for member `by` (already validated with validateDevMessage). Never throws. */
     run(game, by, msg) {
       const op = Object.hasOwn(ops, msg.op) ? ops[msg.op] : null;
-      if (!op) return fail('bad_request', E.badOp);
+      if (!op) return fail('bad_request', 'err.dev.badOp');
       try {
         return op(game, by, msg);
       } catch (e) {
         game.lastError = e;
-        return { ...fail('not_allowed', E.internal), internal: true };
+        return { ...fail('not_allowed', 'err.internal'), internal: true };
       }
     },
     /** true when dev mode gave this special object (tests). */
@@ -448,7 +451,7 @@ export class DevTools {
 
   parseSeed(v) { return parseSeed(v); }
   roomRng(seed) { return seededRng(seed); }
-  logSeed(game, seed) { game._log('info', T.log.seed(seed)); }
+  logSeed(game, seed) { game._log('info', 'log.dev.seed', { seed: String(seed) }); }
   godView(game) { return godView(game); }
 
   /** Handles one {t:'dev'} frame of `conn` (rooms.js calls it only in dev mode). Replies like any action. */
@@ -465,7 +468,7 @@ export class DevTools {
       else res = this.ops.run(room.game, id, msg);
     } catch (e) {
       this.logger(`dev op ${msg.op} failed`, e);
-      res = fail('not_allowed', E.internal);
+      res = fail('not_allowed', 'err.internal');
     }
     if (!res.ok) {
       if (res.internal) this.logger(`dev op ${msg.op} failed`, room.game.lastError);
@@ -478,7 +481,7 @@ export class DevTools {
 
   _god(room, conn, on) {
     conn.devGod = on === true;
-    room.game._log('info', T.log.god(room.game._name(conn.playerId), conn.devGod));
+    room.game._log('info', 'log.dev.god', { a: room.game._ref(conn.playerId), on: conn.devGod });
     return ok();
   }
 
@@ -500,10 +503,10 @@ export class DevTools {
     const free = lobby ? MAX_PLAYERS - g.players.length - t.pending : MAX_SPECTATORS - g.spectators.length - t.pending;
     if (free <= 0) {
       if (!t.bots.size && !t.pending) this.tables.delete(room.code);
-      return fail('room_full', lobby ? E.tableFull : E.spectatorsFull);
+      return fail('room_full', lobby ? 'err.dev.tableFull' : 'err.dev.spectatorsFull');
     }
     const n = Math.min(msg.count, free);
-    g._log('info', T.log.addBots(g._name(by), n, lobby));
+    g._log('info', 'log.dev.addBots', { a: g._ref(by), n, seated: lobby });
     const specials = typeof msg.specials === 'number' ? msg.specials : 0;
     for (let i = 0; i < n; i++) this._spawnBot(room.code, t, specials);
     return ok();

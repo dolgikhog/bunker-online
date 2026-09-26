@@ -181,6 +181,19 @@ export function statsAllowed(peer, headers) {
   return FORWARDING_HEADERS.every((k) => h[k] === undefined);
 }
 
+/**
+ * §11 X5.2: sends UTF-8 chunks as ONE WebSocket text message, each chunk a fragment (RFC 6455 §5.4; every browser and
+ * `ws` reassemble them). The chunks are handed to the socket as they are, so a buffer shared by many recipients (the
+ * log, rooms.js) is neither copied nor re-encoded per recipient; `ws.send(string)` would encode the whole frame for each
+ * one, a fresh 100–180 KB allocation per recipient per broadcast. Safe because the fragments go out back to back: the
+ * calls are synchronous, and with perMessageDeflate off (and no Blob ever sent) `ws` writes each one at once, so no
+ * other message can come between them.
+ */
+export function sendFragments(ws, chunks) {
+  const last = chunks.length - 1;
+  for (let i = 0; i <= last; i++) ws.send(chunks[i], { binary: false, fin: i === last });
+}
+
 function sendText(res, status, text, extra = {}) {
   const body = Buffer.from(text, 'utf8');
   res.writeHead(status, {
@@ -375,6 +388,11 @@ export async function startServer(options = {}) {
       send(obj) {
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
       },
+      // §11 X5.2: a state as the UTF-8 chunks of one JSON frame (rooms.js: this recipient's head, then the log's bytes,
+      // encoded once per language and shared by every recipient of it)
+      sendChunks(chunks) {
+        if (ws.readyState === ws.OPEN) sendFragments(ws, chunks);
+      },
     };
     ws._bunkerConn = conn;
     rooms.open(conn);
@@ -453,9 +471,25 @@ export async function startServer(options = {}) {
   };
 }
 
+/**
+ * The process-wide handlers of a server run from the command line: an error nothing else caught is logged to stderr
+ * instead of killing every room. A write to stdout or stderr after the process reading them has gone (a harness or a
+ * terminal that exited; production's journald never goes) fails with EPIPE, which the stream reports as an 'error'
+ * event. Unheard, that event is itself an uncaught exception, whose handler writes to stderr again, fails again, and so
+ * on: an orphaned server spun at ~80% of a core for hours. So a failed log write is dropped (the stream's 'error'
+ * listener), and the handler never throws.
+ */
+export function installProcessHandlers(proc = process) {
+  const drop = () => {};
+  proc.stdout.on('error', drop);
+  proc.stderr.on('error', drop);
+  const say = (line) => { try { proc.stderr.write(line); } catch { /* nowhere left to say it */ } };
+  proc.on('uncaughtException', (e) => say(`[bunker] uncaught: ${e?.stack || e}\n`));
+  proc.on('unhandledRejection', (e) => say(`[bunker] unhandled rejection: ${e?.stack || e}\n`));
+}
+
 if (import.meta.main) {
-  process.on('uncaughtException', (e) => { process.stderr.write(`[bunker] uncaught: ${e?.stack || e}\n`); });
-  process.on('unhandledRejection', (e) => { process.stderr.write(`[bunker] unhandled rejection: ${e?.stack || e}\n`); });
+  installProcessHandlers();
   const cfg = configFromEnv();
   startServer(cfg).then((srv) => {
     process.stdout.write(`BUNKER_LISTENING ${srv.port}\n`);

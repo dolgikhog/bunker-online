@@ -1,8 +1,25 @@
 // server/game.js — the PURE Bunker engine (SPEC.md §1–§7, §8 "Engine interface").
 // No sockets, no timers: time only appears as timestamps taken from `now()`. All randomness comes from `rng`.
 // Every public method is synchronous and never throws on bad input.
+//
+// §11 X5 (languages; reports/i18n-design.md §3): every English field stays and is rendered once (card text, special
+// title and text, catastrophe, bunker, log text, notes, timer label), and a language-neutral twin sits next to it:
+//   - a card's non-enumerable `tok` (a frozen content token; a swap or reroll replaces it, never edits it);
+//   - a special's `ref` (its catalogue id, only when its words are the catalogue's English, else null: a literal);
+//   - `catastropheTok` and `bunkerTok`;
+//   - log entries, notes and the timer carry `key` and `params` (server/i18n; player refs {p, n}, never rendered text).
+// view(id, lang) renders every human-readable string in the member's language (or `lang`), caching per token and per
+// log entry; the view's `log` array is shared, read-only, by every recipient of one language until the log changes.
+// A failure is {ok:false, code, key, params, message (English)}; rooms.js renders `key` in the socket's language.
 
-import { CATEGORIES, createDealer, AIRLOCK_CARD, REVIVE_CARD } from './content.js';
+import {
+  CATEGORIES, createDealer, AIRLOCK_CARD, REVIVE_CARD, FALLBACK_SPECIAL as CONTENT_FALLBACK_SPECIAL,
+  FALLBACK_FEATURE_TOK, FALLBACK_CATASTROPHE_TOK, FALLBACK_BUNKER_TOK, litTok, bunkerWithFeature,
+  renderCard, renderSpecial, renderCatastrophe, renderBunker, renderFeature,
+} from './content.js';
+import { renderMsg, renderText, hasKey, normLang, categoryLabel, LANGS } from './i18n/index.js';
+
+export { LANGS };
 
 export const MAX_ROUNDS = 7;
 export const MAX_PLAYERS = 16;
@@ -23,7 +40,6 @@ function contentLabel(id) {
 }
 /** Categories in display order (§1): ids fixed by the spec, labels from content.js when it has them. */
 export const CATEGORY_LIST = Object.freeze(CATEGORY_IDS.map((id) => Object.freeze({ id, label: contentLabel(id) ?? SPEC_LABELS[id] })));
-const LABEL = Object.fromEntries(CATEGORY_LIST.map((c) => [c.id, c.label]));
 const IS_CATEGORY = (v) => typeof v === 'string' && CATEGORY_IDS.includes(v);
 
 export const DEFAULT_OPTIONS = Object.freeze({ speechSeconds1: 60, speechSeconds: 30, discussionSeconds: 90, defenseSeconds: 30 });
@@ -108,10 +124,12 @@ const IN_STEP = new Set(['vote', 'defense']);
 // Messages: schema check (shared with rooms.js so bad_request always wins, §7 precedence)
 
 const SCHEMAS = {
-  create: { name: 'string' },
-  join: { room: 'string', name: 'string', spectator: 'boolean?' },
-  resume: { room: 'string', token: 'string' },
+  // §11 X5.1: `lang` ('en' | 'ru') on the hellos, and setLang at any time (rooms.js handles it like ping)
+  create: { name: 'string', lang: 'lang?' },
+  join: { room: 'string', name: 'string', spectator: 'boolean?', lang: 'lang?' },
+  resume: { room: 'string', token: 'string', lang: 'lang?' },
   ping: {},
+  setLang: { lang: 'lang' },
   leave: {},
   setOptions: { options: 'object' },
   start: {},
@@ -133,20 +151,20 @@ export const MESSAGE_TYPES = Object.freeze(Object.keys(SCHEMAS));
 const ENGINE_TYPES = new Set(['leave', 'setOptions', 'start', 'takeSeat', 'kick', 'transferHost', 'reveal', 'endTurn', 'next', 'vote', 'closeVote', 'special', 'playAgain', 'endGame']);
 const MAX_STRING = 1000;
 
-const DEFAULT_MESSAGES = {
-  bad_request: 'Bad request',
-  not_in_room: 'You are not in a room',
-  no_room: 'No such room',
-  bad_token: 'This seat is no longer available',
-  server_busy: 'The server is busy, try again later',
-  room_full: 'The room is full',
-  not_host: 'Only the host can do that',
-  wrong_phase: 'You cannot do that right now',
-  not_your_turn: "It's not your turn",
-  not_allowed: 'That is not allowed',
-  replaced: 'This seat was opened somewhere else',
-};
-export function fail(code, message) { return { ok: false, code, message: message || DEFAULT_MESSAGES[code] || 'Error' }; }
+/**
+ * A failure (§7; §11 X5.4): {ok:false, code, key, params, message}. `key` is a server/i18n message key (default
+ * `err.<code>`), `params` its language-neutral params, and `message` its English rendering, which tests and logs read;
+ * rooms.js sends `key` rendered in the socket's language. A second argument that is not a catalogue key is taken as a
+ * ready English message (callers outside the catalogue, such as server/dev.js): that failure has no key and is sent as
+ * it is.
+ */
+export function fail(code, key, params) {
+  if (typeof key === 'string' && key && !hasKey(key)) return { ok: false, code, message: key };
+  const k = typeof key === 'string' && key ? key : `err.${code}`;
+  if (!hasKey(k)) return { ok: false, code, message: 'Error' };
+  const p = params && typeof params === 'object' ? params : {};
+  return { ok: false, code, key: k, params: p, message: renderText('en', k, p) };
+}
 const ok = () => ({ ok: true });
 
 // §11 R1 step key: `at: {phase, round, overtime, turnIndex, ballot, stage}`, copied from the StateView the click was made on.
@@ -167,6 +185,7 @@ function checkType(type, v) {
     case 'boolean': return typeof v === 'boolean';
     case 'object': return v !== null && typeof v === 'object' && !Array.isArray(v);
     case 'category': return IS_CATEGORY(v);
+    case 'lang': return LANGS.includes(v);
     case 'stepref': return checkType('object', v) && STEP_REF_KEYS.every((k) => !Object.hasOwn(v, k) || STEP_REF_TYPES[k](v[k]));
     default: return false;
   }
@@ -174,23 +193,23 @@ function checkType(type, v) {
 
 /** Returns null when `msg` passes the §7 schema check, otherwise a `bad_request` failure. */
 export function validateMessage(msg) {
-  if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return fail('bad_request', 'Expected a JSON object');
-  if (typeof msg.t !== 'string' || !Object.hasOwn(SCHEMAS, msg.t)) return fail('bad_request', 'Unknown message type');
+  if (msg === null || typeof msg !== 'object' || Array.isArray(msg)) return fail('bad_request', 'err.expectedObject');
+  if (typeof msg.t !== 'string' || !Object.hasOwn(SCHEMAS, msg.t)) return fail('bad_request', 'err.unknownType');
   for (const [key, spec] of Object.entries(SCHEMAS[msg.t])) {
     const optional = spec.endsWith('?');
     const type = optional ? spec.slice(0, -1) : spec;
     const v = Object.hasOwn(msg, key) ? msg[key] : undefined;
     if (v === undefined || (optional && v === null)) {
       if (optional) continue;
-      return fail('bad_request', `Missing field "${key}"`);
+      return fail('bad_request', 'err.missingField', { field: key });
     }
-    if (!checkType(type, v)) return fail('bad_request', `Invalid field "${key}"`);
+    if (!checkType(type, v)) return fail('bad_request', 'err.invalidField', { field: key });
   }
   if (msg.t === 'setOptions') {
     for (const key of OPTION_KEYS) {
       if (!Object.hasOwn(msg.options, key) || msg.options[key] === undefined) continue;
       const v = msg.options[key];
-      if (!Number.isInteger(v) || v < 5 || v > 600) return fail('bad_request', `${key} must be a whole number of seconds from 5 to 600`);
+      if (!Number.isInteger(v) || v < 5 || v > 600) return fail('bad_request', 'err.optionRange', { field: key });
     }
   }
   return null;
@@ -255,7 +274,21 @@ function clampInt(v, min, max, dflt) {
 const str = (v, fallback = '') => (typeof v === 'string' ? v : v == null ? fallback : String(v));
 const strList = (v) => (Array.isArray(v) ? v.map((x) => str(x)).filter(Boolean) : []);
 
-/** A dealt or hand-made special reduced to what the §5 effect table allows (also used by server/dev.js, §11 X9). */
+/**
+ * The catalogue id of a special whose words are exactly the catalogue's English (design §3.4), else null: a test card
+ * that borrows a real id with other words stays a literal in every language.
+ */
+function catalogueRef(id, title, text) {
+  let en = null;
+  try { en = renderSpecial('en', id); } catch { en = null; }
+  return en && en.title === title && en.text === text ? id : null;
+}
+
+/**
+ * A dealt or hand-made special reduced to what the §5 effect table allows (also used by server/dev.js, §11 X9).
+ * §11 X5: `ref` is its catalogue id when its title and text are the catalogue's English (null otherwise), and a card
+ * without a title gets `special.untitled` ("Special condition"), marked `untitled` so it renders in every language.
+ */
 export function normalizeSpecial(raw) {
   if (!raw || typeof raw !== 'object') return null;
   if (typeof raw.effect !== 'string' || !Object.hasOwn(EFFECTS, raw.effect)) return null;
@@ -264,22 +297,109 @@ export function normalizeSpecial(raw) {
   let category = null;
   if (eff.category === 'any') category = IS_CATEGORY(raw.category) || raw.category === 'choose' ? raw.category : 'choose';
   else if (eff.category === 'hidden') category = raw.category === 'random' ? 'random' : 'choose';
-  return {
-    id: str(raw.id, raw.effect),
-    title: str(raw.title, 'Special condition').slice(0, 200),
-    text: str(raw.text).slice(0, 1000),
-    effect: raw.effect,
-    target,
-    category,
-  };
+  const untitled = raw.title === undefined || raw.title === null;
+  const id = str(raw.id, raw.effect);
+  const title = (untitled ? renderText('en', 'special.untitled') : str(raw.title)).slice(0, 200);
+  const text = str(raw.text).slice(0, 1000);
+  const out = { id, title, text, effect: raw.effect, target, category, ref: untitled ? null : catalogueRef(id, title, text) };
+  if (untitled) out.untitled = true;
+  return out;
 }
 
-const FALLBACK_SPECIAL = { id: 'fallback-feature', title: 'Hidden room', text: 'Add a new feature to the bunker.', effect: 'bunker_add_feature', target: 'none' };
+const FALLBACK_SPECIAL = CONTENT_FALLBACK_SPECIAL && typeof CONTENT_FALLBACK_SPECIAL === 'object' ? CONTENT_FALLBACK_SPECIAL
+  : { id: 'fallback-feature', title: 'Hidden room', text: 'Add a new feature to the bunker.', effect: 'bunker_add_feature', target: 'none' };
 // The fixed cards of §11 X1 (content.js owns their words; these stand in only if it ever lacks them).
 const FIXED_AIRLOCK = normalizeSpecial(AIRLOCK_CARD) || normalizeSpecial({ id: 'airlock', title: 'Airlock', effect: 'airlock', target: 'other',
   text: 'Needs a partner. Choose a player to start cycling the airlock on them. If another player plays an Airlock on the same player this round before the vote, they are thrown out — no vote. Alone, the airlock jams.' });
 const FIXED_REVIVE = normalizeSpecial(REVIVE_CARD) || normalizeSpecial({ id: 'revive', title: 'Back from the Forest', effect: 'revive', target: 'ejected',
   text: 'Play during a reveal or discussion phase. Choose an ejected player, whether they were voted out or thrown out through the airlock (not one who left the game): they come back and are alive again.' });
+
+// ---------------------------------------------------------------------------------------------------------------
+// §11 X5: language-neutral twins (reports/i18n-design.md §3)
+
+/**
+ * A characteristic card: {text, revealed} plus a non-enumerable `tok` (so a card still deep-equals {text, revealed}).
+ * Every place that makes a new card object goes through here: a spread or a JSON copy would drop the token.
+ */
+function makeCard(text, tok, revealed) {
+  const card = { text, revealed };
+  Object.defineProperty(card, 'tok', { value: tok, enumerable: false, writable: true, configurable: true });
+  return card;
+}
+
+/** A nested message param ({msg: {key, params}}), as server/i18n renders it. */
+const M = (key, params = {}) => ({ msg: { key, params } });
+
+/** The key of a log line an outside caller wrote as ready English text (server/dev.js, §11 X9: English-only). */
+export const LEGACY_LOG_KEY = 'log.dev.text';
+
+function deepFreeze(o) {
+  if (o && typeof o === 'object' && !Object.isFrozen(o)) {
+    Object.freeze(o);
+    for (const v of Object.values(o)) deepFreeze(v);
+  }
+  return o;
+}
+
+/**
+ * Wire params (design §8.3): the internal params with every ref reduced to its language-neutral id. A player {p, n}
+ * -> its id, a category -> its id, a special -> its catalogue ref (or its own id), a catastrophe -> its content id or
+ * null, a bunker name -> null, a nested message -> {key, params} reduced; card and feature tokens are left out (their
+ * text is in `text`/`parts` only). Numbers, booleans, strings and round prefixes {r, ot} pass through.
+ */
+const OMIT = Symbol('omit');
+function reduceValue(v) {
+  if (v === null || v === undefined) return null;
+  if (Array.isArray(v)) return v.map(reduceValue).filter((x) => x !== OMIT);
+  if (typeof v !== 'object') return v;
+  if (typeof v.p === 'string' && Object.hasOwn(v, 'n')) return v.p;
+  if (Object.hasOwn(v, 'cat')) return v.cat;
+  if (Object.hasOwn(v, 'tok') || Object.hasOwn(v, 'feat') || Object.hasOwn(v, 'cardtext')) return OMIT;
+  if (Object.hasOwn(v, 'sp')) return v.sp && typeof v.sp === 'object' ? (v.sp.ref ?? v.sp.id ?? null) : null;
+  if (Object.hasOwn(v, 'cata')) return v.cata && typeof v.cata === 'object' && typeof v.cata.id === 'string' ? v.cata.id : null;
+  if (Object.hasOwn(v, 'bname')) return null;
+  if (Object.hasOwn(v, 'msg')) return v.msg && typeof v.msg === 'object' ? { key: v.msg.key, params: reduceParams(v.msg.params) } : null;
+  if (Object.hasOwn(v, 'r') && Object.hasOwn(v, 'ot')) return { r: v.r, ot: v.ot };
+  return reduceParams(v);
+}
+function reduceParams(params) {
+  const out = {};
+  if (!params || typeof params !== 'object') return out;
+  for (const [k, v] of Object.entries(params)) {
+    const r = reduceValue(v);
+    if (r !== OMIT) out[k] = r;
+  }
+  return out;
+}
+
+/**
+ * Log entries as views show them, cached per entry (entries never change once logged) and language:
+ * {id, ts, kind, text, key, params (wire), parts}, deep-frozen and shared by every view in that language.
+ */
+const ENTRY_VIEWS = new WeakMap();
+function entryView(e, lang) {
+  let c = ENTRY_VIEWS.get(e);
+  if (!c) { c = {}; ENTRY_VIEWS.set(e, c); }
+  if (c[lang]) return c[lang];
+  if (!c.wire) c.wire = deepFreeze(reduceParams(e.params));
+  const r = lang === 'en' && c.enParts ? { parts: c.enParts } : renderMsg(lang, e.key, e.params);
+  c.enParts = undefined;
+  // English is the entry's own text, rendered once when it was logged
+  const text = lang === 'en' ? e.text : r.text;
+  c[lang] = deepFreeze({ id: e.id, ts: e.ts, kind: e.kind, text, key: e.key, params: c.wire, parts: r.parts });
+  return c[lang];
+}
+
+/** Warns once (in production) about a card without its token; under NODE_ENV=test it is an error (design §3.1). */
+let tokWarned = false;
+function missingTok() {
+  if (typeof process !== 'undefined' && process.env && process.env.NODE_ENV === 'test') {
+    const e = new Error('a card without its language-neutral token reached a view');
+    e.missingTok = true;
+    throw e;
+  }
+  if (!tokWarned) { tokWarned = true; console.warn('[i18n] a card without its language-neutral token reached a view: English is shown'); }
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 
@@ -316,7 +436,9 @@ export class Game {
     this.kicks = [];
     this.capacity = 0;
     this.catastrophe = null;
+    this.catastropheTok = null; // §11 X5 language-neutral twins of the two fields above
     this.bunker = null;
+    this.bunkerTok = null;
     this.turn = null; // { kind, order, index, hasRevealed }
     this.vote = null; // { stage, candidates, voters, votes: Map<voterId, targetId> }
     this.step = null; // { ballot, ballots, tied, mainVoters }
@@ -345,11 +467,32 @@ export class Game {
   _time() {
     try { const t = Number(this.now()); return Number.isFinite(t) ? t : 0; } catch { return 0; }
   }
-  _log(kind, text) {
-    this.log.push({ id: ++this.logSeq, ts: this._time(), kind, text });
+  /**
+   * Logs a line (§11 X5.3): `key` is a server/i18n key and `params` its language-neutral params (player refs {p, n},
+   * tokens, nested messages; never rendered text). The entry keeps its English `text`, rendered now. A `key` that is
+   * not a catalogue key is taken as a ready English line (server/dev.js writes those): it is kept as LEGACY_LOG_KEY
+   * with the line as its `text` param, the same in every language.
+   */
+  _log(kind, key, params) {
+    let k = key;
+    let p = params;
+    if (typeof key !== 'string' || !hasKey(key)) { k = LEGACY_LOG_KEY; p = { text: str(key) }; } else if (!p || typeof p !== 'object') p = {};
+    deepFreeze(p);
+    const r = renderMsg('en', k, p);
+    const entry = { id: ++this.logSeq, ts: this._time(), kind, text: r.text, key: k, params: p };
+    ENTRY_VIEWS.set(entry, { enParts: r.parts });
+    this.log.push(entry);
     if (this.log.length > LOG_LIMIT) this.log.splice(0, this.log.length - LOG_LIMIT);
   }
+  /** The round prefix as English text ('Round 3' / 'Overtime'); server/dev.js reads it. */
   _rp() { return this.overtime ? 'Overtime' : `Round ${this.round}`; }
+  /** The round prefix as a message param (§11 X5.3 `rp`). */
+  _rpRef() { return { r: this.round, ot: this.overtime }; }
+  /** A member as a message param: {p: id, n: the name now} ('?' for an id that is not a member, as _name). */
+  _ref(id) { return { p: id, n: this._name(id) }; }
+  _refs(ids) { return ids.map((id) => this._ref(id)); }
+  /** A member object as a message param. */
+  _pref(x) { return { p: x.id, n: x.name }; }
   _player(id) { return typeof id === 'string' ? this.players.find((p) => p.id === id) ?? null : null; }
   _spectator(id) { return typeof id === 'string' ? this.spectators.find((s) => s.id === id) ?? null : null; }
   _member(id) {
@@ -359,6 +502,7 @@ export class Game {
     return s ? { kind: 'spectator', obj: s } : null;
   }
   _name(id) { return this._member(id)?.obj.name ?? '?'; }
+  /** Names joined ', ' (English text; server/dev.js reads it). */
   _names(ids) { return ids.map((id) => this._name(id)).join(', '); }
   _alive() { return this.players.filter((p) => p.status === 'alive'); }
   _aliveCount() { return this.players.reduce((n, p) => n + (p.status === 'alive' ? 1 : 0), 0); }
@@ -394,7 +538,7 @@ export class Game {
     const cur = this._stepRef();
     for (const k of STEP_REF_KEYS) {
       if (ignore && ignore.includes(k)) continue;
-      if (Object.hasOwn(at, k) && at[k] !== cur[k]) return fail('wrong_phase', 'Too late: that turn or vote has already moved on');
+      if (Object.hasOwn(at, k) && at[k] !== cur[k]) return fail('wrong_phase', 'err.stale');
     }
     return null;
   }
@@ -425,16 +569,19 @@ export class Game {
     this.voteMods.doubleVote.clear();
     if (includeCancel) this.voteMods.cancelNext = false;
   }
-  /** The vote modifiers a cancelled or skipped step takes with it, for the log ('' when none). */
+  /** The vote modifiers a cancelled or skipped step takes with it, for the log: a mods.used message, or null. */
   _expiringMods() {
-    const parts = [
-      ...this._bySeat([...this.voteMods.immune]).map((id) => `${this._name(id)}'s immunity`),
-      ...this._bySeat([...this.voteMods.blocked]).map((id) => `${this._name(id)}'s vote block`),
-      ...this._bySeat([...this.voteMods.doubleVote]).map((id) => `${this._name(id)}'s double vote`),
+    const items = [
+      ...this._bySeat([...this.voteMods.immune]).map((id) => M('mod.immune', { p: this._ref(id) })),
+      ...this._bySeat([...this.voteMods.blocked]).map((id) => M('mod.blocked', { p: this._ref(id) })),
+      ...this._bySeat([...this.voteMods.doubleVote]).map((id) => M('mod.double', { p: this._ref(id) })),
     ];
-    if (!parts.length) return '';
-    const list = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(', ')} and ${parts[parts.length - 1]}`;
-    return `. ${list} ${parts.length === 1 ? 'was' : 'were'} for this vote and ${parts.length === 1 ? 'is' : 'are'} used up`;
+    return items.length ? M('mods.used', { items, n: items.length }) : null;
+  }
+
+  /** The timer of a turn or a discussion: `key`/`params` name its label (timer.*), rendered in English here. */
+  _setTimer(key, params, secs) {
+    this.timer = { label: renderText('en', key, params), endsAt: this._time() + secs * 1000, key, params: deepFreeze(params) };
   }
   _dropMods(id) {
     this.voteMods.immune.delete(id);
@@ -443,35 +590,55 @@ export class Game {
   }
 
   // ------------------------------------------------------------------------------------------------ public API
+  /** A new member (§6). `lang` (§11 X5): the member's language, 'en' unless given ('en' | 'ru'). */
   join(name, opts = {}) {
     try {
-      const spectator = !!opts && typeof opts === 'object' && opts.spectator === true;
+      const o = opts && typeof opts === 'object' ? opts : {};
+      const spectator = o.spectator === true;
+      const lang = normLang(o.lang) ?? 'en';
       const clean = sanitizeName(name);
-      if (!clean) return fail('bad_request', 'Please enter a name (1–20 characters)');
+      if (!clean) return fail('bad_request', 'err.nameRequired');
       const asSpectator = spectator === true || this.phase !== 'lobby' || this.players.length >= MAX_PLAYERS;
-      if (asSpectator && this.spectators.length >= MAX_SPECTATORS) return fail('room_full', 'The room is full');
+      if (asSpectator && this.spectators.length >= MAX_SPECTATORS) return fail('room_full');
       const id = `p${++this.idSeq}`;
       const finalName = this._uniqueName(clean);
       if (asSpectator) {
-        this.spectators.push({ id, name: finalName, connected: true, disconnectedAt: 0 });
-        this._log('info', `${finalName} is watching`);
+        this.spectators.push({ id, name: finalName, connected: true, disconnectedAt: 0, lang });
+        this._log('info', 'log.watch', { p: { p: id, n: finalName } });
         return { ok: true, id, role: 'spectator' };
       }
-      this.players.push(this._newPlayer(id, finalName));
-      this._log('info', `${finalName} joined`);
+      const p = this._newPlayer(id, finalName);
+      p.lang = lang;
+      this.players.push(p);
+      this._log('info', 'log.join', { p: { p: id, n: finalName } });
       if (!this.hostId) this._setHost(id);
       return { ok: true, id, role: 'player' };
     } catch (e) {
       this.lastError = e;
-      return fail('not_allowed', 'Internal error');
+      return fail('not_allowed', 'err.internal');
     }
+  }
+
+  /** §11 X5.1: sets a member's language. false for an unknown id or a language that is not supported. */
+  setLang(id, lang) {
+    const L = normLang(lang);
+    const m = this._member(id);
+    if (!L || !m) return false;
+    m.obj.lang = L;
+    return true;
+  }
+
+  /** A member's language ('en' | 'ru'), or null for an id that is not a member. */
+  langOf(id) {
+    const m = this._member(id);
+    return m ? normLang(m.obj.lang) ?? 'en' : null;
   }
 
   handle(id, msg) {
     try {
       const bad = validateMessage(msg);
       if (bad) return bad;
-      if (!ENGINE_TYPES.has(msg.t)) return fail('bad_request', `"${msg.t}" is not a game action`);
+      if (!ENGINE_TYPES.has(msg.t)) return fail('bad_request', 'err.notGameAction', { type: msg.t });
       const m = this._member(id);
       if (!m || (m.kind === 'player' && m.obj.status === 'left')) return fail('not_in_room');
       switch (msg.t) {
@@ -489,11 +656,11 @@ export class Game {
         case 'special': return this._special(m, msg);
         case 'playAgain': return this._playAgain(id);
         case 'endGame': return this._endGame(id);
-        default: return fail('bad_request', 'Unknown message type');
+        default: return fail('bad_request', 'err.unknownType');
       }
     } catch (e) {
       this.lastError = e;
-      return { ...fail('not_allowed', 'Internal error'), internal: true };
+      return { ...fail('not_allowed', 'err.internal'), internal: true };
     }
   }
 
@@ -513,7 +680,7 @@ export class Game {
       if (!host || host.connected) return false;
       const next = this._pickHost(true);
       if (!next) return false;
-      this._setHost(next.id, `${host.name} has been offline for a while`);
+      this._setHost(next.id, M('host.offline', { p: this._pref(host) }));
       return true;
     } catch (e) {
       this.lastError = e;
@@ -539,10 +706,11 @@ export class Game {
   }
 
   // ------------------------------------------------------------------------------------------------ host
-  _setHost(id, why = '') {
+  /** `why`: null, or the reason as a nested message (host.offline, host.handover). */
+  _setHost(id, why = null) {
     this.hostId = id;
     this.hostSince = this._time();
-    if (id) this._log('info', `${why ? why + ' — ' : ''}${this._name(id)} is now the host`);
+    if (id) this._log('info', 'log.host', { p: this._ref(id), why: why || null });
   }
   _pickHost(connectedOnly) {
     const pool = this.players.filter((p) => p.status !== 'left' && p.id !== this.hostId);
@@ -564,39 +732,44 @@ export class Game {
   // ------------------------------------------------------------------------------------------------ lobby
   _setOptions(id, options) {
     if (id !== this.hostId) return fail('not_host');
-    if (this.phase !== 'lobby') return fail('wrong_phase', 'Options can only be changed in the lobby');
+    if (this.phase !== 'lobby') return fail('wrong_phase', 'err.optionsLobbyOnly');
     for (const key of OPTION_KEYS) if (Number.isInteger(options[key])) this.options[key] = options[key];
     return ok();
   }
 
   _takeSeat(m) {
-    if (this.players.length >= MAX_PLAYERS) return fail('room_full', 'All 16 seats are taken');
-    if (this.phase !== 'lobby') return fail('wrong_phase', 'Seats can only be taken in the lobby');
-    if (m.kind !== 'spectator') return fail('not_allowed', 'You already have a seat');
+    if (this.players.length >= MAX_PLAYERS) return fail('room_full', 'err.seatsFull');
+    if (this.phase !== 'lobby') return fail('wrong_phase', 'err.seatsLobbyOnly');
+    if (m.kind !== 'spectator') return fail('not_allowed', 'err.alreadySeated');
     const s = m.obj;
     this.spectators = this.spectators.filter((x) => x !== s);
     const p = this._newPlayer(s.id, s.name);
     p.connected = s.connected;
     p.disconnectedAt = s.disconnectedAt;
+    p.lang = s.lang ?? 'en';
     this.players.push(p);
     this._renumber();
-    this._log('info', `${s.name} took a seat`);
+    this._log('info', 'log.seat', { p: this._pref(s) });
     if (!this.hostId) this._setHost(p.id);
     return ok();
   }
 
   _start(id) {
     if (id !== this.hostId) return fail('not_host');
-    if (this.phase !== 'lobby') return fail('wrong_phase', 'The game has already started');
+    if (this.phase !== 'lobby') return fail('wrong_phase', 'err.alreadyStarted');
     const n = this.players.length;
-    if (n < this.minPlayers) return fail('not_allowed', `At least ${this.minPlayers} players are needed to start`);
+    if (n < this.minPlayers) return fail('not_allowed', 'err.tooFewPlayers', { n: this.minPlayers });
     this._resetTable();
     this.N = n;
     this.kicks = kicksRow(n);
     this.capacity = Math.floor(n / 2);
-    const cat = this._safeDraw(() => this.dealer.drawCatastrophe(), null) || {};
+    // §11 X5: a token dealer's twin when it has one (the same rng calls), else the English draw as a literal token;
+    // nothing (or a throw) gives the engine's stand-in, which renders in every language
+    this.catastropheTok = this._drawCatastropheTok();
+    const cat = renderCatastrophe('en', this.catastropheTok) || {};
     this.catastrophe = { title: str(cat.title, 'Catastrophe'), text: str(cat.text), details: strList(cat.details) };
-    const b = this._safeDraw(() => this.dealer.drawBunker(), null) || {};
+    this.bunkerTok = this._drawBunkerTok();
+    const b = renderBunker('en', this.bunkerTok) || {};
     this.bunker = {
       name: str(b.name, 'The bunker'), size: str(b.size), duration: str(b.duration), food: str(b.food),
       features: strList(b.features),
@@ -608,7 +781,10 @@ export class Game {
     for (const p of this.players) {
       p.status = 'alive';
       p.cards = {};
-      for (const c of CATEGORY_IDS) p.cards[c] = { text: this._drawCard(c), revealed: false };
+      for (const c of CATEGORY_IDS) {
+        const d = this._drawCard(c);
+        p.cards[c] = makeCard(d.text, d.tok, false);
+      }
       const f = fixed.get(p.id);
       if (f) {
         const slot = this._rand(2);
@@ -620,7 +796,9 @@ export class Game {
       p.notes = [];
       p.lastSpecialRound = 0;
     }
-    this._log('system', `The game begins: ${n} players, ${this.capacity} beds. Catastrophe: ${this.catastrophe.title}. Bunker: ${this.bunker.name}.`);
+    this._log('system', 'log.gameBegins', {
+      n, beds: this.capacity, cata: { cata: this.catastropheTok }, bname: { bname: this._bunkerNameTok() },
+    });
     this._startReveal(1);
     return ok();
   }
@@ -629,8 +807,65 @@ export class Game {
     try { return fn(); } catch (e) { this.lastError = e; return fallback; }
   }
 
+  /** true when the dealer has the §11 X5 token twin `name` (picked per method: a test dealer may wrap only some). */
+  _hasTok(name) {
+    try { return !!this.dealer && typeof this.dealer[name] === 'function'; } catch { return false; }
+  }
+
+  /** {text, tok}: the dealt card's English text and its token ('—', a literal, when the dealer has nothing). */
   _drawCard(category) {
-    return str(this._safeDraw(() => this.dealer.drawCard(category), ''), '') || '—';
+    if (this._hasTok('drawCardTok')) {
+      const tok = this._safeDraw(() => this.dealer.drawCardTok(category), null);
+      if (tok !== null && typeof tok === 'object') {
+        const text = str(this._safeDraw(() => renderCard('en', tok), ''), '');
+        if (text) return { text, tok };
+      }
+      return { text: '—', tok: litTok('—') };
+    }
+    const text = str(this._safeDraw(() => this.dealer.drawCard(category), ''), '') || '—';
+    return { text, tok: litTok(text) };
+  }
+
+  _drawCatastropheTok() {
+    if (this._hasTok('drawCatastropheTok')) {
+      const tok = this._safeDraw(() => this.dealer.drawCatastropheTok(), null);
+      return tok !== null && typeof tok === 'object' ? tok : FALLBACK_CATASTROPHE_TOK;
+    }
+    const cat = this._safeDraw(() => this.dealer.drawCatastrophe(), null);
+    if (!cat || typeof cat !== 'object') return FALLBACK_CATASTROPHE_TOK;
+    return deepFreeze({ lit: { title: str(cat.title, 'Catastrophe'), text: str(cat.text), details: strList(cat.details) } });
+  }
+
+  _drawBunkerTok() {
+    if (this._hasTok('drawBunkerTok')) {
+      const tok = this._safeDraw(() => this.dealer.drawBunkerTok(), null);
+      return tok !== null && typeof tok === 'object' ? tok : FALLBACK_BUNKER_TOK;
+    }
+    const b = this._safeDraw(() => this.dealer.drawBunker(), null);
+    if (!b || typeof b !== 'object') return FALLBACK_BUNKER_TOK;
+    return deepFreeze({
+      lit: { name: str(b.name, 'The bunker'), size: str(b.size), duration: str(b.duration), food: str(b.food), features: strList(b.features) },
+    });
+  }
+
+  /** The bunker's name as a token of its own (a literal bunker's name is a literal). */
+  _bunkerNameTok() {
+    const t = this.bunkerTok;
+    if (t && typeof t === 'object' && t.lit !== undefined) return litTok(this.bunker ? this.bunker.name : '');
+    return t && typeof t === 'object' && t.name && typeof t.name === 'object' ? t.name : FALLBACK_BUNKER_TOK.name;
+  }
+
+  /** A bunker feature card's token: the dealer's, or the engine's stand-in "A hidden storeroom" (never dealt). */
+  _drawFeatureTok() {
+    let tok = null;
+    if (this._hasTok('drawBunkerFeatureTok')) {
+      tok = this._safeDraw(() => this.dealer.drawBunkerFeatureTok(), null);
+      if (tok !== null && typeof tok === 'object' && !str(this._safeDraw(() => renderFeature('en', tok), ''), '')) tok = null;
+    } else {
+      const text = str(this._safeDraw(() => this.dealer.drawBunkerFeature(), ''));
+      tok = text ? litTok(text) : null;
+    }
+    return tok !== null && typeof tok === 'object' ? tok : FALLBACK_FEATURE_TOK;
   }
 
   /** A random special from the dealer. With the fixed deal on, an Airlock, revive or `eject` it offers is redrawn. */
@@ -663,7 +898,7 @@ export class Game {
 
   _playAgain(id) {
     if (id !== this.hostId) return fail('not_host');
-    if (this.phase !== 'final') return fail('wrong_phase', 'Play again is only available after the game');
+    if (this.phase !== 'final') return fail('wrong_phase', 'err.playAgainFinal');
     this._backToLobby();
     return ok();
   }
@@ -677,8 +912,8 @@ export class Game {
    */
   _endGame(id) {
     if (id !== this.hostId) return fail('not_host');
-    if (this.phase === 'lobby') return fail('wrong_phase', 'There is no game to end: the table is already in the lobby');
-    if (this.phase !== 'final') this._log('system', 'The host ended the game');
+    if (this.phase === 'lobby') return fail('wrong_phase', 'err.endGameLobby');
+    if (this.phase !== 'final') this._log('system', 'log.endGame');
     this._backToLobby();
     return ok();
   }
@@ -697,7 +932,7 @@ export class Game {
     }
     this._renumber();
     this._resetTable();
-    this._log('system', 'Back to the lobby — same table, new cards next game');
+    this._log('system', 'log.backToLobby');
   }
 
   // ------------------------------------------------------------------------------------------------ leave / kick / host
@@ -709,8 +944,8 @@ export class Game {
   _kick(id, targetId) {
     if (id !== this.hostId) return fail('not_host');
     const m = this._member(targetId);
-    if (!m || (m.kind === 'player' && m.obj.status === 'left')) return fail('not_allowed', 'No such player');
-    if (targetId === this.hostId) return fail('not_allowed', 'You cannot kick yourself');
+    if (!m || (m.kind === 'player' && m.obj.status === 'left')) return fail('not_allowed', 'err.noSuchPlayer');
+    if (targetId === this.hostId) return fail('not_allowed', 'err.kickSelf');
     this._removeMember(m, 'kicked');
     return ok();
   }
@@ -718,17 +953,17 @@ export class Game {
   _removeMember(m, how) {
     const x = m.obj;
     const kicked = how === 'kicked';
-    const verb = kicked ? 'was removed by the host' : 'left';
+    const who = { p: this._pref(x) };
     if (m.kind === 'spectator') {
       this.spectators = this.spectators.filter((s) => s !== x);
-      this._log('info', `${x.name} (spectator) ${verb}`);
+      this._log('info', kicked ? 'log.specKicked' : 'log.specLeft', who);
       return;
     }
     const wasHost = x.id === this.hostId;
     if (this.phase === 'lobby') {
       this.players = this.players.filter((p) => p !== x);
       this._renumber();
-      this._log('info', `${x.name} ${verb}`);
+      this._log('info', kicked ? 'log.kicked' : 'log.leftLobby', who);
       if (wasHost) this._passHostNow();
       return;
     }
@@ -737,19 +972,19 @@ export class Game {
     x.connected = false;
     this._dropMods(x.id);
     // "… was removed by the host" (the client's final banner looks for exactly that phrase) or "… left the game".
-    this._log('info', kicked ? `${x.name} ${verb}` : `${x.name} left the game`);
+    this._log('info', kicked ? 'log.kicked' : 'log.leftGame', who);
     // §11 Y1: an airlock on them jams right after that line, before a new host is named. When this ends the game, it
     // jams at the final instead, after "The bunker door closes" (_afterLostAlive → _checkEnd → _enterFinal).
     if (wasAlive && IN_GAME.has(this.phase) && this._aliveCount() > this.capacity) this._jamAirlocks((a) => a.targetId === x.id);
     if (wasHost) this._passHostNow();
-    if (wasAlive && IN_GAME.has(this.phase)) this._afterLostAlive(x.id, `with ${x.name} gone`);
+    if (wasAlive && IN_GAME.has(this.phase)) this._afterLostAlive(x.id, M('why.gone', who));
   }
 
   _transferHost(id, targetId) {
     if (id !== this.hostId) return fail('not_host');
     const p = this._player(targetId);
-    if (!p || p.status === 'left' || p.id === this.hostId) return fail('not_allowed', 'Pick another seated player');
-    this._setHost(p.id, `${this._name(id)} handed over the host role`);
+    if (!p || p.status === 'left' || p.id === this.hostId) return fail('not_allowed', 'err.transferTarget');
+    this._setHost(p.id, M('host.handover', { p: this._ref(id) }));
     return ok();
   }
 
@@ -762,7 +997,7 @@ export class Game {
     const order = this._alive().map((p) => p.id);
     if (round % 2 === 0) order.reverse();
     this.turn = { kind: 'reveal', order, index: 0, hasRevealed: false };
-    this._log('system', `Round ${round} of ${MAX_ROUNDS} — reveal phase (${round % 2 ? 'ascending' : 'descending'} seat order)${round === 1 ? '. Everyone reveals their Profession' : ''}`);
+    this._log('system', 'log.roundReveal', { r: round, max: MAX_ROUNDS, asc: round % 2 === 1, first: round === 1 });
     this._startTurnTimer();
   }
 
@@ -770,7 +1005,7 @@ export class Game {
     const t = this.turn;
     const sp = this._player(this._speakerId());
     const secs = t.kind === 'defense' ? this.options.defenseSeconds : this.round === 1 ? this.options.speechSeconds1 : this.options.speechSeconds;
-    this.timer = { label: t.kind === 'defense' ? `Defense: ${sp?.name ?? ''}` : `${sp?.name ?? ''}'s turn`, endsAt: this._time() + secs * 1000 };
+    this._setTimer(t.kind === 'defense' ? 'timer.defense' : 'timer.turn', { p: { p: sp?.id ?? '', n: sp?.name ?? '' } }, secs);
   }
 
   _advanceReveal() {
@@ -789,24 +1024,22 @@ export class Game {
     this.phase = 'discussion';
     this.turn = null;
     this.vote = null;
-    this.timer = { label: this.overtime ? 'Overtime discussion' : 'Discussion', endsAt: this._time() + this.options.discussionSeconds * 1000 };
+    this._setTimer(this.overtime ? 'timer.otDiscussion' : 'timer.discussion', {}, this.options.discussionSeconds);
     const k = this._kicksNow();
-    const tail = k > 0
-      ? (this.voteMods.cancelNext ? ' — the vote after it is cancelled' : ` — then a vote: ${k} player${k === 1 ? '' : 's'} will stay outside`)
-      : ' — no vote this round';
-    this._log('system', `${this._rp()} — discussion${tail}`);
+    const mode = k > 0 ? (this.voteMods.cancelNext ? 'cancelled' : 'vote') : 'none';
+    this._log('system', 'log.discussion', { rp: this._rpRef(), mode, k });
   }
 
   _reveal(id, category, at) {
-    if (this.phase !== 'reveal') return fail('wrong_phase', 'Cards are revealed during the reveal phase');
+    if (this.phase !== 'reveal') return fail('wrong_phase', 'err.revealPhase');
     const stale = this._stale(at);
     if (stale) return stale;
     if (this._speakerId() !== id) return fail('not_your_turn');
     const p = this._player(id);
-    if (this.turn.hasRevealed) return fail('not_allowed', 'You have already revealed a card this turn');
+    if (this.turn.hasRevealed) return fail('not_allowed', 'err.alreadyRevealed');
     if (!this._eligible(p).includes(category)) {
-      if (this._mustReveal() && category !== this._mustReveal()) return fail('not_allowed', 'In round 1 you must reveal your Profession');
-      return fail('not_allowed', 'That card is already revealed');
+      if (this._mustReveal() && category !== this._mustReveal()) return fail('not_allowed', 'err.round1Profession');
+      return fail('not_allowed', 'err.cardRevealed');
     }
     this._doReveal(p, category, false);
     return ok();
@@ -815,17 +1048,17 @@ export class Game {
   _doReveal(p, category, auto) {
     p.cards[category].revealed = true;
     this.turn.hasRevealed = true;
-    this._log('reveal', `${this._rp()} — ${p.name} revealed ${LABEL[category]}: ${p.cards[category].text}${auto ? ' (revealed automatically)' : ''}`);
+    this._log('reveal', 'log.reveal', { rp: this._rpRef(), p: this._pref(p), cat: { cat: category }, card: { tok: p.cards[category].tok }, auto: !!auto });
   }
 
   _endTurn(id, at) {
-    if (this.phase !== 'reveal' && this.phase !== 'defense') return fail('wrong_phase', 'There is no turn to end');
+    if (this.phase !== 'reveal' && this.phase !== 'defense') return fail('wrong_phase', 'err.noTurn');
     const stale = this._stale(at);
     if (stale) return stale;
     if (this._speakerId() !== id) return fail('not_your_turn');
     if (this.phase === 'reveal') {
       const p = this._player(id);
-      if (!this.turn.hasRevealed && this._eligible(p).length > 0) return fail('not_allowed', 'Reveal a card first');
+      if (!this.turn.hasRevealed && this._eligible(p).length > 0) return fail('not_allowed', 'err.revealFirst');
       this._advanceReveal();
     } else {
       this._advanceDefense();
@@ -850,7 +1083,7 @@ export class Game {
       case 'defense': this._advanceDefense(); return ok();
       case 'discussion': this._afterDiscussion(); return ok();
       case 'vote': this._closeBallot(); return ok();
-      default: return fail('wrong_phase', this.phase === 'lobby' ? 'Use Start to begin the game' : 'Use Play again to return to the lobby');
+      default: return fail('wrong_phase', this.phase === 'lobby' ? 'err.useStart' : 'err.usePlayAgain');
     }
   }
 
@@ -862,7 +1095,7 @@ export class Game {
       const lost = this._expiringMods();
       this._clearMods(true);
       this.lastVoteResult = { stage: 'main', tally: [], ejectedId: null, tie: null, random: false, cancelled: true };
-      this._log('vote', `${this._rp()} — the vote is cancelled (a special card); the ${k === 1 ? 'kick carries' : 'kicks carry'} over${lost}`);
+      this._log('vote', 'log.voteSkipped', { rp: this._rpRef(), k, mods: lost });
       this._afterStep();
       return;
     }
@@ -874,7 +1107,7 @@ export class Game {
     if (this.round < MAX_ROUNDS) { this._startReveal(this.round + 1); return; }
     if (!this.overtime) {
       this.overtime = true;
-      this._log('system', `Overtime — the bunker is still over capacity (${this._aliveCount()} players, ${this.capacity} beds): discuss, then vote again`);
+      this._log('system', 'log.overtime', { alive: this._aliveCount(), beds: this.capacity });
     }
     this._startDiscussion();
   }
@@ -896,7 +1129,7 @@ export class Game {
     const survivors = this.players.filter((p) => p.status === 'alive').map((p) => p.id);
     const out = this.players.filter((p) => p.status !== 'alive').map((p) => p.id);
     this.final = { survivors, out };
-    this._log('system', `The bunker door closes. In the bunker: ${this._names(survivors) || 'nobody'}. Stayed in the forest: ${this._names(out) || 'nobody'}.`);
+    this._log('system', 'log.doorCloses', { in: this._refs(survivors), out: this._refs(out) });
     // §11 X1: open airlocks jam when the game ends. Logged after the door line, so the line before it stays the
     // move that ended the game (the client's final banner reads it).
     this._jamAirlocks(() => true);
@@ -908,14 +1141,15 @@ export class Game {
     const gone = this.airlocks.filter(pred);
     if (!gone.length) return;
     this.airlocks = this.airlocks.filter((a) => !gone.includes(a));
-    for (const a of gone) this._log('special', `🚪 The airlock on ${this._name(a.targetId)} jammed — nobody closed it.`);
+    for (const a of gone) this._log('special', 'log.airlockJam', { t: this._ref(a.targetId) });
   }
 
   /**
    * An alive player stopped being alive outside a ballot result (left, kicked, or ejected by a special).
-   * `why` ("with P1 gone") explains a smaller ballot total in the log when this happens during a vote step.
+   * `why` (a nested message: why.gone "with P1 gone") explains a smaller ballot total in the log when this happens
+   * during a vote step.
    */
-  _afterLostAlive(id, why = '') {
+  _afterLostAlive(id, why = null) {
     this._dropMods(id);
     if (this._checkEnd()) return;
     // §11 X1: an airlock on someone who is no longer alive jams at once (one they opened on someone else stays open).
@@ -946,14 +1180,14 @@ export class Game {
     const fewer = before - s.ballots;
     if (fewer > 0 && ballotGoesOn) {
       const n = s.ballots;
-      this._log('vote', `${this._rp()} — ${why ? why + ', ' : ''}${fewer === 1 ? 'one ejection fewer is' : `${fewer} fewer ejections are`} due: this vote now has ${n} ballot${n === 1 ? '' : 's'} instead of ${before}`);
+      this._log('vote', 'log.ballotsFewer', { rp: this._rpRef(), why: why || null, fewer, n, before });
     }
   }
 
   // ------------------------------------------------------------------------------------------------ vote step (§3)
   _startStep(k) {
     this.step = { ballot: 0, ballots: k, tied: null, mainVoters: null, ejected: 0 };
-    this._log('vote', `${this._rp()} — vote: ${k} player${k === 1 ? '' : 's'} will stay outside`);
+    this._log('vote', 'log.voteStep', { rp: this._rpRef(), k });
     this._openNextBallot();
   }
 
@@ -961,7 +1195,7 @@ export class Game {
     const k = this._kicksNow();
     if (k <= 0) {
       // Normally the last ballot just ran. If fewer ballots ran than the step still showed, say why it stops here.
-      if (this.step && this.step.ballot < this.step.ballots) this._log('vote', `${this._rp()} — no more ejections are due in this vote`);
+      if (this.step && this.step.ballot < this.step.ballots) this._log('vote', 'log.noMoreDue', { rp: this._rpRef() });
       this._endStep();
       return;
     }
@@ -973,7 +1207,7 @@ export class Game {
     const alive = this._alive();
     const candidates = alive.filter((p) => !this.voteMods.immune.has(p.id)).map((p) => p.id);
     if (candidates.length === 0) {
-      this._log('vote', `${this._rp()} — everyone is immune: the rest of the vote is cancelled`);
+      this._log('vote', 'log.allImmune', { rp: this._rpRef() });
       this._cancelStep('main');
       return;
     }
@@ -1000,7 +1234,7 @@ export class Game {
     const lost = this._expiringMods();
     // An earlier ballot of this step may already have ejected someone: then only the rest of the vote is off.
     const earlier = this.step && this.step.ejected > 0;
-    if (lost) this._log('vote', `${this._rp()} — ${earlier ? 'no further ejections in this vote' : 'the vote ends without an ejection'}${lost}`);
+    if (lost) this._log('vote', 'log.stepCancelled', { rp: this._rpRef(), earlier: !!earlier, mods: lost });
     this._clearMods(false);
     this.step = null;
     this.vote = null;
@@ -1009,13 +1243,13 @@ export class Game {
   }
 
   _vote(id, targetId, at) {
-    if (this.phase !== 'vote' || !this.vote) return fail('wrong_phase', 'There is no open vote');
+    if (this.phase !== 'vote' || !this.vote) return fail('wrong_phase', 'err.noOpenVote');
     const stale = this._stale(at);
     if (stale) return stale;
     const v = this.vote;
-    if (!v.voters.includes(id)) return fail('not_allowed', 'You are not a voter in this ballot');
-    if (targetId === id) return fail('not_allowed', 'You cannot vote for yourself');
-    if (!v.candidates.includes(targetId)) return fail('not_allowed', 'That player is not a candidate');
+    if (!v.voters.includes(id)) return fail('not_allowed', 'err.notVoter');
+    if (targetId === id) return fail('not_allowed', 'err.voteSelf');
+    if (!v.candidates.includes(targetId)) return fail('not_allowed', 'err.notCandidate');
     v.votes.set(id, targetId);
     this._autoClose();
     return ok();
@@ -1023,7 +1257,7 @@ export class Game {
 
   _closeVote(id, at) {
     if (id !== this.hostId) return fail('not_host');
-    if (this.phase !== 'vote' || !this.vote) return fail('wrong_phase', 'There is no open vote');
+    if (this.phase !== 'vote' || !this.vote) return fail('wrong_phase', 'err.noOpenVote');
     const stale = this._stale(at);
     if (stale) return stale;
     this._closeBallot();
@@ -1053,11 +1287,11 @@ export class Game {
     let ejectedId = null;
     let tie = null;
     let random = false;
-    let why = '';
+    let how = 0; // log.eject: 1 nobody voted, 2 still tied (fate decides either way)
     if (total === 0) {
       ejectedId = this._pick(this._bySeat(v.candidates));
       random = true;
-      why = 'Nobody voted — fate decides';
+      how = 1;
     } else {
       const top = tally[0].votes;
       const tops = tally.filter((e) => e.votes === top).map((e) => e.targetId);
@@ -1067,7 +1301,7 @@ export class Game {
         tie = tops;
         ejectedId = this._pick(tops);
         random = true;
-        why = 'Still tied — fate decides';
+        how = 2;
       }
     }
     this.lastVoteResult = {
@@ -1076,9 +1310,14 @@ export class Game {
       ejectedId, tie: tie ? [...tie] : null, random, cancelled: false,
     };
     const counted = new Set(tally.flatMap((e) => e.voterIds));
-    const parts = tally.map((e) => `${this._name(e.targetId)} ${e.votes}${e.voterIds.length ? ` (${e.voterIds.map((x) => this._name(x) + (this.voteMods.doubleVote.has(x) ? ' ×2' : '')).join(', ')})` : ''}`);
+    const rows = tally.map((e) => ({
+      t: this._ref(e.targetId), votes: e.votes,
+      voters: e.voterIds.map((x) => ({ p: this._ref(x), x2: this.voteMods.doubleVote.has(x) })),
+    }));
     const abstained = this._bySeat(v.voters).filter((x) => !counted.has(x));
-    this._log('vote', `${this._rp()} — ${v.stage === 'revote' ? 'revote' : 'vote'} ${s.ballot} of ${s.ballots}: ${parts.join('; ')}${abstained.length ? `; abstained: ${this._names(abstained)}` : ''}`);
+    this._log('vote', 'log.tally', {
+      rp: this._rpRef(), revote: v.stage === 'revote', ballot: s.ballot, ballots: s.ballots, rows, abstained: this._refs(abstained),
+    });
     const mainVoters = v.voters;
     this.vote = null;
     if (tie && !ejectedId) {
@@ -1087,16 +1326,17 @@ export class Game {
       this._startDefense(s.tied);
       return;
     }
-    this._ejectByVote(ejectedId, why);
+    this._ejectByVote(ejectedId, how);
   }
 
-  _ejectByVote(id, why) {
+  /** `how` (log.eject): 0 by the votes, 1 nobody voted, 2 still tied after the revote. */
+  _ejectByVote(id, how = 0) {
     const p = this._player(id);
     p.status = 'ejected';
     if (this.step) this.step.ejected += 1;
     this._dropMods(id);
     this._jamAirlocks((a) => a.targetId === id); // none can be open during a vote step (they jam when it starts)
-    this._log('eject', `${why ? why + ': ' : ''}${p.name} is ejected and stays in the forest`);
+    this._log('eject', 'log.eject', { p: this._pref(p), how: [1, 2].includes(how) ? how : 0 });
     if (this._checkEnd()) return;
     this._openNextBallot();
   }
@@ -1104,7 +1344,7 @@ export class Game {
   _startDefense(tied) {
     this.phase = 'defense';
     this.turn = { kind: 'defense', order: [...tied], index: 0, hasRevealed: false };
-    this._log('vote', `${this._rp()} — tie between ${this._names(tied)}: defense speeches, then a revote`);
+    this._log('vote', 'log.tie', { rp: this._rpRef(), ids: this._refs(tied) });
     this._startTurnTimer();
   }
 
@@ -1140,13 +1380,13 @@ export class Game {
     const candidates = this._bySeat((s.tied || []).filter((id) => this._isAlive(id)));
     if (candidates.length === 0) {
       this.lastVoteResult = { stage: 'revote', tally: [], ejectedId: null, tie: null, random: false, cancelled: false };
-      this._log('vote', `${this._rp()} — nobody is left to vote out in this ballot`);
+      this._log('vote', 'log.nobodyLeft', { rp: this._rpRef() });
       this._openNextBallot();
       return;
     }
     const voters = this._bySeat((s.mainVoters || []).filter((id) => this._isAlive(id) && candidates.some((c) => c !== id)));
     this.vote = { stage: 'revote', candidates, voters, votes: new Map() };
-    this._log('vote', `${this._rp()} — revote between ${this._names(candidates)}`);
+    this._log('vote', 'log.revote', { rp: this._rpRef(), ids: this._refs(candidates) });
     this._autoClose();
   }
 
@@ -1161,7 +1401,7 @@ export class Game {
     for (const voter of [...v.votes.keys()]) if (!v.voters.includes(voter)) v.votes.delete(voter);
     if (v.candidates.length === 0) {
       this.lastVoteResult = { stage: v.stage, tally: [], ejectedId: null, tie: null, random: false, cancelled: false };
-      this._log('vote', `${this._rp()} — nobody is left to vote out in this ballot`);
+      this._log('vote', 'log.nobodyLeft', { rp: this._rpRef() });
       this.vote = null;
       this._openNextBallot();
       return;
@@ -1171,7 +1411,7 @@ export class Game {
 
   // ------------------------------------------------------------------------------------------------ specials (§5)
   _special(m, msg) {
-    if (!IN_GAME.has(this.phase)) return fail('wrong_phase', 'Specials can only be played during the game');
+    if (!IN_GAME.has(this.phase)) return fail('wrong_phase', 'err.specialPhase');
     // §11 R3: a card aimed at a step that has ended (a vote that closed while it was in flight) must not land on the
     // next one: nothing is spent. Whose turn it is does not change what a card does, so `turnIndex` is not compared.
     // §11 Z2: nor does the step from a round's reveal phase into its discussion (an Airlock join confirmed on the last
@@ -1180,45 +1420,45 @@ export class Game {
     const at = msg.at && msg.at.phase === 'reveal' && this.phase === 'discussion' ? { ...msg.at, phase: 'discussion' } : msg.at;
     const stale = this._stale(at, ['turnIndex']);
     if (stale) return stale;
-    if (m.kind !== 'player') return fail('not_allowed', 'Spectators have no special cards');
+    if (m.kind !== 'player') return fail('not_allowed', 'err.spectatorSpecial');
     const p = m.obj;
     const card = p.specials.find((s) => s.uid === msg.uid);
-    if (!card) return fail('not_allowed', 'You do not have that card');
+    if (!card) return fail('not_allowed', 'err.noCard');
     const eff = EFFECTS[card.effect];
-    if (eff.timing === 'before_vote' && !BEFORE_VOTE.has(this.phase)) return fail('wrong_phase', 'This card can only be played before the vote (reveal or discussion)');
-    if (p.status !== 'alive') return fail('not_allowed', 'Only players still in the game can play specials');
-    if (card.used) return fail('not_allowed', 'That card has already been played');
-    if (p.lastSpecialRound === this.round) return fail('not_allowed', 'You have already played a special this round');
-    if (this.round < card.minRound) return fail('not_allowed', `This card can be played from round ${card.minRound}`);
+    if (eff.timing === 'before_vote' && !BEFORE_VOTE.has(this.phase)) return fail('wrong_phase', 'err.beforeVoteOnly');
+    if (p.status !== 'alive') return fail('not_allowed', 'err.specialAlive');
+    if (card.used) return fail('not_allowed', 'err.cardUsed');
+    if (p.lastSpecialRound === this.round) return fail('not_allowed', 'err.oneSpecial');
+    if (this.round < card.minRound) return fail('not_allowed', 'err.fromRound', { n: card.minRound });
     const inStep = IN_STEP.has(this.phase);
-    if (card.effect === 'cancel_vote' && !inStep && this.voteMods.cancelNext) return fail('not_allowed', 'The next vote is already cancelled');
+    if (card.effect === 'cancel_vote' && !inStep && this.voteMods.cancelNext) return fail('not_allowed', 'err.cancelledAlready');
     // §11 Z3: a ×2 needs a vote to double. A blocked player has none in this or the next vote step (the block lasts the
     // whole step), and nor does anyone who is not a voter of the open ballot (they stay out for the rest of the step).
     if (card.effect === 'double_vote') {
-      if (this.voteMods.blocked.has(p.id)) return fail('not_allowed', `Your vote is blocked in ${inStep ? 'this' : 'the next'} vote, so a double vote would do nothing`);
-      if (this.phase === 'vote' && this.vote && !this.vote.voters.includes(p.id)) return fail('not_allowed', 'You are not a voter in this ballot, so a double vote would do nothing');
+      if (this.voteMods.blocked.has(p.id)) return fail('not_allowed', 'err.doubleBlocked', { now: inStep });
+      if (this.phase === 'vote' && this.vote && !this.vote.voters.includes(p.id)) return fail('not_allowed', 'err.doubleNotVoter');
     }
 
     let target = null;
     if (card.target === 'self') target = p;
     else if (card.target === 'other') {
       target = this._player(msg.targetId);
-      if (!target || target === p || target.status !== 'alive') return fail('not_allowed', 'Pick another player who is still in the game');
-      if (eff.category === 'hidden' && this._hidden(target).length === 0) return fail('not_allowed', 'That player has no hidden cards left');
+      if (!target || target === p || target.status !== 'alive') return fail('not_allowed', 'err.pickAlive');
+      if (eff.category === 'hidden' && this._hidden(target).length === 0) return fail('not_allowed', 'err.noHidden');
     } else if (card.target === 'ejected') {
       target = this._player(msg.targetId);
-      if (!target || target.status !== 'ejected') return fail('not_allowed', 'Pick a player who was voted out');
+      if (!target || target.status !== 'ejected') return fail('not_allowed', 'err.pickEjected');
     }
     // §11 X1: the airlock needs a *different* second player (unreachable while one special per round holds: kept as a guard)
     if (card.effect === 'airlock' && this.airlocks.some((a) => a.targetId === target.id && a.byIds.includes(p.id))) {
-      return fail('not_allowed', `You already started the airlock on ${target.name}: someone else has to close it`);
+      return fail('not_allowed', 'err.ownAirlock', { t: this._pref(target) });
     }
 
     let category = null;
     if (eff.category) {
       if (card.category === 'choose') {
-        if (!IS_CATEGORY(msg.category)) return fail('not_allowed', 'Pick a category');
-        if (eff.category === 'hidden' && !this._hidden(target).includes(msg.category)) return fail('not_allowed', 'That card is not hidden');
+        if (!IS_CATEGORY(msg.category)) return fail('not_allowed', 'err.pickCategory');
+        if (eff.category === 'hidden' && !this._hidden(target).includes(msg.category)) return fail('not_allowed', 'err.notHidden');
         category = msg.category;
       } else if (card.category === 'random') {
         category = this._pick(this._hidden(target));
@@ -1229,88 +1469,105 @@ export class Game {
 
     card.used = true;
     p.lastSpecialRound = this.round;
-    p.playedSpecials.push({ title: card.title, text: card.text });
+    p.playedSpecials.push(this._playedCopy(card));
     const after = this._applyEffect(p, card, target, category, inStep);
     return after ?? ok();
   }
 
-  _specialLog(p, card, result) {
-    this._log('special', `${this._rp()} — ${p.name} played “${card.title}”${card.text ? `: ${card.text}` : ''} → ${result}`);
+  /** A played special as players[].playedSpecials keeps it: its words plus its content id and catalogue ref. */
+  _playedCopy(card) {
+    const out = { id: card.id, ref: card.ref ?? null, title: card.title, text: card.text };
+    if (card.untitled) out.untitled = true;
+    return out;
+  }
+
+  /** A special card as a message param ({sp}): its ids and its English words (a literal card shows those). */
+  _spParam(card) {
+    const sp = { id: card.id, ref: card.ref ?? null, title: card.title, text: card.text };
+    if (card.untitled) sp.untitled = true;
+    return { sp };
+  }
+
+  /** log.special: `result` is the nested res.* message. */
+  _specialLog(p, card, key, params = {}) {
+    this._log('special', 'log.special', { rp: this._rpRef(), p: this._pref(p), card: this._spParam(card), result: M(key, params) });
   }
 
   _applyEffect(p, card, target, category, inStep) {
-    const L = category ? LABEL[category] : '';
+    const cat = category ? { cat: category } : null;
     switch (card.effect) {
       case 'swap_card': {
         const a = p.cards[category];
         const b = target.cards[category];
         [a.text, b.text] = [b.text, a.text];
+        [a.tok, b.tok] = [b.tok, a.tok];
         a.revealed = true;
         b.revealed = true;
-        this._specialLog(p, card, `${p.name} and ${target.name} swapped ${L}: ${p.name} now has “${a.text}”, ${target.name} now has “${b.text}”`);
+        this._specialLog(p, card, 'res.swap', { a: this._pref(p), b: this._pref(target), cat, ca: { tok: a.tok }, cb: { tok: b.tok } });
         return null;
       }
       case 'reroll_card': {
-        const text = this._drawCard(category);
-        target.cards[category] = { text, revealed: true };
-        this._specialLog(p, card, `${target === p ? `${p.name}'s` : `${target.name}'s`} ${L} was replaced with a new card: “${text}”`);
+        const d = this._drawCard(category);
+        target.cards[category] = makeCard(d.text, d.tok, true);
+        this._specialLog(p, card, 'res.reroll', { t: this._pref(target), cat, c: { tok: d.tok } });
         return null;
       }
       case 'force_reveal': {
         target.cards[category].revealed = true;
-        this._specialLog(p, card, `${target.name} had to reveal ${L}: “${target.cards[category].text}”`);
+        this._specialLog(p, card, 'res.force', { t: this._pref(target), cat, c: { tok: target.cards[category].tok } });
         return null;
       }
       case 'peek': {
-        p.notes.push({ ts: this._time(), text: `${this._rp()}: ${target.name}'s ${L} — “${target.cards[category].text}”` });
-        this._specialLog(p, card, `${p.name} secretly looked at one of ${target.name}'s hidden cards`);
+        // the note keeps the token as it is now: a later swap or reroll does not change what was seen
+        const np = deepFreeze({ rp: this._rpRef(), t: this._pref(target), cat, c: { tok: target.cards[category].tok } });
+        p.notes.push({ ts: this._time(), text: renderText('en', 'note.peek', np), key: 'note.peek', params: np });
+        this._specialLog(p, card, 'res.peek', { p: this._pref(p), t: this._pref(target) });
         return null;
       }
       case 'mass_reveal': {
         const alive = this._alive();
         for (const x of alive) x.cards[category].revealed = true;
-        this._specialLog(p, card, `everyone's ${L} is revealed: ${alive.map((x) => `${x.name} — “${x.cards[category].text}”`).join('; ')}`);
+        this._specialLog(p, card, 'res.mass', { cat, rows: alive.map((x) => ({ p: this._pref(x), c: { tok: x.cards[category].tok } })) });
         return null;
       }
       case 'shuffle_category': {
         const alive = this._alive();
-        const texts = this._shuffle(alive.map((x) => x.cards[category].text));
-        alive.forEach((x, i) => { x.cards[category] = { text: texts[i], revealed: true }; });
-        this._specialLog(p, card, `all ${L} cards were shuffled and dealt back face up: ${alive.map((x) => `${x.name} — “${x.cards[category].text}”`).join('; ')}`);
+        // the same rng draws as before X5: one shuffle of an array as long as the alive list
+        const dealt = this._shuffle(alive.map((x) => ({ text: x.cards[category].text, tok: x.cards[category].tok })));
+        alive.forEach((x, i) => { x.cards[category] = makeCard(dealt[i].text, dealt[i].tok, true); });
+        this._specialLog(p, card, 'res.shuffle', { cat, rows: alive.map((x) => ({ p: this._pref(x), c: { tok: x.cards[category].tok } })) });
         return null;
       }
       case 'immunity':
       case 'protect': {
         this.voteMods.immune.add(target.id);
-        this._specialLog(p, card, `nobody can vote against ${target.name} in the next vote`);
+        this._specialLog(p, card, 'res.protect', { t: this._pref(target) });
         return null;
       }
       case 'double_vote': {
         this.voteMods.doubleVote.add(p.id);
-        this._specialLog(p, card, `${p.name}'s vote counts twice in ${inStep ? 'this' : 'the next'} vote`);
+        this._specialLog(p, card, 'res.double', { p: this._pref(p), now: !!inStep });
         return null;
       }
       case 'block_vote': {
         this.voteMods.blocked.add(target.id);
-        this._specialLog(p, card, `${target.name} cannot vote in the next vote`);
+        this._specialLog(p, card, 'res.block', { t: this._pref(target) });
         return null;
       }
       case 'cancel_vote': {
         if (inStep) {
           const stage = this.phase === 'vote' && this.vote ? this.vote.stage : 'main';
-          this._specialLog(p, card, this.step && this.step.ejected > 0
-            ? 'the rest of the vote is cancelled right now; the kicks still due carry over'
-            : 'the vote is cancelled right now; the kicks carry over');
+          this._specialLog(p, card, this.step && this.step.ejected > 0 ? 'res.cancelRest' : 'res.cancelNow');
           this._cancelStep(stage);
         } else {
           this.voteMods.cancelNext = true;
-          this._specialLog(p, card, 'the next vote will be cancelled');
+          this._specialLog(p, card, 'res.cancelNext');
         }
         return null;
       }
       case 'eject': {
         target.status = 'ejected';
-        this._specialLog(p, card, `${target.name} is ejected and stays in the forest`);
+        this._specialLog(p, card, 'res.eject', { t: this._pref(target) });
         this._afterLostAlive(target.id);
         return null;
       }
@@ -1320,12 +1577,12 @@ export class Game {
         if (open) {
           this.airlocks = this.airlocks.filter((a) => a !== open);
           target.status = 'ejected';
-          this._log('eject', `🚪 ${p.name} sealed the airlock with ${this._names(open.byIds)} — ${target.name} is thrown out of the bunker, no vote!`);
+          this._log('eject', 'log.airlockSeal', { a: this._pref(p), by: this._refs(open.byIds), t: this._pref(target) });
           this._afterLostAlive(target.id);
         } else {
           this.airlocks.push({ targetId: target.id, byIds: [p.id], round: this.round });
-          const until = this.overtime ? 'the overtime discussion ends' : "this round's discussion ends"; // §11 Z5
-          this._log('special', `🚪 ${p.name} started cycling the airlock on ${target.name}. If one more Airlock card is played on ${target.name} before ${until}, ${target.name} is out — no vote.`);
+          // §11 Z5: "before the overtime discussion ends" in overtime
+          this._log('special', 'log.airlockStart', { a: this._pref(p), t: this._pref(target), ot: this.overtime });
         }
         return null;
       }
@@ -1333,31 +1590,33 @@ export class Game {
         target.status = 'alive';
         // §1: a player still ahead in this phase's order (alive when it started) speaks this round; anyone else waits
         // for the next reveal phase, and after round 7 there is none (overtime has no reveals).
-        let when = '';
+        let when = 0; // res.revive: 1 still gets a turn this round, 2 from the next round on
         if (this.phase === 'reveal') {
-          if (this.turn.order.indexOf(target.id) > this.turn.index) when = ' (they still get their turn this round)';
-          else if (this.round < MAX_ROUNDS) when = ' (from the next round on)';
+          if (this.turn.order.indexOf(target.id) > this.turn.index) when = 1;
+          else if (this.round < MAX_ROUNDS) when = 2;
         }
-        this._specialLog(p, card, `${target.name} is back in the game${when}`);
+        this._specialLog(p, card, 'res.revive', { t: this._pref(target), when });
         return null;
       }
       case 'capacity_plus': {
         this.capacity += 1;
-        this._specialLog(p, card, `the bunker now has ${this.capacity} beds`);
-        if (!this._checkEnd()) this._refreshBallots('with the extra bed', true);
+        this._specialLog(p, card, 'res.beds', { n: this.capacity });
+        if (!this._checkEnd()) this._refreshBallots(M('why.bed'), true);
         return null;
       }
       case 'capacity_minus': {
         const before = this.capacity;
         this.capacity = Math.max(1, this.capacity - 1);
-        this._specialLog(p, card, before === this.capacity ? `the bunker already has only ${this.capacity} bed` : `the bunker now has ${this.capacity} beds`);
+        this._specialLog(p, card, before === this.capacity ? 'res.bedsMin' : 'res.beds', { n: this.capacity });
         this._checkEnd();
         return null;
       }
       case 'bunker_add_feature': {
-        const f = str(this._safeDraw(() => this.dealer.drawBunkerFeature(), '')) || 'A hidden storeroom';
+        const ftok = this._drawFeatureTok();
+        const f = str(this._safeDraw(() => renderFeature('en', ftok), '')) || 'A hidden storeroom';
         this.bunker.features.push(f);
-        this._specialLog(p, card, `the bunker gains a new feature: “${f}”`);
+        this.bunkerTok = bunkerWithFeature(this.bunkerTok, ftok);
+        this._specialLog(p, card, 'res.feature', { f: { feat: ftok } });
         return null;
       }
       default:
@@ -1366,34 +1625,97 @@ export class Game {
   }
 
   // ------------------------------------------------------------------------------------------------ views (§7)
-  view(id) {
+  /**
+   * The StateView of member `id` (§7), every human-readable string in `lang` (§11 X5.2): the member's language by
+   * default ('en' when unset). null for a non-member or a player who left.
+   */
+  view(id, lang) {
     try {
-      return this._view(id);
+      return this._view(id, lang);
     } catch (e) {
+      if (e && e.missingTok) throw e; // NODE_ENV=test: a card without its token is a bug to fail on (design §3.1)
       this.lastError = e;
       return null;
     }
   }
 
-  _publicPlayer(p) {
+  /** A card's text in `lang` (English: the text stored when it was dealt). */
+  _cardText(card, lang) {
+    if (!card.tok || typeof card.tok !== 'object') {
+      missingTok();
+      return card.text;
+    }
+    return lang === 'en' ? card.text : renderCard(lang, card.tok);
+  }
+
+  /** {title, text} of a special in `lang`: the catalogue's words for a catalogue card, else its own. */
+  _specialWords(s, lang) {
+    if (lang !== 'en') {
+      if (s.ref) {
+        const r = renderSpecial(lang, s.ref);
+        if (r) return r;
+      } else if (s.untitled) return { title: renderText(lang, 'special.untitled'), text: s.text };
+    }
+    return { title: s.title, text: s.text };
+  }
+
+  _specialView(s, lang) {
+    const w = this._specialWords(s, lang);
+    return { id: s.id, title: w.title, text: w.text };
+  }
+
+  /** The view's log in `lang`: one frozen array per language, shared by every recipient until the log changes. */
+  _logView(lang) {
+    const log = this.log;
+    const version = `${log.length ? log[0].id : 0}:${log.length ? log[log.length - 1].id : 0}:${log.length}`;
+    if (this._logVersion !== version) {
+      this._logVersion = version;
+      this._logViews = {};
+    }
+    let out = this._logViews[lang];
+    if (!out) {
+      out = Object.freeze(log.slice(-LOG_LIMIT).map((e) => entryView(e, lang)));
+      this._logViews[lang] = out;
+    }
+    return out;
+  }
+
+  _publicPlayer(p, lang) {
     const final = this.phase === 'final';
     const cards = {};
-    for (const c of CATEGORY_IDS) cards[c] = p.cards && (final || p.cards[c].revealed) ? p.cards[c].text : null;
+    for (const c of CATEGORY_IDS) cards[c] = p.cards && (final || p.cards[c].revealed) ? this._cardText(p.cards[c], lang) : null;
     const out = {
       id: p.id, name: p.name, seat: p.seat, connected: !!p.connected, isHost: p.id === this.hostId,
       status: this.phase === 'lobby' ? 'alive' : p.status,
       cards,
       revealedCount: p.cards ? CATEGORY_IDS.filter((c) => p.cards[c].revealed).length : 0,
-      playedSpecials: p.playedSpecials.map((s) => ({ title: s.title, text: s.text })),
+      playedSpecials: p.playedSpecials.map((s) => this._specialView(s, lang)),
       specialsLeft: p.specials.filter((s) => !s.used).length,
     };
-    if (final) out.unplayedSpecials = p.specials.filter((s) => !s.used).map((s) => ({ title: s.title, text: s.text }));
+    if (final) out.unplayedSpecials = p.specials.filter((s) => !s.used).map((s) => this._specialView(s, lang));
     return out;
   }
 
-  _view(id) {
+  _catastropheView(lang) {
+    if (!this.catastrophe) return null;
+    const tok = this.catastropheTok;
+    const id = tok && typeof tok === 'object' && typeof tok.id === 'string' ? tok.id : null;
+    const r = lang !== 'en' && tok ? renderCatastrophe(lang, tok) : null;
+    const src = r || this.catastrophe;
+    return { id, title: src.title, text: src.text, details: [...src.details] };
+  }
+
+  _bunkerView(lang) {
+    if (!this.bunker) return null;
+    const r = lang !== 'en' && this.bunkerTok ? renderBunker(lang, this.bunkerTok) : null;
+    const src = r || this.bunker;
+    return { name: src.name, size: src.size, duration: src.duration, food: src.food, features: [...src.features] };
+  }
+
+  _view(id, lang) {
     const m = this._member(id);
     if (!m || (m.kind === 'player' && m.obj.status === 'left')) return null;
+    const L = normLang(lang) ?? normLang(m.obj.lang) ?? 'en';
     const phase = this.phase;
     const inGame = phase !== 'lobby';
     const t = this.turn;
@@ -1408,23 +1730,30 @@ export class Game {
     if (m.kind === 'player' && inGame && m.obj.cards) {
       const p = m.obj;
       const cards = {};
-      for (const c of CATEGORY_IDS) cards[c] = { text: p.cards[c].text, revealed: p.cards[c].revealed };
+      for (const c of CATEGORY_IDS) cards[c] = { text: this._cardText(p.cards[c], L), revealed: p.cards[c].revealed };
       me = {
         cards,
-        specials: p.specials.map((c) => ({
-          uid: c.uid, title: c.title, text: c.text, effect: c.effect, target: c.target,
-          category: c.category ?? null, timing: c.timing, minRound: c.minRound, used: c.used,
-        })),
+        specials: p.specials.map((c) => {
+          const w = this._specialWords(c, L);
+          return {
+            uid: c.uid, id: c.id, title: w.title, text: w.text, effect: c.effect, target: c.target,
+            category: c.category ?? null, timing: c.timing, minRound: c.minRound, used: c.used,
+          };
+        }),
         canPlaySpecial: p.status === 'alive' && p.lastSpecialRound !== this.round && IN_GAME.has(phase),
-        notes: p.notes.map((n) => ({ ts: n.ts, text: n.text })),
+        notes: p.notes.map((n) => ({ ts: n.ts, text: L === 'en' || !n.key ? n.text : renderText(L, n.key, n.params) })),
         myVote: phase === 'vote' && v ? v.votes.get(p.id) ?? null : null,
       };
     }
 
+    const timer = this.timer && (phase === 'reveal' || phase === 'defense' || phase === 'discussion')
+      ? { label: L === 'en' || !this.timer.key ? this.timer.label : renderText(L, this.timer.key, this.timer.params), endsAt: this.timer.endsAt }
+      : null;
+
     return {
       serverNow: this._time(),
       room: this.room,
-      you: { id, name: m.obj.name, role: m.kind, isHost: id === this.hostId },
+      you: { id, name: m.obj.name, role: m.kind, isHost: id === this.hostId, lang: L },
       hostId: this.hostId,
       phase,
       round: this.round,
@@ -1433,11 +1762,11 @@ export class Game {
       minPlayers: this.minPlayers,
       maxPlayers: MAX_PLAYERS,
       options: { ...this.options },
-      categories: CATEGORY_LIST.map((c) => ({ id: c.id, label: c.label })),
-      catastrophe: this.catastrophe ? { title: this.catastrophe.title, text: this.catastrophe.text, details: [...this.catastrophe.details] } : null,
-      bunker: this.bunker ? { ...this.bunker, features: [...this.bunker.features] } : null,
+      categories: CATEGORY_LIST.map((c) => ({ id: c.id, label: L === 'en' ? c.label : categoryLabel(L, c.id) })),
+      catastrophe: this._catastropheView(L),
+      bunker: this._bunkerView(L),
       capacity: this.capacity,
-      players: this.players.map((p) => this._publicPlayer(p)),
+      players: this.players.map((p) => this._publicPlayer(p, L)),
       spectators: this.spectators.map((x) => ({ id: x.id, name: x.name, connected: !!x.connected })),
       me,
       turn: t && (phase === 'reveal' || phase === 'defense')
@@ -1466,7 +1795,7 @@ export class Game {
         cancelNext: this.voteMods.cancelNext,
       },
       airlocks: this.airlocks.map((a) => ({ targetId: a.targetId, byIds: [...a.byIds], round: a.round })),
-      timer: this.timer && (phase === 'reveal' || phase === 'defense' || phase === 'discussion') ? { ...this.timer } : null,
+      timer,
       lastVoteResult: this.lastVoteResult
         ? {
           ...this.lastVoteResult,
@@ -1474,7 +1803,7 @@ export class Game {
           tie: this.lastVoteResult.tie ? [...this.lastVoteResult.tie] : null,
         }
         : null,
-      log: this.log.slice(-LOG_LIMIT).map((e) => ({ ...e })),
+      log: this._logView(L),
       final: this.final ? { survivors: [...this.final.survivors], out: [...this.final.out] } : null,
     };
   }

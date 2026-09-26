@@ -13,7 +13,8 @@ The app is the table. It deals the cards, runs the turns and counts the votes. T
 call (Discord, Telegram…), because there is no chat. You need no account and nothing to install, and it works on
 phones.
 
-- [Players](#players): joining, how a game goes, special cards, votes, game length
+- [Players](#players): joining, language, how a game goes, special cards, votes, game length
+- [По-русски](#по-русски): the switcher and how to play, in Russian
 - [Host guide](#host-guide): running a table, dropped players, testing alone with bots
 - [Operator](#operator): running it locally, tests, deploying, logs
 - [Contributing](#contributing) and [License](#license)
@@ -35,10 +36,22 @@ right crew?
 | Watch only | Press **Watch** (or **Just watch**) instead. Spectators see only public information |
 | Get back in after a drop | Nothing to do: the page reconnects by itself, and your seat waits for you (shown as offline) |
 | Get back in after closing the tab | Open the link again **in the same browser** and press **Rejoin as ‹name›**. Your seat belongs to that browser, so another device cannot take it over |
-| Join a game that already started | You can only watch. After the game, the host's **Play again** returns everyone to the lobby, where you can **Take a seat** |
+| Join a game that already started | You can only watch. The host's **Play again** (after the game) or **End game** (at any time) returns everyone to the lobby, where you can **Take a seat** |
 
 Names are 1–20 characters. If your name is already taken in the room, the game adds " (2)". The **Rules** button in
 the header opens a short "How to play" at any time.
+
+### Language: English or Russian
+Each player picks their own language with the **EN / RU** switch:
+- It sits at the top of the start page, and next to **Rules** in the lobby and in the game header. On a phone, during a
+  game, it is in the header's second row.
+- A switch changes only your own screen. The game goes on, and nobody else is affected.
+- Your browser remembers the choice.
+- On a first visit the game starts in Russian if your browser's language is Russian, and in English otherwise.
+
+Everything is translated: the cards, catastrophes, bunkers, special cards, the log, errors and the rules. Player names
+are never translated. The only exception is the narration, which is English in both languages; the Russian screen says
+so. [По-русски ниже](#по-русски).
 
 ### How a game goes
 1. **Setup.** Everyone sees the **Catastrophe**, the **Bunker** (size, food, how long you must stay, its features)
@@ -152,6 +165,8 @@ Each of the 18 catastrophes has a recorded narration by a British voice, male or
 - **▶ Listen**, next to the catastrophe title, plays it again at any time, even with the narrator off.
 - If the browser blocks sound (common on iPhones), a "▶ Listen to the catastrophe" button appears, and one tap plays it.
 - The sound comes from each player's own device, because Discord does not carry browser audio.
+- The narration is English only. With the page in Russian, the same English clip plays, and the Russian buttons say
+  so («Слушать (англ.)»).
 - The clips live in `public/audio/` and are made from the card texts with Kokoro TTS plus an effects chain, mastered to -12 LUFS. [`tools/voice/`](tools/voice/README.md) rebuilds them.
 - Production caches `/audio/*` for 7 days, so a re-rendered clip needs a new file name. The build in `tools/voice/` renames changed clips by itself.
 
@@ -160,6 +175,32 @@ Each of the 18 catastrophes has a recorded narration by a British voice, male or
 - Leaving a running game is for good. You cannot come back into it.
 - Games live in the server's memory. A server restart or a deploy ends every game in progress. A room nobody has been
   connected to for 30 minutes is deleted.
+
+---
+
+## По-русски
+
+**Бункер онлайн** — онлайн-стол по мотивам дискуссионной игры «Бункер»: <https://178-104-144-119.sslip.io>. Страница
+раздаёт карты, ведёт очерёдность ходов и считает голоса, а спорите вы в своём голосовом чате (Дискорд, Телеграм…).
+Текстового чата нет. Регистрация и установка не нужны, с телефона тоже можно.
+
+**Язык.**
+- Переключатель **EN / RU** стоит вверху главной страницы, а в лобби и в игре — рядом с кнопкой «Правила». На
+  телефоне во время игры он во второй строке шапки.
+- Язык у каждого свой: переключение меняет только твой экран. Игра идёт дальше, и у остальных ничего не меняется.
+- Браузер запоминает выбор. При первом входе игра открывается по-русски, если браузер русскоязычный.
+- Переведено всё, кроме имён игроков и озвучки. Рассказчик читает катастрофу только по-английски, и русский экран об
+  этом предупреждает.
+
+**Как играть.** Случилась катастрофа, а коек в бункере хватит только на половину из вас. Каждому раздают 8 скрытых
+карт характеристик (профессия, биология, здоровье, хобби, фобия, навык, характер, багаж) и 2 карты особых условий. В
+каждом из 7 раундов игроки по очереди раскрывают по одной карте и доказывают, что без них бункеру не обойтись. Потом
+все спорят, а после отмеченных раундов голосуют, кто останется в лесу; при ничьей — речи в защиту и переголосование.
+Особое условие можно сыграть одно за раунд: заставить другого раскрыть карту, подсмотреть чужую, отменить голосование,
+добавить койку… «Шлюз» выбрасывает игрока без голосования, только если двое сыграют его на одного и того же игрока в
+одном раунде, а «Вернулся из леса» возвращает изгнанного в игру. Как только оставшиеся помещаются на койки, дверь
+бункера закрывается и все карты открываются: та ли команда? Ведущий — тот, кто создаёт игру: он задаёт темп кнопкой
+«Дальше» и может завершить игру досрочно.
 
 ---
 
@@ -184,6 +225,7 @@ out.
 | **Kick** (next to a name) | In the lobby it removes the player. In a game it takes two taps ("Remove?"), and the player is out **for good**: they count as out, and the vote plan adjusts. You can also kick a spectator |
 | **Make host** | Hands the host role to another player |
 | **Play again** | In the final, returns everyone to the lobby with the same seats, timers and log. Players who left are dropped. Spectators can then **Take a seat** |
+| **End game** | At any time in a game, ends it for everyone and returns the table to the lobby, like Play again. It takes two taps (**End game**, then **Tap again to end**). Seats and spectators stay, hidden cards stay hidden, and the log says "The host ended the game". Use it to let a friend who arrived late take a seat |
 
 Nothing moves on by itself. Watch the speaker, and press Next when they are done or their time is up.
 
@@ -195,7 +237,7 @@ Nothing moves on by itself. Watch the speaker, and press Next when they are done
 | An offline player is holding up a vote | Press **Close vote**. Their vote counts as an abstention |
 | They are not coming back | **Kick** them (two taps). The vote plan adjusts, and the game may end early if the rest now fit in the beds |
 | **You**, the host, drop | After 45 s offline, the role passes to a connected player (and at once if you press Leave). It does not come back when you return, so ask the new host to press **Make host** on you |
-| A friend arrives after Start | There is no way to add a seat mid-game. They press **Watch**, and they can take a seat after **Play again** |
+| A friend arrives after Start | There is no way to add a seat mid-game. They press **Watch**. They can take a seat after **Play again**, or right away if you press **End game** |
 
 ### Testing alone with bots
 Bots are real players over the network: they reveal, vote, defend and play specials (Airlocks included). Run them from
@@ -216,6 +258,7 @@ Useful options:
 - `--patience MS` makes a bot host skip a human who stalls.
 - `--games K` plays K games in a row, `--exit-on-final` quits after the last final, and `--spectator` joins as
   spectators.
+- `--lang ru` makes the bots Russian: they get Cyrillic names (Бот Анна, …) and Russian server messages.
 
 **Ctrl-C** makes every bot leave. `npm run bots -- --help` lists everything. One network can open at most 40
 connections and create 5 rooms on the server, and bots slow themselves down to stay under the rate limit.
@@ -266,11 +309,22 @@ Code: `server/` has `index.js` (HTTP, WebSocket and limits), `rooms.js` (rooms, 
 `game.js` (the pure rules engine) and `content.js` (the cards). `public/` is the client (no build). `SPEC.md` is the
 contract: its §11 amendments override the earlier sections.
 
+Texts live in one place per language (SPEC §11 X5):
+- `server/content/en/*.js` and `server/content/ru/*.js` hold the cards, catastrophes, bunkers and specials, keyed by
+  the same ids.
+- `server/i18n/{en,ru}.js` hold the log lines and errors.
+- `public/i18n/{en,ru}.js` hold the client's strings.
+- `public/i18n/core.js` is the shared formatter: plurals, lists and numbers.
+
+A change to an English text needs the same change in Russian. `npm run i18n:check` finds what is missing or broken.
+
 ### Tests
 | Command | What it runs | Time |
 |---|---|---|
-| `npm test` | Unit tests plus full-game simulations over real WebSockets. They spawn their own servers on free ports | ~60 s |
-| `npm run e2e` | A browser end-to-end run: puppeteer-core with `/usr/bin/google-chrome-stable`, a desktop host, a phone player, a spectator and bots. Useful options: `--players 16`, `--headful`, `--slow`, `--url URL` (use a running server), `--screens DIR` (default `reports/screens/e2e`) | ~65 s |
+| `npm test` | Unit tests plus full-game simulations over real WebSockets, in English, Russian and mixed tables. They spawn their own servers on free ports | ~2 min |
+| `npm run e2e` | A browser end-to-end run: puppeteer-core with `/usr/bin/google-chrome-stable`, a desktop host, a phone player, a spectator and bots. It includes a Russian pass: a mid-game language switch and a Russian late arrival at 360 px. Useful options: `--players 16`, `--headful`, `--slow`, `--url URL` (use a running server), `--screens DIR` (default `reports/screens/e2e`) | ~2–3 min |
+| `npm run i18n:check` | Checks every Russian text against English: keys, placeholders, plurals, no Latin letters, gender-neutral wording. `npm test` runs the same checks | ~1 s |
+| `node tools/bench-broadcast.js` | The broadcast budget at 16 players + 50 spectators: CPU no higher than before X5, and every state ≤ 120 KB | ~45 s |
 
 ### Production
 The live game runs on a small VPS with Ubuntu 24.04. The server's details are kept out of the repository, in

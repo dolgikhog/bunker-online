@@ -78,3 +78,6 @@ desktop.ini
 
 # written by deploy/deploy.sh
 public/version.json
+
+# local stable checkouts (e.g. the dev test table)
+.worktrees/

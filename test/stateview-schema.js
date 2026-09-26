@@ -11,11 +11,24 @@
 // 2 specials (giveSpecial tops a player up to 2 unused cards and keeps the used ones, which stay in playedSpecials): at
 // most DEV_MAX_HAND, 7 played (one per round) plus 2 unused.
 //
+// §11 X5.2 (languages): `you.lang`, `catastrophe.id`, an `id` on every special entry, and `key`, `params` and `parts` on
+// every log entry, whose parts must join to exactly its `text` (report §8.1: no empty or adjacent strings, a prefix only
+// first, a cardtext with its ': '). validateLogEntry() is exported for the Checker. The report's §14 fallback: the oldest
+// entries of a long log may come without `parts` ({id, ts, kind, text, key, params}), but only as a run at the start of
+// the log, and never among its newest PARTS_MIN entries.
+//
 // Used by the Checker in test/helpers-sim.js (so every simulated state in `npm test` is validated) and by the
 // integration soak. Side-effect free on import (`node --test test/` loads every file in test/).
 
 export const CATEGORY_IDS = ['profession', 'biology', 'health', 'hobby', 'phobia', 'skill', 'trait', 'baggage'];
 const PHASES = ['lobby', 'reveal', 'discussion', 'vote', 'defense', 'final'];
+/** §11 X5.1 languages (copied from the SPEC text). */
+export const LANGS = ['en', 'ru'];
+const PART_TYPES = ['player', 'card', 'cardtext', 'cat', 'value', 'prefix'];
+const LOG_KEYS = ['id', 'ts', 'kind', 'text', 'key', 'params', 'parts'];
+/** §11 X5.2 (report §14): an old entry without its parts, and how many of the newest entries always have them. */
+const LOG_KEYS_BARE = ['id', 'ts', 'kind', 'text', 'key', 'params'];
+export const PARTS_MIN = 20;
 const LOG_KINDS = ['system', 'reveal', 'special', 'vote', 'eject', 'info'];
 const STATUSES = ['alive', 'ejected', 'left'];
 const ERROR_CODES = ['bad_request', 'not_in_room', 'no_room', 'bad_token', 'server_busy', 'room_full', 'not_host', 'wrong_phase',
@@ -57,7 +70,7 @@ const TOP_KEYS = ['serverNow', 'room', 'you', 'hostId', 'phase', 'round', 'maxRo
   'categories', 'catastrophe', 'bunker', 'capacity', 'players', 'spectators', 'me', 'turn', 'vote', 'schedule', 'voteMods', 'timer',
   'lastVoteResult', 'log', 'final', 'airlocks'];
 const PLAYER_KEYS = ['id', 'name', 'seat', 'connected', 'isHost', 'status', 'cards', 'revealedCount', 'playedSpecials', 'specialsLeft'];
-const SPECIAL_KEYS = ['uid', 'title', 'text', 'effect', 'target', 'category', 'timing', 'minRound', 'used'];
+const SPECIAL_KEYS = ['uid', 'id', 'title', 'text', 'effect', 'target', 'category', 'timing', 'minRound', 'used'];
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isStr = (v) => typeof v === 'string';
@@ -76,6 +89,67 @@ function exactKeys(obj, keys, optional = []) {
 
 function strArray(v) { return Array.isArray(v) && v.every(isStr); }
 function unique(arr) { return new Set(arr).size === arr.length; }
+
+/**
+ * §11 X5.3 / report §8.1: the problems of one log entry's `parts` against its `text` ([] when fine). A string part is
+ * plain text; the others are {t:'player', id, v}, {t:'card', id, v, label, title, text}, {t:'cardtext', v} (with its
+ * leading ': '), {t:'cat', id, v}, {t:'value', v} and {t:'prefix', v} (only first). No empty string, no two strings in a
+ * row, and the parts joined are exactly the text.
+ */
+export function validateParts(parts, text) {
+  const out = [];
+  if (!Array.isArray(parts)) return [`parts is not an array: ${short(parts)}`];
+  let joined = '';
+  parts.forEach((x, i) => {
+    if (typeof x === 'string') {
+      if (!x) out.push(`parts[${i}] is an empty string`);
+      if (i > 0 && typeof parts[i - 1] === 'string') out.push(`parts[${i - 1}] and parts[${i}] are two strings in a row`);
+      joined += x;
+      return;
+    }
+    if (!isObj(x) || !PART_TYPES.includes(x.t)) { out.push(`parts[${i}] has no known type: ${short(x)}`); return; }
+    const keys = {
+      player: ['t', 'id', 'v'], card: ['t', 'id', 'v', 'label', 'title', 'text'], cardtext: ['t', 'v'], cat: ['t', 'id', 'v'],
+      value: ['t', 'v'], prefix: ['t', 'v'],
+    }[x.t];
+    for (const y of exactKeys(x, keys)) out.push(`parts[${i}] (${x.t}): ${y}`);
+    for (const k of keys) if (k !== 't' && !isStr(x[k])) out.push(`parts[${i}].${k} is not a string`);
+    if ((x.t === 'player' || x.t === 'card') && !isNEStr(x.id)) out.push(`parts[${i}] (${x.t}) has an empty id`);
+    if (x.t === 'cat' && !CATEGORY_IDS.includes(x.id)) out.push(`parts[${i}] (cat) id ${short(x.id)}`);
+    if (x.t === 'prefix' && i !== 0) out.push(`parts[${i}] is a prefix but not first`);
+    if (x.t === 'cardtext' && isStr(x.v) && !x.v.startsWith(': ')) out.push(`parts[${i}] (cardtext) does not start with ': '`);
+    joined += isStr(x.v) ? x.v : '';
+  });
+  if (isStr(text) && joined !== text) out.push(`the parts join to ${short(joined)}, not the text ${short(text)}`);
+  return out;
+}
+
+/**
+ * Entries already found valid. The engine hands every view of one language the same deep-frozen entry objects, so a
+ * frozen entry is validated once (a changed or copied entry is a new object and is validated again).
+ */
+const VALID_ENTRIES = new WeakSet();
+const frozenEntry = (e) => Object.isFrozen(e) && (!Object.hasOwn(e, 'parts')
+  || (Array.isArray(e.parts) && Object.isFrozen(e.parts) && e.parts.every((x) => typeof x === 'string' || Object.isFrozen(x))));
+const hasParts = (e) => isObj(e) && Object.hasOwn(e, 'parts');
+
+/**
+ * §11 X5.3: the problems of one log entry {id, ts, kind, text, key, params, parts} ([] when fine). An entry without the
+ * `parts` key is the §14 fallback's old entry {id, ts, kind, text, key, params}; where it may stand is checked with the
+ * whole log (validateStateView).
+ */
+export function validateLogEntry(e) {
+  const out = exactKeys(e, hasParts(e) ? LOG_KEYS : LOG_KEYS_BARE);
+  if (!isObj(e)) return out;
+  if (!isInt(e.ts)) out.push('ts');
+  if (!LOG_KINDS.includes(e.kind)) out.push(`kind ${short(e.kind)}`);
+  if (!isStr(e.text)) out.push('text');
+  if (!isNEStr(e.key)) out.push(`key ${short(e.key)}`);
+  if (!isObj(e.params)) out.push(`params ${short(e.params)}`);
+  if (hasParts(e)) out.push(...validateParts(e.parts, e.text));
+  if (!out.length && isInt(e.id) && frozenEntry(e)) VALID_ENTRIES.add(e);
+  return out;
+}
 
 /** Validates one server -> client message. Returns a list of problems ([] = matches the SPEC). */
 export function validateServerMessage(msg, opts = {}) {
@@ -111,8 +185,10 @@ export function validateServerMessage(msg, opts = {}) {
 /**
  * Validates a StateView (without the wire `t`) field by field against SPEC §7 incl. "Field semantics".
  * `dev: true` validates a dev-mode server's view (§11 X9): an optional `god`, and hands of 2–4 specials.
+ * `logFrom`: validate only the log entries with a larger id in depth (a caller that validated the older ones already,
+ * and checks elsewhere that they did not change); ids and order are always checked.
  */
-export function validateStateView(s, { dev = false } = {}) {
+export function validateStateView(s, { dev = false, logFrom = 0 } = {}) {
   const P = [];
   const bad = (m) => P.push(m);
   for (const x of exactKeys(s, TOP_KEYS, dev ? ['god'] : [])) bad(`StateView: ${x}`);
@@ -153,8 +229,9 @@ export function validateStateView(s, { dev = false } = {}) {
     if (s.bunker !== null) bad('bunker must be null in the lobby');
     if (s.capacity !== 0) bad('capacity must be 0 in the lobby');
   } else {
-    for (const x of exactKeys(s.catastrophe, ['title', 'text', 'details'])) bad(`catastrophe: ${x}`);
+    for (const x of exactKeys(s.catastrophe, ['id', 'title', 'text', 'details'])) bad(`catastrophe: ${x}`);
     if (isObj(s.catastrophe) && (!isNEStr(s.catastrophe.title) || !isStr(s.catastrophe.text) || !strArray(s.catastrophe.details))) bad('catastrophe field types');
+    if (isObj(s.catastrophe) && s.catastrophe.id !== null && !isNEStr(s.catastrophe.id)) bad(`catastrophe.id ${short(s.catastrophe.id)} (a content id or null)`);
     for (const x of exactKeys(s.bunker, ['name', 'size', 'duration', 'food', 'features'])) bad(`bunker: ${x}`);
     if (isObj(s.bunker)) {
       for (const k of ['name', 'size', 'duration', 'food']) if (!isStr(s.bunker[k])) bad(`bunker.${k} not a string`);
@@ -197,8 +274,8 @@ export function validateStateView(s, { dev = false } = {}) {
     const specList = (arr, what) => {
       if (!Array.isArray(arr)) { bad(`${L}.${what} not an array`); return; }
       arr.forEach((x, j) => {
-        for (const y of exactKeys(x, ['title', 'text'])) bad(`${L}.${what}[${j}]: ${y}`);
-        if (isObj(x) && (!isStr(x.title) || !isStr(x.text))) bad(`${L}.${what}[${j}] types`);
+        for (const y of exactKeys(x, ['id', 'title', 'text'])) bad(`${L}.${what}[${j}]: ${y}`);
+        if (isObj(x) && (!isNEStr(x.id) || !isStr(x.title) || !isStr(x.text))) bad(`${L}.${what}[${j}] types`);
       });
     };
     specList(p.playedSpecials, 'playedSpecials');
@@ -234,8 +311,9 @@ export function validateStateView(s, { dev = false } = {}) {
   if (!isStr(s.hostId)) bad('hostId not a string');
   else if (s.hostId !== '' && !isPlayer(s.hostId)) bad(`hostId ${s.hostId} is not a seated player`);
   else if (s.hostId !== '' && byId.get(s.hostId).status === 'left') bad(`hostId ${s.hostId} has left`);
-  for (const x of exactKeys(s.you, ['id', 'name', 'role', 'isHost'])) bad(`you: ${x}`);
+  for (const x of exactKeys(s.you, ['id', 'name', 'role', 'isHost', 'lang'])) bad(`you: ${x}`);
   const you = isObj(s.you) ? s.you : {};
+  if (!LANGS.includes(you.lang)) bad(`you.lang ${short(you.lang)}`);
   if (!['player', 'spectator'].includes(you.role)) bad(`you.role ${short(you.role)}`);
   if (you.isHost !== (you.id === s.hostId)) bad('you.isHost inconsistent with hostId');
   const selfPub = byId.get(you.id);
@@ -284,7 +362,7 @@ export function validateStateView(s, { dev = false } = {}) {
           for (const x of exactKeys(c, SPECIAL_KEYS)) bad(`${L}: ${x}`);
           if (!isObj(c)) return;
           uids.push(c.uid);
-          if (!isNEStr(c.uid) || !isStr(c.title) || !isStr(c.text) || !isBool(c.used)) bad(`${L} types`);
+          if (!isNEStr(c.uid) || !isNEStr(c.id) || !isStr(c.title) || !isStr(c.text) || !isBool(c.used)) bad(`${L} types`);
           const rule = EFFECTS[c.effect];
           if (!rule) { bad(`${L}.effect ${short(c.effect)}`); return; }
           if (!rule.targets.includes(c.target)) bad(`${L}: target ${short(c.target)} not allowed for ${c.effect}`);
@@ -461,20 +539,23 @@ export function validateStateView(s, { dev = false } = {}) {
     if (s.log.length > 200) bad(`log has ${s.log.length} entries (> 200)`);
     let prev = 0;
     s.log.forEach((e, i) => {
-      for (const x of exactKeys(e, ['id', 'ts', 'kind', 'text'])) bad(`log[${i}]: ${x}`);
+      if (!isObj(e) || !(VALID_ENTRIES.has(e) || (isInt(e.id) && e.id <= logFrom))) for (const x of validateLogEntry(e)) bad(`log[${i}]: ${x}`);
       if (!isObj(e)) return;
       if (!isInt(e.id) || e.id <= prev) bad(`log[${i}].id ${short(e.id)} not increasing`);
       prev = isInt(e.id) ? e.id : prev;
-      if (!isInt(e.ts)) bad(`log[${i}].ts`);
-      if (!LOG_KINDS.includes(e.kind)) bad(`log[${i}].kind ${short(e.kind)}`);
-      if (!isStr(e.text)) bad(`log[${i}].text`);
     });
     if (s.log.length && s.log[0].id < 1) bad('log ids must start at 1');
+    // §11 X5.2 (report §14): entries without parts only as the log's oldest run, never among the newest PARTS_MIN
+    let bare = 0;
+    while (bare < s.log.length && isObj(s.log[bare]) && !hasParts(s.log[bare])) bare++;
+    s.log.forEach((e, i) => { if (i > bare && isObj(e) && !hasParts(e)) bad(`log[${i}] (#${short(e.id)}) has no parts, but an older entry has them`); });
+    if (bare > Math.max(0, s.log.length - PARTS_MIN)) bad(`only ${s.log.length - bare} of the newest ${Math.min(PARTS_MIN, s.log.length)} log entries have parts`);
   }
 
   // god (§11 X9, dev mode only): every seated player's cards and specials, consistent with the public view
   if (dev && Object.hasOwn(s, 'god')) {
     const g = s.god;
+    const english = you.lang === 'en'; // the god view is English-only (§11 X9): its words match only an English view
     for (const x of exactKeys(g, ['players'])) bad(`god: ${x}`);
     if (isObj(g) && !isObj(g.players)) bad(`god.players not an object: ${short(g.players)}`);
     else if (isObj(g)) {
@@ -492,7 +573,7 @@ export function validateStateView(s, { dev = false } = {}) {
         if (isObj(e.cards)) {
           for (const c of CATEGORY_IDS) {
             if (!isStr(e.cards[c])) bad(`${L}.cards.${c} is ${short(e.cards[c])}`);
-            else if (pub && isObj(pub.cards) && pub.cards[c] !== null && pub.cards[c] !== e.cards[c]) bad(`${L}.cards.${c} differs from the public card`);
+            else if (english && pub && isObj(pub.cards) && pub.cards[c] !== null && pub.cards[c] !== e.cards[c]) bad(`${L}.cards.${c} differs from the public card`);
           }
         }
         if (!Array.isArray(e.specials) || e.specials.length < 2 || e.specials.length > DEV_MAX_HAND) { bad(`${L}.specials ${short(e.specials)}`); continue; }
@@ -505,7 +586,7 @@ export function validateStateView(s, { dev = false } = {}) {
           if (Array.isArray(pub.playedSpecials) && used !== pub.playedSpecials.length) bad(`${L}: ${used} used specials but ${pub.playedSpecials.length} played`);
           if (e.specials.length - used !== pub.specialsLeft) bad(`${L}: ${e.specials.length - used} unused specials but specialsLeft ${pub.specialsLeft}`);
         }
-        if (you.id === id && isObj(s.me) && Array.isArray(s.me.specials) && isObj(s.me.cards)) {
+        if (english && you.id === id && isObj(s.me) && Array.isArray(s.me.specials) && isObj(s.me.cards)) {
           if (CATEGORY_IDS.some((c) => isObj(s.me.cards[c]) && s.me.cards[c].text !== e.cards?.[c])) bad(`${L}: my own cards differ from me.cards`);
           if (s.me.specials.length !== e.specials.length || s.me.specials.some((c, j) => !isObj(c) || c.title !== e.specials[j]?.title || c.used !== e.specials[j]?.used)) bad(`${L}: my own specials differ from me.specials`);
         }

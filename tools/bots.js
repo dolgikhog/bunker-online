@@ -2,7 +2,7 @@
 // Bunker Online: bot players for humans who want to test or play with a partial table.
 // Run `node tools/bots.js --help` for usage.
 
-import { BOT_NAMES, Bot, Coordinator, describeState, roomLink, toHttpUrl } from './botlib.js';
+import { BOT_NAMES, BOT_NAMES_RU, Bot, Coordinator, describeState, normLang, roomLink, toHttpUrl } from './botlib.js';
 
 const HELP = `Bunker Online bots: fill a table with bot players.
 
@@ -33,7 +33,9 @@ Options:
                        the table goes back to the lobby, and with --host-bot the next game starts (SPEC §11 X6)
   --spectator          join as spectators instead of players
   --seed S             seed for the bots' choices (default: random)
-  --names A,B,C        bot names (default Bot Anna, Bot Boris, ...)
+  --lang en|ru         the bots' language (SPEC §11 X5; default en). ru also gives them Cyrillic names (Бот Анна, ...),
+                       so a Russian table is not full of Latin names
+  --names A,B,C        bot names (default Bot Anna, Bot Boris, ...; with --lang ru: Бот Анна, Бот Борис, ...)
   --exit-on-final      exit after the last game's final (default: stay seated until Ctrl-C)
   --no-leave           on Ctrl-C just disconnect (seats stay, shown offline) instead of leaving
   --quiet              only print errors and the summary
@@ -68,6 +70,7 @@ function parseArgs(argv) {
   num('games', 0, 1e6);
   num('patience', 0, 3600000);
   num('end-game', 0, 1);
+  if (o.lang !== undefined && !normLang(o.lang)) throw new Error('--lang must be en or ru');
   return o;
 }
 
@@ -103,7 +106,8 @@ async function main() {
   const url = urlFromRoomLink(o.room) || toHttpUrl(o.url);
   const room = createMode ? null : parseRoom(o.room);
   const count = createMode ? o.create : o.count;
-  const names = o.names ? String(o.names).split(',').map((s) => s.trim()).filter(Boolean) : BOT_NAMES;
+  const lang = normLang(o.lang) || 'en';
+  const names = o.names ? String(o.names).split(',').map((s) => s.trim()).filter(Boolean) : lang === 'ru' ? BOT_NAMES_RU : BOT_NAMES;
   const seed = o.seed ?? String(Date.now());
   const quiet = !!o.quiet;
   const log = quiet ? null : (line) => console.log(`${new Date().toISOString().slice(11, 19)} ${line}`);
@@ -113,7 +117,7 @@ async function main() {
   let exiting = false;
 
   const mkBot = (i, hostOpts = {}) => new Bot({
-    url, name: names[i % names.length] + (i >= names.length ? ` ${i + 1}` : ''), seed: `${seed}:${i}`,
+    url, name: names[i % names.length] + (i >= names.length ? ` ${i + 1}` : ''), seed: `${seed}:${i}`, lang,
     delay: o.delay, speechDelay: o.speech ?? 2 * o.delay, specials: o.specials, coordinator: coord, reconnect: true, log,
     maxRate: 16, // the server drops messages above 20/s per socket (SPEC §9)
     host: { discussionDelay: o.discussion ?? 4 * o.delay, patience: o.patience, endGame: o['end-game'], ...hostOpts },
