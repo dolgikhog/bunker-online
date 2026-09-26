@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server/index.js",
     "dev": "BUNKER_DEV=1 BUNKER_MIN_PLAYERS=2 PORT=8081 HOST=0.0.0.0 node server/index.js",
-    "test": "node --test test/",
+    "test": "node --test test/*.test.js",
     "bots": "node tools/bots.js",
     "e2e": "node tools/e2e.js",
     "dev:smoke": "node tools/dev-smoke.js"
