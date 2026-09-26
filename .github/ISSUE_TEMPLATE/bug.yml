@@ -1,0 +1,87 @@
+# Bug report form.
+#
+# The game links here with the fields filled in, using GitHub's issue-form query parameters:
+#   https://github.com/dolgikhog/bunker-online/issues/new?template=bug.yml&version=<v>&browser=<ua>&lang=<EN|RU>&room=<code>
+# A parameter's name is the field's `id` below. These ids are a public contract with the game:
+# do not rename or remove them. Every prefilled field is a plain `input` (not a dropdown), so
+# any value the game passes lands as text.
+#   version  game version (build) the player was on
+#   browser  device, OS and browser
+#   lang     game language, EN or RU
+#   room     4-letter room code (optional)
+# `title` can be prefilled too (&title=...).
+name: Bug report
+description: Something in the game did not work as it should.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. One problem per report, please.
+        Do not include personal data (real names, e-mail addresses, phone numbers) in the report.
+        Security problems go through private reporting instead: see SECURITY.md.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you saw. Copy any error message word for word.
+      placeholder: After the vote closed, the round track still showed the old plan…
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: As exact as you can. Include the number of players and the game phase (lobby, reveals, discussion, vote, defense, final).
+      placeholder: |
+        1. Create a game with 6 players
+        2. In round 2, play an Airlock on …
+        3. …
+    validations:
+      required: true
+  - type: input
+    id: browser
+    attributes:
+      label: Device and browser
+      description: Device, operating system and browser, with versions if you know them.
+      placeholder: iPhone 13, iOS 18.5, Safari
+    validations:
+      required: true
+  - type: input
+    id: lang
+    attributes:
+      label: Game language
+      description: EN or RU.
+      placeholder: EN
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Game version
+      description: Filled in for you when you use the game's report link. Otherwise leave it blank.
+      placeholder: "0.1.0"
+    validations:
+      required: false
+  - type: input
+    id: room
+    attributes:
+      label: Room code (optional)
+      description: The 4-letter code of the room, if the game was still running when you reported it.
+      placeholder: ABCD
+    validations:
+      required: false
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or recordings
+      description: Drag images or videos here. Crop out anything personal, such as other people's names.
+    validations:
+      required: false

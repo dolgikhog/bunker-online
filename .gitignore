@@ -1,0 +1,77 @@
+# Bunker Online: only the game, its tests, its tools and the deploy scripts are public.
+
+# Dependencies
+node_modules/
+
+# Local working areas: agent scratch space, hotfix checkouts, agent reports and logs,
+# voice staging (incl. comparison samples), old client variants
+/.scratch/
+/.hotfix/
+/reports/
+/assets-voice/
+/clients/
+
+# Secrets and local settings (deploy targets, keys, tokens)
+.env
+.env.*
+*.env
+!.env.example
+deploy/.env
+*.pem
+*.key
+id_rsa*
+id_ecdsa*
+id_ed25519*
+# npm auth tokens live here; the project needs no .npmrc
+.npmrc
+# npm pack output
+*.tgz
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test and e2e output (tools/e2e.js writes to reports/screens/e2e by default)
+coverage/
+.nyc_output/
+/e2e-screens/
+/screens/
+/shots/
+/tmp/
+FAIL-*.png
+
+# Voice build: virtualenvs, model files, caches, intermediate renders (see tools/voice/README.md)
+tools/voice/.venv/
+tools/voice/venv/
+tools/voice/models/
+tools/voice/work/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.onnx
+*.pt
+*.pth
+*.safetensors
+voices*.bin
+
+# Backups and merge leftovers
+*.bak
+*.bak[0-9]*
+*.orig
+*.rej
+*~
+*.swp
+*.swo
+
+# OS and editor junk
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.code-workspace
+.claude/

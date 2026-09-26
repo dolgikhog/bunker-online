@@ -1,0 +1,31 @@
+{
+  "name": "bunker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Online Bunker — a post-apocalyptic discussion party game (proof of concept)",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test test/",
+    "bots": "node tools/bots.js",
+    "e2e": "node tools/e2e.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^24.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dolgikhog/bunker-online.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dolgikhog/bunker-online/issues"
+  },
+  "homepage": "https://github.com/dolgikhog/bunker-online#readme"
+}

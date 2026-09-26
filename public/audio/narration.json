@@ -1,0 +1,110 @@
+[
+ {
+  "title": "Asteroid Impact",
+  "src": "audio/catastrophes/asteroid-impact.mp3",
+  "voice": "bm_george",
+  "durationSec": 39.52
+ },
+ {
+  "title": "Gamma-Ray Burst",
+  "src": "audio/catastrophes/gamma-ray-burst.mp3",
+  "voice": "bm_lewis",
+  "durationSec": 39.82
+ },
+ {
+  "title": "Gray Goo",
+  "src": "audio/catastrophes/gray-goo.mp3",
+  "voice": "bm_daniel",
+  "durationSec": 33.93
+ },
+ {
+  "title": "Machine Uprising",
+  "src": "audio/catastrophes/machine-uprising.mp3",
+  "voice": "bm_daniel",
+  "durationSec": 37.31
+ },
+ {
+  "title": "New Ice Age",
+  "src": "audio/catastrophes/new-ice-age.mp3",
+  "voice": "bm_lewis",
+  "durationSec": 37.61
+ },
+ {
+  "title": "Nuclear Winter",
+  "src": "audio/catastrophes/nuclear-winter.mp3",
+  "voice": "bm_george",
+  "durationSec": 38.29
+ },
+ {
+  "title": "Pole Reversal",
+  "src": "audio/catastrophes/pole-reversal.mp3",
+  "voice": "bm_fable",
+  "durationSec": 35.85
+ },
+ {
+  "title": "Scorched Earth",
+  "src": "audio/catastrophes/scorched-earth.mp3",
+  "voice": "bm_lewis",
+  "durationSec": 39.44
+ },
+ {
+  "title": "Silent Spring",
+  "src": "audio/catastrophes/silent-spring.mp3",
+  "voice": "bf_isabella",
+  "durationSec": 33.22
+ },
+ {
+  "title": "Solar Superflare",
+  "src": "audio/catastrophes/solar-superflare.mp3",
+  "voice": "bm_daniel",
+  "durationSec": 33.74
+ },
+ {
+  "title": "Spore Rain",
+  "src": "audio/catastrophes/spore-rain.mp3",
+  "voice": "bf_isabella",
+  "durationSec": 35.15
+ },
+ {
+  "title": "Supervolcano",
+  "src": "audio/catastrophes/supervolcano.mp3",
+  "voice": "bm_george",
+  "durationSec": 39.78
+ },
+ {
+  "title": "The Barren Plague",
+  "src": "audio/catastrophes/the-barren-plague.mp3",
+  "voice": "bf_emma",
+  "durationSec": 39.48
+ },
+ {
+  "title": "The Biting Plague",
+  "src": "audio/catastrophes/the-biting-plague.mp3",
+  "voice": "bm_fable",
+  "durationSec": 36.78
+ },
+ {
+  "title": "The Gray Fever",
+  "src": "audio/catastrophes/the-gray-fever.mp3",
+  "voice": "bf_emma",
+  "durationSec": 33.35
+ },
+ {
+  "title": "The Great Flood",
+  "src": "audio/catastrophes/the-great-flood.mp3",
+  "voice": "bm_fable",
+  "durationSec": 34.85
+ },
+ {
+  "title": "The Visitors",
+  "src": "audio/catastrophes/the-visitors.mp3",
+  "voice": "bf_lily",
+  "durationSec": 34.55
+ },
+ {
+  "title": "The Yellow Cloud",
+  "src": "audio/catastrophes/the-yellow-cloud.mp3",
+  "voice": "bf_alice",
+  "durationSec": 37.1
+ }
+]

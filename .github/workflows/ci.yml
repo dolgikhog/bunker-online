@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: npm test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  e2e:
+    name: e2e (Chrome)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # tools/e2e.js honours CHROME_PATH; point it at the runner's Google Chrome.
+      - name: Locate Google Chrome
+        run: |
+          CHROME="$(command -v google-chrome-stable || command -v google-chrome)"
+          "$CHROME" --version
+          echo "CHROME_PATH=$CHROME" >> "$GITHUB_ENV"
+      - name: Browser end-to-end run
+        run: node tools/e2e.js --screens e2e-screens
+      - name: Upload e2e screenshots
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-screens
+          path: e2e-screens/
+          retention-days: 14
+          if-no-files-found: ignore

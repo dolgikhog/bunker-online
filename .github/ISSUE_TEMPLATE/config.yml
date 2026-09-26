@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Play Bunker Online
+    url: https://178-104-144-119.sslip.io
+    about: The live game. Open it to check whether a problem still happens before you report it.
+  - name: Report a security vulnerability
+    url: https://github.com/dolgikhog/bunker-online/security/advisories/new
+    about: Please report security problems privately, not in a public issue (see SECURITY.md).

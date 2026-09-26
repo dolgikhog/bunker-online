@@ -1,0 +1,50 @@
+# Feature idea form.
+#
+# Prefillable from a link, like bug.yml (parameter name = field id):
+#   https://github.com/dolgikhog/bunker-online/issues/new?template=idea.yml&version=<v>&lang=<EN|RU>
+# Stable ids: idea, why, alternatives, version, lang. Do not rename them.
+name: Feature idea
+description: Suggest something new for the game, or a change to how it plays.
+title: "[Idea]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ideas are welcome. Please search the open issues first: someone may have suggested it already.
+        New card ideas: write your own text. Do not copy text from other games or books.
+  - type: textarea
+    id: idea
+    attributes:
+      label: The idea
+      description: What should the game do? Describe it from a player's or a host's point of view.
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: What problem does it solve, or what would it make better at the table?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+    validations:
+      required: false
+  - type: input
+    id: lang
+    attributes:
+      label: Game language
+      description: EN or RU, if the idea is about the text of one language.
+      placeholder: EN
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: Game version
+      description: Filled in for you when you use the game's link. Otherwise leave it blank.
+    validations:
+      required: false
