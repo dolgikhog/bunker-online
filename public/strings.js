@@ -27,4 +27,10 @@ export const STR = {
 
   // X10: the short lead-in on the final screen and in the rules sheet
   feedbackLead: 'Something off, or an idea for the game?',
+
+  // X9.3: the narrator's popover in a seat of the /dev test table (dev mode only), where the table gives the sound to
+  // one seat at a time ({who} is a seat's name, P1…P16)
+  narrTableOn: 'Test table: this seat has the sound. It reads the catastrophe when a game starts.',
+  narrTableOther: ({ who }) => `Test table: ${who} has the sound. ▶ Listen or the switch here moves it to this seat.`,
+  narrTableOff: 'Test table: the sound is off. ▶ Listen or the switch here turns it on for this seat.',
 };

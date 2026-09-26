@@ -1,7 +1,7 @@
 # Bunker Online: only the game, its tests, its tools and the deploy scripts are public.
 
 # Dependencies
-node_modules/
+node_modules
 
 # Local working areas: agent scratch space, hotfix checkouts, agent reports and logs,
 # voice staging (incl. comparison samples), old client variants

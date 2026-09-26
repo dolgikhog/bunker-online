@@ -233,6 +233,8 @@ expose a dev server publicly**: dev mode refuses to start next to `BUNKER_TRUST_
 - **What it shows:** 2–16 seats side by side, each a real client with its own profile. **New test game** seats P1…PN
   automatically, with an optional **seed** for a reproducible deal.
 - **Controls:** **Add bots**, **Start** and **Fast timers**.
+- **🔊 Sound:** one seat reads the catastrophe at Start (Auto: the focused seat, else P1; a clip that is playing finishes first), whatever its own Narrator
+  switch says; the others stay silent. **▶ Listen** in another seat moves the sound there. Choose **Off** for silence.
 - **Shortcuts:** give any player any special card (e.g. two Airlocks), auto-reveal the round, skip to the next vote,
   force a tie, and **god view** (every hidden card in a table).
 - **Smoke test:** `npm run dev:smoke` runs the table end to end.

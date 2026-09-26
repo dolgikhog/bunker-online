@@ -1524,6 +1524,7 @@ function narrTitle(titleEl, s, where) { return narrHook((n) => n.titleRow(titleE
 import('./narrator.js').then((m) => {
   m.init({ onChange: scheduleRender, notify: (text) => { if (!isNarrow()) toast('info', 'narrator', text); }, memory: !!MOCK });
   narr = m;
+  devSoundApply();   // dev mode: the test table's sound command may have come first
   scheduleRender();
 }).catch(() => { /* no narrator */ });
 
@@ -3843,8 +3844,12 @@ setInterval(() => {
  *                     { cmd: 'leave' }                        leave the room for good, forget the seat, show Landing
  *                     { cmd: 'start' }                        the host's Start
  *                     { cmd: 'dev', op, params? }             sends { t: 'dev', op, ...params } on this seat's socket
+ *                     { cmd: 'sound', on, who }               the narrator: this seat has the sound (on), or seat `who`
+ *                                                             has it (one seat at a time; narrator.js devSound)
  *      seat → parent  { ev: 'ready', href, profile }          once, when the bridge is up
- *                     { ev: 'status', screen, room, id, online, pending }   whenever one of these changes
+ *                     { ev: 'status', screen, room, id, online, pending, narr }   whenever one of these changes
+ *                                                             (narr: the narrator's { on, status }, narrator.js devState)
+ *                     { ev: 'sound', want }                   the player here asked for the sound (▶ Listen, the switch)
  *                     { ev: 'joined', room, id }              a create / join / resume was accepted
  *                     { ev: 'state', state }                  every StateView (god view included, X9.4)
  *                     { ev: 'error', code, message }          every error from the server
@@ -3863,6 +3868,7 @@ function devStatus() {
     id: state ? state.you.id : identity ? identity.id : '',
     online: conn.status === 'open' && joinedOnSocket,
     pending: !!ui.pending,
+    narr: narrHook((n) => n.devState(), null),
   };
   const sig = JSON.stringify(st);
   if (sig === devStatusSig) return;
@@ -3926,6 +3932,7 @@ function devCommand(m) {
     }
     case 'leave': devLeave(); break;
     case 'start': sendTurnAction({ t: 'start' }); break;
+    case 'sound': devSoundMsg = { on: m.on === true, who: typeof m.who === 'string' ? m.who : '' }; devSoundApply(); break;
     case 'dev': {
       if (typeof m.op !== 'string' || !m.op) break;
       const extra = m.params && typeof m.params === 'object' && !Array.isArray(m.params) ? m.params : {};
@@ -3935,6 +3942,10 @@ function devCommand(m) {
     default: break;
   }
   scheduleRender();
+}
+let devSoundMsg = null;   // the table's last { on, who } for this seat's narrator (kept for when narrator.js loads)
+function devSoundApply() {
+  if (devBridge && devSoundMsg) narrHook((n) => n.devSound(devSoundMsg, (want) => devPost({ ev: 'sound', want: !!want })));
 }
 function devBridgeInstall() {
   if (devBridge) return;

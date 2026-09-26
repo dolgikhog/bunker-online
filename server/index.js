@@ -13,7 +13,8 @@
 // HTTP: GET /healthz -> ok; GET /stats -> {"rooms","activeGames","sockets"} only for a request made on this host (a
 // loopback peer with no X-Forwarded-For, SPEC §11 X8), 404 for everyone else; in dev mode only, GET /devinfo ->
 // {"dev":true} and /dev -> public/dev.html (without dev mode these and every public/dev.* file are the plain 404);
-// every other path is a static file.
+// every other path is a static file, GET or HEAD, with byte ranges for a GET (Accept-Ranges: bytes, 206, 416; see
+// parseRange).
 
 import http from 'node:http';
 import net from 'node:net';
@@ -208,6 +209,51 @@ function insideDir(dir, p) {
   return p === dir || p.startsWith(dir.endsWith(path.sep) ? dir : dir + path.sep);
 }
 
+// ---- static files: byte ranges (RFC 9110 §14) --------------------------------------------------------------------
+
+/**
+ * What a GET's Range header asks of a static file of `size` bytes. Media needs this: Safari and every iOS browser do
+ * not play audio from a server that answers a range request with the whole file (200), and Chrome cannot seek in it.
+ *   { status: 200 }              the whole file: no Range header, a unit other than `bytes` or none (RFC 9110 §14.2: a
+ *                                server MUST ignore those), or more than one range (multipart/byteranges is not
+ *                                implemented; a server MAY ignore Range, and media players ask for one range only);
+ *   { status: 206, start, end }  bytes start..end, `end` inclusive: "a-b" (b past the end means to the end), "a-", and
+ *                                "-n" (the last n bytes; the whole file when n >= size);
+ *   { status: 416 }              nothing can be served: a malformed `bytes` range ("5-2", "x-1", "-", "1-2-3", an empty
+ *                                list), a range that starts at or past the end, "-0", any range of an empty file, or
+ *                                several ranges none of which can be served.
+ * The caller applies Range to a GET only, and sends a 416 with the unsatisfied-range form of Content-Range (the file's
+ * size after "bytes *", RFC 9110 §14.4).
+ */
+export function parseRange(header, size) {
+  if (typeof header !== 'string') return { status: 200 };
+  const eq = header.indexOf('=');
+  if (eq < 0 || header.slice(0, eq).trim().toLowerCase() !== 'bytes') return { status: 200 };
+  const specs = header.slice(eq + 1).split(',').map((x) => x.trim()).filter(Boolean);   // empty list elements are allowed
+  if (!specs.length) return { status: 416 };
+  const ranges = [];
+  for (const spec of specs) {
+    const m = /^(\d+)-(\d*)$|^-(\d+)$/.exec(spec);
+    if (!m) return { status: 416 };
+    let start;
+    let end;
+    if (m[3] !== undefined) {
+      const n = Number(m[3]);
+      start = Math.max(0, size - n);
+      end = n > 0 ? size - 1 : -1;
+    } else {
+      start = Number(m[1]);
+      if (m[2] !== '' && Number(m[2]) < start) return { status: 416 };   // last-pos < first-pos: invalid (RFC 9110 §14.1.1)
+      end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+    }
+    ranges.push(start < size && end >= start ? { start, end } : null);
+  }
+  const ok = ranges.filter(Boolean);
+  if (!ok.length) return { status: 416 };
+  if (ranges.length > 1) return { status: 200 };
+  return { status: 206, ...ok[0] };
+}
+
 /**
  * The static file server. `dev` (§11 X9): serve /devinfo and /dev (public/dev.html), and let pages of this origin frame
  * ours (X-Frame-Options SAMEORIGIN instead of DENY: the test table shows each seat's client in an <iframe>). Without it
@@ -250,18 +296,31 @@ function makeStaticHandler(publicDir, { dev = false } = {}) {
           if (errStat || !st.isFile()) { sendText(res, 404, 'Not found'); return; }
           const ext = path.extname(real).toLowerCase();
           const isIndex = path.basename(real) === 'index.html';
-          res.writeHead(200, {
+          const lastModified = st.mtime.toUTCString();
+          // byte ranges (parseRange): for a GET only (RFC 9110 §14.2), and an If-Range that is not this file's
+          // Last-Modified (an ETag, an older date) means the file changed since: then the whole file
+          const ifRange = req.headers['if-range'];
+          const range = req.method === 'GET' && (ifRange === undefined || ifRange === lastModified)
+            ? parseRange(req.headers.range, st.size) : { status: 200 };
+          if (range.status === 416) {
+            sendText(res, 416, 'Range not satisfiable', { 'Accept-Ranges': 'bytes', 'Content-Range': `bytes */${st.size}` });
+            return;
+          }
+          const part = range.status === 206;
+          res.writeHead(range.status, {
             'Content-Type': MIME[ext] || 'application/octet-stream',
-            'Content-Length': st.size,
+            'Content-Length': part ? range.end - range.start + 1 : st.size,
+            ...(part ? { 'Content-Range': `bytes ${range.start}-${range.end}/${st.size}` } : {}),
+            'Accept-Ranges': 'bytes',
             'Cache-Control': isIndex ? 'no-store' : 'no-cache',
             'Content-Security-Policy': CSP,
             'X-Content-Type-Options': 'nosniff',
             'Referrer-Policy': 'no-referrer',
             'X-Frame-Options': frameOptions,
-            'Last-Modified': st.mtime.toUTCString(),
+            'Last-Modified': lastModified,
           });
           if (req.method === 'HEAD') { res.end(); return; }
-          const stream = fs.createReadStream(real);
+          const stream = fs.createReadStream(real, part ? { start: range.start, end: range.end } : undefined);
           stream.on('error', () => res.destroy());
           res.on('close', () => stream.destroy());
           stream.pipe(res);
