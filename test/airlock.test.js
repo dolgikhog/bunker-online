@@ -248,7 +248,7 @@ describe('§11 X1 Airlock: open and join', () => {
     const last = g.log[g.log.length - 1];
     assert.deepEqual([last.kind, last.text], ['special', openLine(g, ids[0], ids[4])]);
     assert.equal(P(g, ids[0]).specials[0].used, true);
-    assert.deepEqual(g.view(ids[5]).players[0].playedSpecials, [{ title: AIR.title, text: AIR.text }]);
+    assert.deepEqual(g.view(ids[5]).players[0].playedSpecials, [{ id: 'airlock', title: AIR.title, text: AIR.text }]);
     assert.equal(g.view(ids[0]).me.canPlaySpecial, false, 'one special per round');
     assert.deepEqual(g.view(ids[5]).schedule, before, 'an open airlock changes nothing in the schedule');
     assert.equal(g.phase, 'reveal');
@@ -270,7 +270,7 @@ describe('§11 X1 Airlock: open and join', () => {
     assert.equal(v.schedule.outCount, 1);
     assert.equal(v.players[4].status, 'ejected');
     assert.equal(v.players[4].cards.health, null, 'their hidden cards stay hidden');
-    assert.deepEqual(v.players[1].playedSpecials, [{ title: AIR.title, text: AIR.text }]);
+    assert.deepEqual(v.players[1].playedSpecials, [{ id: 'airlock', title: AIR.title, text: AIR.text }]);
     // N=6 votes once in round 5: the airlock ejection already covers it
     advanceTo(g, 5, 'discussion');
     assert.equal(g.view(specs[0]).schedule.kicksThisStep, 0);
@@ -386,7 +386,7 @@ describe('§11 X1 Airlock: open and join', () => {
     assert.equal(t.length, i + 2);
     assert.deepEqual(pubAirlocks(g), [], 'none open in the final');
     assert.deepEqual(g.final.out, [ids[1], ids[3], ids[5]]);
-    assert.deepEqual(g.view(ids[0]).players[2].unplayedSpecials, [{ title: FILLER.title, text: FILLER.text }]);
+    assert.deepEqual(g.view(ids[0]).players[2].unplayedSpecials, [{ id: FILLER.id, title: FILLER.title, text: FILLER.text }]);
   });
 });
 

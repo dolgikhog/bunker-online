@@ -32,6 +32,10 @@
 //
 // Determinism: all game choices come from a seeded RNG (`seed`), consumed only when an action is actually sent.
 //
+// Languages (SPEC §11 X5.1): `lang` ('en' | 'ru') goes with create, join and resume; setLang(l) switches at any time
+// (the server answers with one state to this socket); `toggleLang: N` switches after every N actions. The policy reads
+// no text: log lines are read by `key` (with the English text as the fallback for a server before X5).
+//
 // Importing this module has no side effects (no sockets, timers, listeners or output until a Bot is used), so the dev
 // server (SPEC §11 X9, server/dev.js) imports it to run in-process bots through a loopback `transport`.
 
@@ -87,6 +91,46 @@ export const EFFECT_RULES = {
 export const BOT_NAMES = ['Bot Anna', 'Bot Boris', 'Bot Clara', 'Bot Dmitri', 'Bot Elena', 'Bot Fedor', 'Bot Galina',
   'Bot Igor', 'Bot Katya', 'Bot Leonid', 'Bot Masha', 'Bot Nikolai', 'Bot Olga', 'Bot Pavel', 'Bot Rita', 'Bot Sergei',
   'Bot Tanya', 'Bot Vadim', 'Bot Yulia', 'Bot Zakhar'];
+/** The same bots with Cyrillic names, for a Russian table (`tools/bots.js --lang ru`, SPEC §11 X5). */
+export const BOT_NAMES_RU = ['Бот Анна', 'Бот Борис', 'Бот Клара', 'Бот Дмитрий', 'Бот Елена', 'Бот Фёдор', 'Бот Галина',
+  'Бот Игорь', 'Бот Катя', 'Бот Леонид', 'Бот Маша', 'Бот Николай', 'Бот Ольга', 'Бот Павел', 'Бот Рита', 'Бот Сергей',
+  'Бот Таня', 'Бот Вадим', 'Бот Юлия', 'Бот Захар'];
+/**
+ * Ordinary full names, first name and surname, 15 to 20 letters (NAME_MAX): what a real table types, and the size the
+ * §11 X5.2 budget has to hold (a Cyrillic letter is 2 bytes of UTF-8, and names fill every tally and door line).
+ * realNames(lang, n): n different names (up to 256), the same ones for the same n; Russian surnames agree with the
+ * first name's gender.
+ */
+const REAL_FIRST = {
+  ru: [['Александра', 'f'], ['Константин', 'm'], ['Екатерина', 'f'], ['Владислав', 'm'], ['Анастасия', 'f'], ['Святослав', 'm'],
+    ['Елизавета', 'f'], ['Станислав', 'm'], ['Маргарита', 'f'], ['Вячеслав', 'm'], ['Валентина', 'f'], ['Ростислав', 'm'],
+    ['Ярослава', 'f'], ['Всеволод', 'm'], ['Людмила', 'f'], ['Григорий', 'm']],
+  en: [['Alexandra'], ['Christopher'], ['Elizabeth'], ['Nathaniel'], ['Josephine'], ['Sebastian'], ['Gwendolyn'], ['Frederick'],
+    ['Katherine'], ['Maximilian'], ['Jacqueline'], ['Bartholomew'], ['Anastasia'], ['Theodore'], ['Valentina'], ['Benjamin']],
+};
+const REAL_LAST = {
+  ru: ['Кузнецов', 'Соколов', 'Лебедев', 'Новиков', 'Морозов', 'Воробьёв', 'Васильев', 'Семёнов', 'Голубев', 'Богданов',
+    'Воронцов', 'Тарасов', 'Беляев', 'Комаров', 'Филиппов', 'Степанов'],
+  en: ['Williams', 'Anderson', 'Thompson', 'Robinson', 'Harrison', 'Campbell', 'Mitchell', 'Richards', 'Fletcher', 'Crawford',
+    'Sullivan', 'Hamilton', 'Chambers', 'Donovan', 'Holloway', 'Whitaker'],
+};
+export function realNames(lang, n) {
+  const first = REAL_FIRST[lang] || REAL_FIRST.en;
+  const last = REAL_LAST[lang] || REAL_LAST.en;
+  if (n > first.length * last.length) throw new Error(`realNames: at most ${first.length * last.length} names`);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const [name, g] = first[i % 16];
+    const b = Math.floor(i / 16);
+    const sur = last[(7 * (i % 16) + b) % 16]; // (i % 16, this) is a different pair for every i < 256
+    out.push(`${name} ${g === 'f' ? `${sur}а` : sur}`);
+  }
+  return out;
+}
+/** SPEC §11 X5.1: the languages a server takes. */
+export const LANGS = ['en', 'ru'];
+/** 'en' | 'ru', or null for anything else. */
+export function normLang(x) { return LANGS.includes(x) ? x : null; }
 
 // ---------------------------------------------------------------------------------------------------------------
 // Small utilities
@@ -114,6 +158,14 @@ export function pick(rng, arr) {
 }
 
 /** http://h:p, ws://h:p, h:p, http://h:p/?room=X -> ws://h:p/ws */
+/** A received WebSocket message's size in bytes (a Buffer, fragments, an ArrayBuffer, or a test transport's string). */
+export function wireBytes(data) {
+  if (Buffer.isBuffer(data)) return data.length;
+  if (Array.isArray(data)) return data.reduce((n, x) => n + wireBytes(x), 0);
+  if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) return data.byteLength;
+  return Buffer.byteLength(String(data));
+}
+
 export function toWsUrl(url) {
   let u = String(url || 'http://127.0.0.1:8080').trim();
   if (!/^[a-z]+:\/\//i.test(u)) u = 'http://' + u;
@@ -246,18 +298,33 @@ export function playableSpecials(state) {
 /** SPEC §11 X1 log line of an airlock that closed: "🚪 A sealed the airlock with B — T is thrown out of the bunker, no vote!" */
 export const AIRLOCK_SEALED_RE = /^🚪 (.+) sealed the airlock with (.+) — (.+) is thrown out of the bunker, no vote!$/u;
 
-/** Players the current game threw out through an airlock who are still ejected (from the log, by name). */
+/** SPEC §11 X5.3: the log line keys of the three airlock lines (a line without `key` is from a server before X5). */
+export const AIR_KEYS = Object.freeze({ 'log.airlockSeal': 'seal', 'log.airlockStart': 'start', 'log.airlockJam': 'jam' });
+
+/** true for the "The game begins" line (by key; by its English text for a server before X5). */
+function isGameStart(e) {
+  return e.key ? e.key === 'log.gameBegins' : e.kind === 'system' && /^The game begins/.test(e.text);
+}
+
+/**
+ * Players the current game threw out through an airlock who are still ejected: from the log's `log.airlockSeal` lines
+ * (params.t), or, for a server before X5, from the English line by name.
+ */
 export function airlockVictims(state) {
   if (!state || !Array.isArray(state.log) || !Array.isArray(state.players)) return [];
   let start = 0;
   for (let i = state.log.length - 1; i >= 0; i--) {
-    if (state.log[i].kind === 'system' && /^The game begins/.test(state.log[i].text)) { start = i; break; }
+    if (isGameStart(state.log[i])) { start = i; break; }
   }
   const byName = new Map(state.players.map((p) => [p.name, p]));
   const out = new Set();
   for (const e of state.log.slice(start)) {
-    const m = e.kind === 'eject' ? AIRLOCK_SEALED_RE.exec(e.text) : null;
-    const p = m ? byName.get(m[3]) : null;
+    let p = null;
+    if (e.key) p = e.key === 'log.airlockSeal' && e.params ? playerById(state, e.params.t) : null;
+    else {
+      const m = e.kind === 'eject' ? AIRLOCK_SEALED_RE.exec(e.text) : null;
+      p = m ? byName.get(m[3]) : null;
+    }
     if (p && p.status === 'ejected') out.add(p.id);
   }
   return [...out];
@@ -344,6 +411,8 @@ export class Bot extends EventEmitter {
    *                                         and 'open'/'message'/'error'/'close' events). The dev server's in-process bots
    *                                         (SPEC §11 X9, server/dev.js) pass a loopback socket that talks to the room
    *                                         registry directly
+   * @param {'en'|'ru'} [o.lang]            SPEC §11 X5.1: sent with create, join and resume (none: the server's default)
+   * @param {number} [o.toggleLang=0]        switch the language (setLang) after every this many actions (0 = never)
    * @param {(line:string)=>void} [o.log]
    */
   constructor(o = {}) {
@@ -373,6 +442,10 @@ export class Bot extends EventEmitter {
     this.maxRate = o.maxRate ?? Infinity;
     this.stepKeys = o.stepKeys !== false;
     this.transport = typeof o.transport === 'function' ? o.transport : null;
+    this.lang = normLang(o.lang);
+    this.toggleLang = Number.isInteger(o.toggleLang) && o.toggleLang > 0 ? o.toggleLang : 0;
+    this.actions = 0; // actions autoplay sent (toggleLang counts them)
+    this.langSwitches = 0;
     this.sentTimes = [];
     this.dropped = 0; // actions whose pong never came (see _expireStale)
 
@@ -476,21 +549,39 @@ export class Bot extends EventEmitter {
     });
   }
 
+  /** A hello with this bot's language (SPEC §11 X5.1), when it has one. */
+  _hello(msg) {
+    if (this.lang) msg.lang = this.lang;
+    return msg;
+  }
+
   /** Creates a room; resolves { room, id, token, state } once the first state arrived. */
   create() {
-    return this._request('create', { t: 'create', name: this.name });
+    return this._request('create', this._hello({ t: 'create', name: this.name }));
   }
 
   join(room, { spectator = false } = {}) {
     const msg = { t: 'join', room: String(room), name: this.name }; // sent as given: the server is case-insensitive
     if (spectator) msg.spectator = true;
-    return this._request('join', msg);
+    return this._request('join', this._hello(msg));
   }
 
   /** Resumes on a new socket with the stored (or given) room and token. */
   async resume(room = this.room, token = this.token) {
     await this.connect();
-    return this._request('resume', { t: 'resume', room, token });
+    return this._request('resume', this._hello({ t: 'resume', room, token }));
+  }
+
+  /**
+   * SPEC §11 X5.1: switches this socket's (and, joined, the member's) language. Joined, the server answers with one
+   * state to this socket only. Returns false if the socket is not open.
+   */
+  setLang(lang) {
+    const l = normLang(lang);
+    if (!l) throw new Error(`${this.name}: not a language: ${lang}`);
+    this.lang = l;
+    this.langSwitches++;
+    return this._send({ t: 'setLang', lang: l }, `setLang:${this.langSwitches}`);
   }
 
   /**
@@ -619,7 +710,8 @@ export class Bot extends EventEmitter {
       this.emit('garbage', data);
       return;
     }
-    const meta = { gen, t: Date.now() };
+    // bytes: the message's size on the wire (UTF-8), which the Checker holds against the §11 X5.2 frame budget
+    const meta = { gen, t: Date.now(), bytes: wireBytes(data) };
     this.emit('message', msg, meta);
     switch (msg && msg.t) {
       case 'joined':
@@ -778,7 +870,13 @@ export class Bot extends EventEmitter {
     const msg = d.build();
     if (!msg) { this._kick(); return; }
     if (this.stepKeys && STEP_KEYED.has(msg.t) && msg.at === undefined) msg.at = stepRefOf(this.state);
-    if (this._send(msg, d.key) && d.describe) this.say(d.describe(msg));
+    const sent = this._send(msg, d.key);
+    if (sent && d.describe) this.say(d.describe(msg));
+    if (sent && this.toggleLang && ++this.actions % this.toggleLang === 0) {
+      const next = LANGS[(LANGS.indexOf(this.lang || 'en') + 1) % LANGS.length];
+      this.setLang(next);
+      this.say(`switches to ${next}`);
+    }
   }
 
   /** The ordered list of things this bot wants to do now: [{ key, delay, build, host?, describe? }]. */

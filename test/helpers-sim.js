@@ -4,6 +4,20 @@
 //   runTable()     plays full games with bots (tools/botlib.js), a spectator "watcher" as the reference stream,
 //                  optional scenario hooks, stall detection and a quiescence check at the end.
 // Side-effect free on import (bare `node --test` would load this file as a test file).
+//
+// §11 X5 (languages; report §11.2). Each recipient's view is in its own language (`you.lang`), so:
+//   - log lines are checked by `key` and `params` (the airlock lines X1/Y1, ejections, End game and Play again E1); the
+//     English text is still compared for English recipients;
+//   - every log entry is validated once per client (the §7 schema, parts included) and must never change afterwards;
+//     the same entry id must look the same to every recipient of one language (or, `neutral`, the same key and params
+//     to everybody);
+//   - `neutral: true` (a table with several languages): the public fingerprints drop every rendered string (labels,
+//     titles, texts, details, names of bunker and catastrophe, card texts become '*', nullness kept; log entries are
+//     compared by key and params), so recipients in different languages compare equal; a card is compared with its
+//     owner's hand only within one language;
+//   - the leak scan pairs by language: a hidden card seen in its owner's hand in language L is searched in the log
+//     (text, parts and params) of a reference stream in L. The main reference is one; `attach(bot, {leakRef: true})`
+//     adds another (runTable adds a watcher per extra language).
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -15,11 +29,19 @@ import {
   kicksFormula, nextVoteRoundFormula, playerById,
 } from '../tools/botlib.js';
 import { AIRLOCK_CARD, REVIVE_CARD } from '../server/content.js';
-import { validateServerMessage } from './stateview-schema.js';
+import { validateServerMessage, PARTS_MIN } from './stateview-schema.js';
+
+/** The §11 X5 language of a state ('en' for a server before X5). */
+const langOf = (s) => (s && s.you && typeof s.you.lang === 'string' ? s.you.lang : 'en');
 
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PHASES = ['lobby', 'reveal', 'discussion', 'vote', 'defense', 'final'];
 const LOG_KINDS = ['system', 'reveal', 'special', 'vote', 'eject', 'info'];
+/** §11 X5.2 (copied from the SPEC text): a state is at most this many bytes of UTF-8 per recipient; the log keeps 200 lines. */
+export const FRAME_BUDGET = 120 * 1024;
+const LOG_LIMIT = 200;
+/** More than any one log line takes without its parts (the longest, a 16-player tally or a special's line, is ~3 KB). */
+const LINE_MAX_BYTES = 16 * 1024;
 
 /** SPEC §11 X1 table (copied from the SPEC text, not from the engine): [Airlocks, revives] dealt to N players. */
 export function x1Deal(n) {
@@ -29,7 +51,13 @@ export function x1Deal(n) {
   return [4, 2];
 }
 const sameCard = (c, card) => !!c && c.title === card.title && c.text === card.text;
-const isAirlockCard = (c) => sameCard(c, AIRLOCK_CARD);
+/**
+ * The fixed cards of §11 X1, by their content id (§11 X5.2); in an English view (or one without ids) their words must
+ * be the catalogue's too.
+ */
+const isFixedCard = (c, card, lang) => !!c && (c.id === undefined ? sameCard(c, card) : c.id === card.id && (lang !== 'en' || sameCard(c, card)));
+const isAirlockCard = (c, lang = 'en') => isFixedCard(c, AIRLOCK_CARD, lang);
+const isReviveCard = (c, lang = 'en') => isFixedCard(c, REVIVE_CARD, lang);
 
 // ---------------------------------------------------------------------------------------------------------------
 // Server process
@@ -121,6 +149,64 @@ export function publicPart(s) {
   return pub;
 }
 
+const STAR = (v) => (typeof v === 'string' ? '*' : v);
+/**
+ * §11 X5: the public part with every rendered string replaced by '*' (nullness kept), the same in every language:
+ * category labels, the catastrophe's words, the bunker's, card texts, special titles and texts, the timer label.
+ */
+export function neutralPublic(pub) {
+  const sp = (x) => (x && typeof x === 'object' ? { ...x, title: STAR(x.title), text: STAR(x.text) } : x);
+  return {
+    ...pub,
+    categories: Array.isArray(pub.categories) ? pub.categories.map((c) => ({ ...c, label: STAR(c.label) })) : pub.categories,
+    catastrophe: pub.catastrophe && typeof pub.catastrophe === 'object'
+      ? { ...pub.catastrophe, title: STAR(pub.catastrophe.title), text: STAR(pub.catastrophe.text), details: (pub.catastrophe.details || []).map(STAR) }
+      : pub.catastrophe,
+    bunker: pub.bunker && typeof pub.bunker === 'object'
+      ? { ...Object.fromEntries(Object.entries(pub.bunker).map(([k, v]) => [k, STAR(v)])), features: (pub.bunker.features || []).map(STAR) }
+      : pub.bunker,
+    players: Array.isArray(pub.players) ? pub.players.map((p) => ({
+      ...p,
+      cards: p.cards && typeof p.cards === 'object' ? Object.fromEntries(Object.entries(p.cards).map(([k, v]) => [k, STAR(v)])) : p.cards,
+      playedSpecials: Array.isArray(p.playedSpecials) ? p.playedSpecials.map(sp) : p.playedSpecials,
+      ...(p.unplayedSpecials !== undefined ? { unplayedSpecials: Array.isArray(p.unplayedSpecials) ? p.unplayedSpecials.map(sp) : p.unplayedSpecials } : {}),
+    })) : pub.players,
+    timer: pub.timer && typeof pub.timer === 'object' ? { ...pub.timer, label: STAR(pub.timer.label) } : pub.timer,
+  };
+}
+
+/**
+ * A log entry as compared across recipients: without its parts, and (neutral) without its rendered text either. The
+ * parts are compared on their own (entryParts), because an old entry may reach a recipient without them (§11 X5.2, the
+ * report's §14 fallback: a client that joins late sees the oldest lines of a long log without parts).
+ */
+function entryShape(e, neutral) {
+  if (!e || typeof e !== 'object') return e;
+  if (neutral) return { id: e.id, ts: e.ts, kind: e.kind, key: e.key, params: e.params };
+  const { parts, ...rest } = e; // eslint-disable-line no-unused-vars
+  return rest;
+}
+
+/**
+ * The log of a state as [last id]: entries are checked one by one elsewhere, and the window (which of the log's lines a
+ * frame carries) by Checker.checkWindow. Where the window starts may differ between recipients: §11 X5.2's frame guard
+ * leaves the oldest lines off a frame that would pass FRAME_BUDGET, and heads differ in size (a player's hand, a
+ * language's words).
+ */
+function logRange(log) {
+  return Array.isArray(log) ? [log.length ? log[log.length - 1].id : 0] : log;
+}
+
+/**
+ * The public part of a state as a JSON key: the log as its id range (every entry is compared once, by id), and,
+ * `neutral`, every rendered string as '*' (§11 X5): equal keys mean equal public states for every recipient.
+ */
+export function publicKey(s, neutral = false) {
+  const pub = publicPart(s);
+  const shaped = neutral ? neutralPublic(pub) : pub;
+  return JSON.stringify({ ...shaped, log: logRange(pub.log) });
+}
+
 function sha1(str) { return createHash('sha1').update(str).digest('hex').slice(0, 20); }
 
 /** Up to `max` differing paths between two JSON values. */
@@ -157,11 +243,19 @@ export class Checker {
    * @param {string} o.label
    * @param {boolean} [o.strictSpecialsFree]  no specials and no leaves: survivors and ejections must match KICKS exactly
    * @param {boolean} [o.checkDeal=true]  every final must show the §11 X1 fixed deal (off for hand-made test deals)
+   * @param {boolean} [o.neutral=false]   §11 X5: recipients may be in different languages; public states are compared
+   *                                      without their rendered strings, log entries by key and params
    */
-  constructor({ label = 'room', strictSpecialsFree = false, checkDeal = true } = {}) {
+  constructor({ label = 'room', strictSpecialsFree = false, checkDeal = true, neutral = false } = {}) {
     this.label = label;
     this.strictSpecialsFree = strictSpecialsFree;
     this.checkDeal = checkDeal;
+    this.neutral = !!neutral;
+    this.entryJson = new Map(); // `${lang or 'n'}:${id}` -> the entry as the first recipient saw it (JSON, no parts)
+    this.entryParts = new Map(); // `${lang}:${id}` -> its parts as the first recipient that got them saw them (JSON)
+    this.bareBytes = new Map(); // `${lang}:${id}` -> the entry's size on the wire without its parts (UTF-8 bytes of JSON)
+    this.leakRefs = []; // clients whose streams the leak scan walks (the reference, plus one per extra language)
+    this.langs = new Set(); // languages seen in states
     this.violations = [];
     this.warnings = [];
     this.clients = new Map(); // bot -> client record
@@ -185,18 +279,29 @@ export class Checker {
     if (this.warnings.length < 300) this.warnings.push(`[${this.label}] ${msg}`);
   }
 
-  /** Records everything `bot` receives. The reference is a spectator present for the whole run. */
-  attach(bot, { reference = false } = {}) {
-    const c = { bot, label: bot.name, segments: [], seg: null, lastLogId: 0, roundKey: null, roundStartPlayed: 0, kickedAt: null, prevPhase: null, gameNo: 0 };
+  /**
+   * Records everything `bot` receives. The reference is a spectator present for the whole run. `leakRef`: this
+   * client's stream is scanned for leaks too (§11 X5: a spectator in another language than the reference).
+   */
+  attach(bot, { reference = false, leakRef = false } = {}) {
+    const c = {
+      bot, label: bot.name, segments: [], seg: null, lastLogId: 0, roundKey: null, roundStartPlayed: 0, kickedAt: null, prevPhase: null, gameNo: 0,
+      logChecked: 0, logTexts: new Map(), leak: null,
+    };
     this.clients.set(bot, c);
     if (reference) this.reference = c;
-    bot.on('message', (msg) => {
+    if (reference || leakRef) {
+      c.leak = { seq: [], log: new Map(), lang: null };
+      this.leakRefs.push(c);
+    }
+    bot.on('message', (msg, meta) => {
       this.messages++;
       const t = performance.now();
       if (!msg || typeof msg !== 'object') { this.v(`${c.label}: non-object message`); return; }
-      // every message, field by field against SPEC §7 (test/stateview-schema.js)
+      // every message, field by field against SPEC §7 (test/stateview-schema.js); a log entry in depth once per client
+      // (checkLog makes sure it never changes afterwards)
       this.schemaChecked++;
-      const problems = validateServerMessage(msg);
+      const problems = validateServerMessage(msg, { logFrom: c.logChecked });
       if (problems.length) {
         this.v(`${c.label}: §7 schema [${msg.t}${msg.phase ? ` ${msg.phase} r${msg.round}` : ''}]: ${problems.slice(0, 6).join('; ')}${problems.length > 6 ? ` (+${problems.length - 6} more)` : ''}`);
       }
@@ -218,14 +323,14 @@ export class Checker {
       if (msg.t === 'pong') return;
       if (msg.t !== 'state') { this.v(`${c.label}: unknown message type ${short(msg)}`); return; }
       try {
-        this.onState(c, msg, t);
+        this.onState(c, msg, t, meta && typeof meta.bytes === 'number' ? meta.bytes : null);
       } catch (e) {
         this.v(`${c.label}: checker crashed on a state: ${e.stack}`);
       }
     });
   }
 
-  onState(c, s, t) {
+  onState(c, s, t, bytes = null) {
     const bot = c.bot;
     if (c.kickedAt !== null) this.v(`${c.label}: received a state after {t:'kicked'}`);
     if (c.replacedAt !== undefined) this.v(`${c.label}: received a state after error 'replaced'`);
@@ -236,20 +341,117 @@ export class Checker {
       c.seg = { gen: bot.socketGen, seq: [] };
       c.segments.push(c.seg);
     }
-    const pub = publicPart(s);
-    const json = JSON.stringify(pub);
+    const json = publicKey(s, this.neutral);
     const fp = sha1(json);
     if (!this.fpJson.has(fp)) this.fpJson.set(fp, json);
     const last = c.seg.seq[c.seg.seq.length - 1];
     if (!last || last.fp !== fp) c.seg.seq.push({ fp, t });
+    this.langs.add(langOf(s));
+    if (c.leak) this.recordLeakStream(c, s, fp);
 
     this.checkShape(c, s);
+    this.checkLog(c, s);
+    this.checkWindow(c, s, bytes);
     this.checkRecipient(c, s, fp);
     if (c === this.reference) {
       const lastRef = this.refSeq[this.refSeq.length - 1];
       if (!lastRef || lastRef.fp !== fp) this.refSeq.push({ fp, t, phase: s.phase });
       this.onReference(s);
       if (this.g && s.phase !== 'lobby') this.g.refStates++;
+    }
+  }
+
+  /** The reference stream a leak scan walks: its states (public part, the log as a range) and its log entries by id. */
+  recordLeakStream(c, s, fp) {
+    const L = c.leak;
+    L.lang = langOf(s);
+    for (const e of s.log) {
+      if (L.log.has(e.id)) continue;
+      L.log.set(e.id, { text: e.text, blob: JSON.stringify([e.params, e.parts]) });
+    }
+    const last = L.seq[L.seq.length - 1];
+    if (!last || last.fp !== fp) L.seq.push({ fp, json: this.neutral ? publicKey(s, false) : null, lang: L.lang });
+  }
+
+  /**
+   * §11 X5.3: the log entries of one state. An entry is compared with the first recipient's copy of it (in the same
+   * language; `neutral`: its key and params only) the first time this client sees it, and must keep its text afterwards.
+   */
+  checkLog(c, s) {
+    const L = c.label;
+    const lang = langOf(s);
+    let max = c.logChecked;
+    for (const e of s.log) {
+      if (!e || typeof e !== 'object' || !isInt(e.id)) continue;
+      if (e.id <= c.logChecked) {
+        const was = c.logTexts.get(e.id);
+        if (was === undefined) c.logTexts.set(e.id, e.text); // back in the window after a language switch (below)
+        else if (was !== e.text && langOf(s) === c.logLang) this.v(`${L}: log entry #${e.id} changed after it was sent: ${short(was)} -> ${short(e.text)}`);
+        continue;
+      }
+      c.logTexts.set(e.id, e.text);
+      const k = `${this.neutral ? 'n' : lang}:${e.id}`;
+      const json = JSON.stringify(entryShape(e, this.neutral));
+      const first = this.entryJson.get(k);
+      if (first === undefined) this.entryJson.set(k, json);
+      else if (first !== json) this.v(`(a) ${L}: log entry #${e.id} differs between recipients: ${short(JSON.parse(json))} vs ${short(JSON.parse(first))}`);
+      if (!this.neutral && Array.isArray(e.parts)) {
+        const pj = JSON.stringify(e.parts);
+        const firstParts = this.entryParts.get(k);
+        if (firstParts === undefined) this.entryParts.set(k, pj);
+        else if (firstParts !== pj) this.v(`(a) ${L}: the parts of log entry #${e.id} differ between recipients: ${short(e.parts)} vs ${short(JSON.parse(firstParts))}`);
+      }
+      if (e.id > max) max = e.id;
+    }
+    // a language switch re-renders every entry: its texts are compared from here on in the new language. Texts of lines
+    // outside this state's window are forgotten, not kept in the old language: the frame guard (X5.10) moves a window's
+    // start back and forth with the head's size, so a line left off here may come back in the next state
+    if (c.logLang !== lang) {
+      c.logLang = lang;
+      c.logTexts.clear();
+      for (const e of s.log) if (e && isInt(e.id)) c.logTexts.set(e.id, e.text);
+    }
+    c.logChecked = max;
+    const first = s.log.length ? s.log[0].id : max + 1;
+    if (c.logTexts.size > 400) for (const id of [...c.logTexts.keys()]) if (id < first) c.logTexts.delete(id);
+  }
+
+  /**
+   * §11 X5.2, the frame guard (server/rooms.js): a state's log is the newest lines of the game's log, with contiguous
+   * ids, and it is the whole window (the last 200 lines, or every line so far) unless the frame is at FRAME_BUDGET: then
+   * the line just before the window would have passed the budget, even without its parts (exact when this Checker has
+   * seen that line in this language; otherwise the frame must be within LINE_MAX_BYTES of the budget), and the frame is
+   * within the budget unless only the newest PARTS_MIN lines are left. `bytes`: the frame's size on the wire.
+   */
+  checkWindow(c, s, bytes) {
+    const log = Array.isArray(s.log) ? s.log : [];
+    if (!log.length || !log.every((e) => e && isInt(e.id))) return; // (checkShape reports a malformed log)
+    const bad = (m) => this.v(`${c.label} [${s.phase} r${s.round}]: ${m}`);
+    const lang = langOf(s);
+    // every line's size without its parts, once per language: the new lines are at the window's ends (what this
+    // language has seen is a run of windows), so each end is walked only up to the first line already known
+    const known = (e) => {
+      const k = `${lang}:${e.id}`;
+      if (this.bareBytes.has(k)) return true;
+      this.bareBytes.set(k, Buffer.byteLength(JSON.stringify({ id: e.id, ts: e.ts, kind: e.kind, text: e.text, key: e.key, params: e.params })));
+      return false;
+    };
+    for (let i = log.length - 1; i >= 0 && !known(log[i]); i--);
+    for (let i = 0; i < log.length && !known(log[i]); i++);
+    for (let i = 1; i < log.length; i++) {
+      if (log[i].id !== log[i - 1].id + 1) { bad(`log ids jump from #${log[i - 1].id} to #${log[i].id} (a window has no gaps)`); return; }
+    }
+    const last = log[log.length - 1].id;
+    const whole = Math.min(LOG_LIMIT, last);
+    if (log.length >= whole) return;
+    const tag = `the log is lines #${log[0].id}-#${last} (${log.length} of ${whole})`;
+    if (!isInt(bytes)) { bad(`${tag}, and the frame's size is unknown`); return; }
+    if (bytes > FRAME_BUDGET && log.length > PARTS_MIN) bad(`${tag}: the frame is ${bytes} bytes, over ${FRAME_BUDGET}, with more than ${PARTS_MIN} lines left`);
+    const before = this.bareBytes.get(`${lang}:${log[0].id - 1}`);
+    if (before !== undefined) {
+      if (bytes + before + 1 <= FRAME_BUDGET) bad(`${tag}: line #${log[0].id - 1} (${before + 1} bytes) was left off a ${bytes}-byte frame although it fit`);
+    } else if (bytes + LINE_MAX_BYTES <= FRAME_BUDGET) {
+      bad(`${tag}: a ${bytes}-byte frame is not at the budget (${FRAME_BUDGET}), yet it left lines off`);
     }
   }
 
@@ -416,7 +618,11 @@ export class Checker {
     // remember the owner's hand per public fingerprint (for the leak scan)
     let m = this.meByFp.get(s.you.id);
     if (!m) { m = new Map(); this.meByFp.set(s.you.id, m); }
-    if (!m.has(fp)) m.set(fp, { cards: me.cards, notes: me.notes });
+    // per public state and language: the leak scan pairs a hand only with a reference stream in its language (§11 X5)
+    let byLang = m.get(fp);
+    if (!byLang) { byLang = {}; m.set(fp, byLang); }
+    const lang = langOf(s);
+    if (!byLang[lang]) byLang[lang] = { cards: me.cards, notes: me.notes };
   }
 
   // ---- reference stream: game-flow invariants (d) (e) (f) ---------------------------------------------------
@@ -673,9 +879,13 @@ export class Checker {
     const lastPs = ps.log.length ? ps.log[ps.log.length - 1].id : 0;
     const fresh = s.log.filter((e) => e.id > lastPs);
     const ended = ps.phase !== 'final';
+    // §11 X5: by key; an English reference also checks the words
+    const wantKeys = [...(ended ? ['log.endGame'] : []), 'log.backToLobby'];
     const want = [...(ended ? ['The host ended the game'] : []), 'Back to the lobby — same table, new cards next game'];
-    if (canon(fresh.map((e) => [e.kind, e.text])) !== canon(want.map((t) => ['system', t]))) {
-      bad(`${ended ? 'went back to the lobby without a final: expected End game' : 'Play again'}'s lines ${short(want)}, got ${short(fresh.map((e) => `${e.kind}: ${e.text}`))}`);
+    const english = langOf(s) === 'en';
+    if (canon(fresh.map((e) => [e.kind, e.key])) !== canon(wantKeys.map((k) => ['system', k]))
+      || (english && canon(fresh.map((e) => e.text)) !== canon(want))) {
+      bad(`${ended ? 'went back to the lobby without a final: expected End game' : 'Play again'}'s lines ${short(wantKeys)}${english ? ` ${short(want)}` : ''}, got ${short(fresh.map((e) => `${e.kind}: ${e.key}: ${e.text}`))}`);
     } else if (ended && g) {
       g.endedByHost = true;
       g.endedIn = { phase: ps.phase, round: ps.round, overtime: ps.overtime, airlocks: (ps.airlocks || []).length, vote: !!ps.vote,
@@ -690,8 +900,12 @@ export class Checker {
     if (canon(s.spectators) !== canon(ps.spectators)) bad(`spectators changed: ${short(ps.spectators.map((x) => x.id))} -> ${short(s.spectators.map((x) => x.id))}`);
     if (s.hostId !== ps.hostId) bad(`host changed ${ps.hostId} -> ${s.hostId}`);
     if (canon(s.options) !== canon(ps.options)) bad('options changed');
+    // (the lines both frames carry must be the same, and end where the old log ended; which older lines a frame carries
+    // is checkWindow's: the lobby's smaller head may bring back lines the final's frame guard left off)
     const oldPart = s.log.slice(0, s.log.length - fresh.length).map((e) => e.id);
-    if (canon(oldPart) !== canon(ps.log.map((e) => e.id).slice(ps.log.length - oldPart.length))) bad('the log was not kept');
+    const psIds = ps.log.map((e) => e.id);
+    const both = Math.min(oldPart.length, psIds.length);
+    if (canon(oldPart.slice(oldPart.length - both)) !== canon(psIds.slice(psIds.length - both)) || (psIds.length > 0 && oldPart.at(-1) !== psIds.at(-1))) bad('the log was not kept');
     if (fresh.length && fresh[0].id !== lastPs + 1) bad(`log ids jumped ${lastPs} -> ${fresh[0].id}`);
     if (!Array.isArray(s.airlocks) || s.airlocks.length) bad(`airlocks in the lobby: ${short(s.airlocks)}`);
   }
@@ -705,31 +919,39 @@ export class Checker {
   checkEjections(ps, s, fresh, bad) {
     const g = this.g;
     const out = [];
+    const lang = langOf(s);
+    const english = lang === 'en';
     const nameOf = (id) => { const p = playerById(s, id); return p ? p.name : id; };
     const resultChanged = s.lastVoteResult && !s.lastVoteResult.cancelled && canon(s.lastVoteResult) !== canon(ps.lastVoteResult);
     for (const p of s.players) {
       const q = playerById(ps, p.id);
       if (!q || q.status !== 'alive' || p.status !== 'ejected') continue;
-      const voteLine = fresh.some((e) => e.kind === 'eject' && (e.text === `${p.name} is ejected and stays in the forest`
-        || e.text.endsWith(`: ${p.name} is ejected and stays in the forest`)));
+      // §11 X5: the vote's eject line by key and params (English references: the words too)
+      const voteLine = fresh.some((e) => e.kind === 'eject' && e.key === 'log.eject' && e.params && e.params.p === p.id
+        && (!english || e.text === `${p.name} is ejected and stays in the forest` || e.text.endsWith(`: ${p.name} is ejected and stays in the forest`)));
       if (voteLine && (ps.phase === 'vote' || ps.phase === 'defense' || resultChanged)) { g.airlockVictims.delete(p.id); continue; }
       if (ps.phase !== 'reveal' && ps.phase !== 'discussion') { bad(`(x1) ${p.id} was ejected in ${ps.phase} without a vote line`); continue; }
       const open = (ps.airlocks || []).find((a) => a.targetId === p.id);
-      const m = fresh.map((e) => (e.kind === 'eject' ? AIRLOCK_SEALED_RE.exec(e.text) : null)).find((x) => x && x[3] === p.name);
+      const seal = fresh.find((e) => e.kind === 'eject' && e.key === 'log.airlockSeal' && e.params && e.params.t === p.id);
       if (!open) { bad(`(x1) ${p.id} was ejected outside a vote with no airlock open on them`); continue; }
-      if (!m) { bad(`(x1) ${p.id} left through the airlock without a "sealed the airlock" line`); continue; }
+      if (!seal) { bad(`(x1) ${p.id} left through the airlock without a "sealed the airlock" line`); continue; }
+      const m = { a: seal.params.a, by: Array.isArray(seal.params.by) ? seal.params.by : [] };
+      if (english) {
+        const t = AIRLOCK_SEALED_RE.exec(seal.text);
+        if (!t || t[1] !== nameOf(m.a) || t[2] !== m.by.map(nameOf).join(', ') || t[3] !== p.name) bad(`(x1) the English seal line does not name its players: ${short(seal.text)}`);
+      }
       if (open.round !== ps.round) bad(`(x1) the airlock on ${p.id} was opened in round ${open.round}, sealed in round ${ps.round}`);
-      const joiner = s.players.find((x) => x.name === m[1]);
+      const joiner = playerById(s, m.a);
       const jq = joiner ? playerById(ps, joiner.id) : null;
       if (!joiner || !jq || joiner.id === p.id || open.byIds.includes(joiner.id)) {
-        bad(`(x1) the airlock on ${p.id} was sealed by "${m[1]}", not by a second, different player (opened by ${open.byIds.join(',')})`);
+        bad(`(x1) the airlock on ${p.id} was sealed by "${m.a}", not by a second, different player (opened by ${open.byIds.join(',')})`);
       } else {
         if (jq.status !== 'alive') bad(`(x1) ${joiner.id} sealed an airlock while ${jq.status}`);
-        if (joiner.playedSpecials.length !== jq.playedSpecials.length + 1 || !isAirlockCard(joiner.playedSpecials[joiner.playedSpecials.length - 1])) {
+        if (joiner.playedSpecials.length !== jq.playedSpecials.length + 1 || !isAirlockCard(joiner.playedSpecials[joiner.playedSpecials.length - 1], lang)) {
           bad(`(x1) ${joiner.id} sealed the airlock on ${p.id} without playing an Airlock card now`);
         }
       }
-      if (m[2] !== open.byIds.map(nameOf).join(', ')) bad(`(x1) "sealed the airlock with ${m[2]}" but it was opened by ${open.byIds.join(',')}`);
+      if (canon(m.by) !== canon(open.byIds)) bad(`(x1) "sealed the airlock with ${m.by.join(', ')}" but it was opened by ${open.byIds.join(',')}`);
       g.airlockSealed++;
       g.airlockVictims.add(p.id);
       out.push(p.id);
@@ -742,6 +964,8 @@ export class Checker {
     const g = this.g;
     const now = Array.isArray(s.airlocks) ? s.airlocks : [];
     const before = Array.isArray(ps.airlocks) ? ps.airlocks : [];
+    const lang = langOf(s);
+    const english = lang === 'en';
     const nameOf = (id) => { const p = playerById(s, id); return p ? p.name : id; };
     const key = (a) => `${a.targetId}|${(a.byIds || []).join(',')}|${a.round}`;
     if (now.length && s.phase !== 'reveal' && s.phase !== 'discussion') bad(`(x1) ${now.length} airlock(s) open in ${s.phase}`);
@@ -765,26 +989,28 @@ export class Checker {
       const p = playerById(s, opener);
       if (ps.phase !== 'reveal' && ps.phase !== 'discussion') bad(`(x1) an airlock was opened in ${ps.phase}`);
       if (!q || q.status !== 'alive') bad(`(x1) the airlock on ${a.targetId} was opened by ${opener}, who was not alive`);
-      if (!p || !q || p.playedSpecials.length !== q.playedSpecials.length + 1 || !isAirlockCard(p.playedSpecials[p.playedSpecials.length - 1])) {
+      if (!p || !q || p.playedSpecials.length !== q.playedSpecials.length + 1 || !isAirlockCard(p.playedSpecials[p.playedSpecials.length - 1], lang)) {
         bad(`(x1) the airlock on ${a.targetId} opened without ${opener} playing an Airlock card now`);
       }
+      // §11 X5: by key and params (the Z5 overtime wording is the `ot` param); English references: the words too
       const line = `🚪 ${nameOf(opener)} started cycling the airlock on ${nameOf(a.targetId)}. If one more Airlock card is played on ${nameOf(a.targetId)} before ${s.overtime ? 'the overtime discussion ends' : "this round's discussion ends"}, ${nameOf(a.targetId)} is out — no vote.`;
-      if (!fresh.some((e) => e.kind === 'special' && e.text === line)) bad(`(x1) no "started cycling the airlock" line for the airlock on ${a.targetId}`);
+      if (!fresh.some((e) => e.kind === 'special' && e.key === 'log.airlockStart' && e.params && e.params.a === opener && e.params.t === a.targetId
+        && e.params.ot === s.overtime && (!english || e.text === line))) bad(`(x1) no "started cycling the airlock" line for the airlock on ${a.targetId}`);
     }
     for (const a of before) {
       if (nowKeys.has(key(a)) || sealed.includes(a.targetId)) continue;
       const t = playerById(s, a.targetId);
       const jam = `🚪 The airlock on ${nameOf(a.targetId)} jammed — nobody closed it.`;
-      const jamAt = fresh.findIndex((e) => e.kind === 'special' && e.text === jam);
+      const jamAt = fresh.findIndex((e) => e.kind === 'special' && e.key === 'log.airlockJam' && e.params && e.params.t === a.targetId && (!english || e.text === jam));
       if (jamAt < 0) bad(`(x1) the airlock on ${a.targetId} closed unsealed without a "jammed" line`);
       else {
         g.airlockJammed++;
         // §11 Y1: a target who left or was kicked: the jammed line comes right after that line (before, say, a new
         // host's line); unless that ended the game, when it comes after "The bunker door closes" (and other jams).
-        const prev = jamAt > 0 ? fresh[jamAt - 1].text : '';
-        const gone = [`${nameOf(a.targetId)} left the game`, `${nameOf(a.targetId)} was removed by the host`];
-        const afterDoor = s.phase === 'final' && (prev.startsWith('The bunker door closes') || /^🚪 The airlock on .+ jammed — nobody closed it\.$/u.test(prev));
-        if (t && t.status === 'left' && !gone.includes(prev) && !afterDoor) bad(`(y1) the airlock on ${a.targetId}, who left, jammed after ${short(prev)} instead of right after the leave/kick line`);
+        const prev = jamAt > 0 ? fresh[jamAt - 1] : null;
+        const gone = !!prev && ['log.leftGame', 'log.kicked'].includes(prev.key) && prev.params && prev.params.p === a.targetId;
+        const afterDoor = s.phase === 'final' && !!prev && ['log.doorCloses', 'log.airlockJam'].includes(prev.key);
+        if (t && t.status === 'left' && !gone && !afterDoor) bad(`(y1) the airlock on ${a.targetId}, who left, jammed after ${short(prev ? prev.text : '')} instead of right after the leave/kick line`);
       }
       if (!(discEnded || s.phase === 'final' || !t || t.status !== 'alive')) bad(`(x1) the airlock on ${a.targetId} jammed while its discussion was running and its target alive`);
     }
@@ -946,17 +1172,19 @@ export class Checker {
     if (this.checkDeal) {
       // §11 X1 deal: the final shows every hand (played + unplayed), so the fixed cards can be counted exactly
       const [wantA, wantR] = x1Deal(g.n);
+      const lang = langOf(s);
       let holdersA = 0;
       let holdersR = 0;
       for (const p of s.players) {
         const hand = [...p.playedSpecials, ...(p.unplayedSpecials || [])];
-        const a = hand.filter(isAirlockCard).length;
-        const r = hand.filter((c) => sameCard(c, REVIVE_CARD)).length;
+        const a = hand.filter((c) => isAirlockCard(c, lang)).length;
+        const r = hand.filter((c) => isReviveCard(c, lang)).length;
         if (a > 1 || r > 1 || (a && r)) bad(`(x1) ${p.id} was dealt ${a} Airlock(s) and ${r} revive(s)`);
         holdersA += a ? 1 : 0;
         holdersR += r ? 1 : 0;
         for (const c of hand) {
-          if ((c.title === AIRLOCK_CARD.title && !isAirlockCard(c)) || (c.title === REVIVE_CARD.title && !sameCard(c, REVIVE_CARD))) {
+          // an English view names the fixed cards: a random card must not look like one (§11 X5: other languages by id)
+          if (lang === 'en' && ((c.title === AIRLOCK_CARD.title && !isAirlockCard(c, lang)) || (c.title === REVIVE_CARD.title && !isReviveCard(c, lang)))) {
             bad(`(x1) ${p.id} holds a "${c.title}" that is not the fixed card (the random deck dealt it): ${short(c.text)}`);
           }
         }
@@ -1016,10 +1244,24 @@ export class Checker {
     return diffPaths(JSON.parse(this.fpJson.get(a)), JSON.parse(this.fpJson.get(b))).join('; ');
   }
 
-  /** (b): walks the reference stream; for every public state checks every public card against its owner's hand at
-   * that same broadcast, and scans new log entries for the text of any card that is still hidden. */
+  /**
+   * (b): walks each leak reference stream (the reference, and one per extra language, §11 X5); for every public state
+   * checks every public card against its owner's hand at that same broadcast (in the stream's language), and scans new
+   * log entries (text, parts and params) for the text of any card that is still hidden.
+   */
   scanLeaks() {
-    const current = new Map(); // pid -> cards (the latest own view known at this point of the stream)
+    const stats = { logEntriesScanned: 0, slotsChecked: 0, streams: [] };
+    for (const c of this.leakRefs) {
+      const r = this.scanStream(c);
+      stats.logEntriesScanned += r.scanned;
+      stats.slotsChecked += r.slotsChecked;
+      stats.streams.push({ label: c.label, lang: c.leak.lang, states: c.leak.seq.length, scanned: r.scanned, slots: r.slotsChecked });
+    }
+    this.leakStats = stats;
+  }
+
+  scanStream(c) {
+    const current = new Map(); // pid -> cards (the latest own view known at this point of the stream, in its language)
     const everPublic = [];
     const everPublicSet = new Set();
     const ambiguous = new Map();
@@ -1039,50 +1281,58 @@ export class Checker {
       ambiguous.set(text, { yes: false, upTo: from });
       return false;
     };
-    for (const e of this.refSeq) {
-      const json = this.fpJson.get(e.fp);
-      for (const tok of this.tokens) if (json.includes(tok)) this.v('(b) a token appears in a public state');
-      if (json.includes('"notes"')) this.v('(b) a public state contains a "notes" field');
+    const tag = this.leakRefs.length > 1 ? ` [${c.label}, ${c.leak.lang}]` : '';
+    for (const e of c.leak.seq) {
+      const json = e.json || this.fpJson.get(e.fp);
+      for (const tok of this.tokens) if (json.includes(tok)) this.v(`(b) a token appears in a public state${tag}`);
+      if (json.includes('"notes"')) this.v(`(b) a public state contains a "notes" field${tag}`);
       const s = JSON.parse(json);
-      if (s.phase === 'lobby') { current.clear(); lastPhase = 'lobby'; lastLogId = s.log.length ? s.log[s.log.length - 1].id : lastLogId; continue; }
+      const lang = e.lang;
+      const [last] = Array.isArray(s.log) ? s.log : [0];
+      if (s.phase === 'lobby') { current.clear(); lastPhase = 'lobby'; lastLogId = Math.max(lastLogId, last); continue; }
       if (lastPhase === 'lobby' || lastPhase === null) current.clear();
       lastPhase = s.phase;
       for (const p of s.players) {
         const m = this.meByFp.get(p.id);
-        const exact = m && m.get(e.fp);
+        const byLang = m && m.get(e.fp);
+        const exact = byLang && byLang[lang];
         if (exact) current.set(p.id, exact.cards);
         for (const k of CATEGORY_IDS) {
           const t = p.cards[k];
           if (t !== null && !everPublicSet.has(t)) { everPublicSet.add(t); everPublic.push(t); }
           if (s.phase === 'final' || !exact) continue;
           slotsChecked++;
-          if (t !== null && (!exact.cards[k].revealed || exact.cards[k].text !== t)) this.v(`(b) public ${p.id}.${k}=${short(t)} but the owner's hand says ${short(exact.cards[k])}`);
-          if (t === null && exact.cards[k].revealed) this.v(`(b) ${p.id}.${k} revealed in the owner's hand but null in public`);
+          if (t !== null && (!exact.cards[k].revealed || exact.cards[k].text !== t)) this.v(`(b) public ${p.id}.${k}=${short(t)} but the owner's hand says ${short(exact.cards[k])}${tag}`);
+          if (t === null && exact.cards[k].revealed) this.v(`(b) ${p.id}.${k} revealed in the owner's hand but null in public${tag}`);
         }
       }
-      if (s.phase === 'final') { lastLogId = s.log.length ? s.log[s.log.length - 1].id : lastLogId; continue; }
+      if (s.phase === 'final') { lastLogId = Math.max(lastLogId, last); continue; }
       const staticText = [s.catastrophe && s.catastrophe.title, s.catastrophe && s.catastrophe.text, ...(s.catastrophe ? s.catastrophe.details : []),
         s.bunker && JSON.stringify(s.bunker), ...s.players.map((p) => p.name), ...s.spectators.map((x) => x.name),
         ...s.players.flatMap((p) => p.playedSpecials.map((x) => `${x.title} ${x.text}`))].join('\n');
-      const fresh = s.log.filter((l) => l.id > lastLogId);
-      if (fresh.length) {
-        lastLogId = fresh[fresh.length - 1].id;
-        const logText = fresh.map((l) => l.text).join('\n');
-        for (const p of s.players) {
-          const own = current.get(p.id);
-          if (!own) continue;
-          for (const k of CATEGORY_IDS) {
-            if (p.cards[k] !== null || own[k].revealed) continue;
-            const secret = own[k].text;
-            if (!logText.includes(secret)) continue;
-            if (isAmbiguous(secret, staticText)) continue;
-            this.v(`(b) LEAK: the hidden ${p.id}.${k} ${short(secret)} appears in the public log: ${short(fresh.map((l) => l.text).filter((x) => x.includes(secret)))}`);
-          }
-        }
-        scanned += fresh.length;
+      const fresh = [];
+      for (let id = lastLogId + 1; id <= last; id++) {
+        const entry = c.leak.log.get(id);
+        if (entry) fresh.push(entry);
       }
+      lastLogId = Math.max(lastLogId, last);
+      if (!fresh.length) continue;
+      // the text, and the parts and params as JSON (a card chip's words and every param are sent too)
+      const logText = fresh.map((l) => `${l.text}\n${l.blob}`).join('\n');
+      for (const p of s.players) {
+        const own = current.get(p.id);
+        if (!own) continue;
+        for (const k of CATEGORY_IDS) {
+          if (p.cards[k] !== null || own[k].revealed) continue;
+          const secret = own[k].text;
+          if (!logText.includes(secret) && !logText.includes(JSON.stringify(secret).slice(1, -1))) continue;
+          if (isAmbiguous(secret, staticText)) continue;
+          this.v(`(b) LEAK: the hidden ${p.id}.${k} ${short(secret)} appears in the public log${tag}: ${short(fresh.map((l) => l.text).filter((x) => x.includes(secret)))}`);
+        }
+      }
+      scanned += fresh.length;
     }
-    this.leakStats = { logEntriesScanned: scanned, slotsChecked };
+    return { scanned, slotsChecked };
   }
 
   report() {
@@ -1116,6 +1366,13 @@ export class Checker {
  * scenario(ctx) may register hooks: ctx.onRef((s, prev) => ...) runs on every reference state; ctx.task(promise) tracks
  * async work; ctx.fail(msg) records a violation. ctx.bots[i], ctx.host, ctx.watcher, ctx.addClient(bot), ctx.mkBot().
  * ctx.afterPlayAgain(state) / ctx.afterEndGame(state) run in the lobby after Play again / after the host ended a game.
+ *
+ * §11 X5 languages: `langs` gives bot i its language (a function of i, an array cycled over, or one language; default
+ * 'en'), `watcherLang` the reference's; every other language in play gets a spectator watcher of its own for the leak
+ * scan. `toggleLang` {bot, every}: bot index `bot` switches its language with setLang after every `every` actions.
+ * With more than one language in play the Checker compares public states `neutral`ly (language-free).
+ * `names`: bot i's name (a function of i, or an array; default BOT_NAMES), e.g. botlib realNames for a real table's
+ * long names (§11 X5.2: they are what fills a frame to its budget).
  */
 export async function runTable(server, {
   n, seed = 1, specials = 0, specialsFromRound = 1, delay = 0, games = 1, label = `N=${n}`, scenario = null, timeoutMs = 40000, stallMs = 5000,
@@ -1123,45 +1380,64 @@ export async function runTable(server, {
   endWith = 'close', // 'close': every socket just closes (the room waits for the idle TTL); 'leave': everyone sends leave first
   endGame = 0, // SPEC §11 X6: chance per game that the bot host presses End game at a random moment (the game then counts
   //              as played, ended by the host, and the next one starts from the lobby)
+  langs = 'en', watcherLang = 'en', toggleLang = null, neutral = null, names = null,
 } = {}) {
+  const nameFor = (i) => (typeof names === 'function' ? names(i) : Array.isArray(names) ? names[i % names.length]
+    : BOT_NAMES[i % BOT_NAMES.length] + (i >= BOT_NAMES.length ? ` ${i}` : ''));
+  const langFor = (i) => (typeof langs === 'function' ? langs(i) : Array.isArray(langs) ? langs[i % langs.length] : langs) || 'en';
+  const inPlay = new Set([watcherLang, ...Array.from({ length: n }, (_, i) => langFor(i))]);
+  if (toggleLang) for (const l of ['en', 'ru']) inPlay.add(l);
   const coord = new Coordinator();
-  const checker = new Checker({ label, strictSpecialsFree: specials === 0 && !scenario });
+  const checker = new Checker({ label, strictSpecialsFree: specials === 0 && !scenario, neutral: neutral ?? inPlay.size > 1 });
   const bots = [];
   const extras = [];
   const tasks = [];
   const refHooks = [];
+  const watchers = [];
   const mkBot = (name, extra = {}) => {
     const b = new Bot({ url: server.url, name, seed: `${seed}:${name}`, delay, specials, specialsFromRound, coordinator: coord, log,
       ...botOpts, ...extra, host: { delay: 0, discussionDelay: 2, endGame, ...(botOpts.host || {}), ...(extra.host || {}) } });
     return b;
   };
+  const botLangOpts = (i) => {
+    const o = { lang: langFor(i) };
+    if (toggleLang && toggleLang.bot === i) o.toggleLang = toggleLang.every || 5;
+    return o;
+  };
   const ctx = {
-    server, checker, coord, bots, extras, mkBot, room: null, host: null, watcher: null,
+    server, checker, coord, bots, extras, mkBot, room: null, host: null, watcher: null, watchers,
     onRef: (fn) => refHooks.push(fn),
     task: (p) => { tasks.push(Promise.resolve(p).catch((e) => checker.v(`scenario task failed: ${e.stack || e}`))); return p; },
     fail: (m) => checker.v(`scenario: ${m}`),
     addClient: (b) => { extras.push(b); checker.attach(b); return b; },
     addBot: (b) => { bots.push(b); checker.attach(b); return b; },
   };
-  const closeAll = () => { for (const b of [...bots, ...extras, ctx.watcher]) if (b) b.close(); };
+  const closeAll = () => { for (const b of [...bots, ...extras, ctx.watcher, ...watchers]) if (b) b.close(); };
   try {
-    const host = mkBot(BOT_NAMES[0]);
+    const host = mkBot(nameFor(0), botLangOpts(0));
     bots.push(host);
     checker.attach(host);
     await host.create();
     ctx.host = host;
     ctx.room = host.room;
-    const watcher = new Bot({ url: server.url, name: 'Watcher', autoplay: false });
+    const watcher = new Bot({ url: server.url, name: 'Watcher', autoplay: false, lang: watcherLang });
     ctx.watcher = watcher;
     checker.attach(watcher, { reference: true });
     await watcher.join(host.room, { spectator: true });
+    // §11 X5: a watcher per other language, so the leak scan pairs every hand with a stream in its own language
+    for (const l of [...inPlay].filter((x) => x !== watcherLang)) {
+      const w = new Bot({ url: server.url, name: `Watcher ${l}`, autoplay: false, lang: l });
+      watchers.push(w);
+      checker.attach(w, { leakRef: true });
+      await w.join(host.room, { spectator: true });
+    }
     watcher.on('state', (s, prev) => {
       for (const fn of refHooks) {
         try { fn(s, prev); } catch (e) { checker.v(`scenario hook threw: ${e.stack}`); }
       }
     });
     for (let i = 1; i < n; i++) {
-      const b = mkBot(BOT_NAMES[i % BOT_NAMES.length] + (i >= BOT_NAMES.length ? ` ${i}` : ''));
+      const b = mkBot(nameFor(i), botLangOpts(i));
       bots.push(b);
       checker.attach(b);
       await b.join(host.room);
@@ -1190,7 +1466,9 @@ export async function runTable(server, {
         const hb = connectedHost();
         if (!hb) throw new Error('no connected host bot to press Play again');
         await quiesce(ctx);
-        hb.act({ t: 'playAgain' });
+        // The host bot's own End game, rolled in a running phase, may have landed on the final instead, where it is Play
+        // again (SPEC §11 X6): then the table is in the lobby already, and a second Play again would be wrong_phase.
+        if (!(watcher.state && watcher.state.phase === 'lobby')) hb.act({ t: 'playAgain' });
         await watcher.waitFor((s) => s.phase === 'lobby', 5000, 'the lobby after Play again');
         ctx.afterPlayAgain && (await ctx.afterPlayAgain(watcher.state));
       }
@@ -1232,7 +1510,7 @@ export async function runTable(server, {
 /** Every connected bot sends `leave` (the watcher last); each leave is confirmed on the watcher's view. */
 async function leaveAll(ctx) {
   const w = ctx.watcher;
-  for (const b of [...ctx.bots, ...ctx.extras]) {
+  for (const b of [...ctx.bots, ...ctx.extras, ...(ctx.watchers || [])]) {
     if (!b || !b.connected || b.left || b.kicked || b.replaced || !b.id) continue;
     const id = b.id;
     b.leave();
@@ -1298,9 +1576,9 @@ export async function quiesce(ctx, timeoutMs = 3000) {
   const t0 = Date.now();
   let stableSince = null;
   for (;;) {
-    const all = [...ctx.bots, ...ctx.extras, ctx.watcher].filter((b) => b && b.connected && !b.left && !b.kicked && !b.replaced && b.state);
+    const all = [...ctx.bots, ...ctx.extras, ctx.watcher, ...(ctx.watchers || [])].filter((b) => b && b.connected && !b.left && !b.kicked && !b.replaced && b.state);
     const busy = all.some((b) => b.fifo.length || b.timer);
-    const fps = new Set(all.map((b) => JSON.stringify(publicPart(b.state))));
+    const fps = new Set(all.map((b) => publicKey(b.state, ctx.checker.neutral)));
     if (!busy && fps.size <= 1) {
       if (stableSince === null) stableSince = Date.now();
       if (Date.now() - stableSince >= 40) return;

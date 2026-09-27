@@ -7,7 +7,8 @@
 // failed join/resume lookups), BUNKER_TRUST_PROXY (=1: behind a reverse proxy on this host, SPEC §11 X2; a socket whose
 // TCP peer is loopback counts as the last address in its X-Forwarded-For for every per-IP limit).
 // BUNKER_DEV (=1: dev mode, SPEC §11 X9: test shortcuts, see server/dev.js; never set in production, and refused
-// together with BUNKER_TRUST_PROXY=1 or NODE_ENV=production).
+// together with BUNKER_TRUST_PROXY=1 or NODE_ENV=production). BUNKER_WS_DEFLATE (=1: permessage-deflate on /ws, =0: off;
+// off by default, SPEC §11 X5.15: see WS_DEFLATE).
 // Once listening, prints `BUNKER_LISTENING <port>` and `listening on http://<host>:<port>` to stdout, then in dev mode
 // DEV_BANNER.
 // HTTP: GET /healthz -> ok; GET /stats -> {"rooms","activeGames","sockets"} only for a request made on this host (a
@@ -29,6 +30,39 @@ export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url
 
 export const CSP = "default-src 'self'; connect-src 'self' ws: wss:; img-src 'self' data:; style-src 'self' 'unsafe-inline'";
 export const MAX_PAYLOAD = 8 * 1024;
+
+/**
+ * §11 X5.15: permessage-deflate (RFC 7692) on /ws, when BUNKER_WS_DEFLATE turns it on (configFromEnv). Tuned with
+ * tools/bench-broadcast.js on one core at 16 players + 50 spectators (reports/ws-compression.md):
+ *   - zlib level 1, memLevel 8 (zlib's default): level 2 took ~4% more CPU for ~8% fewer bytes; memLevel 5 saves ~55 KB
+ *     per socket for ~3% more bytes; a smaller window costs more CPU and more bytes (12 bits: ~1.5× the CPU, 10: ~2.7×);
+ *   - server_no_context_takeover: every message is compressed on its own, so nothing sent earlier on the socket (the
+ *     `joined` token) is ever in the window of a later message that carries other people's names (a CRIME-style size
+ *     oracle), and a message under `threshold` goes out as it is (ws decides on its first fragment). Context takeover
+ *     would save ~5% of the bytes and no memory: ws keeps the deflater and only resets it;
+ *   - no server_max_window_bits / client_max_window_bits: every browser's offer is accepted as it is made (with a number
+ *     here, ws fails the handshake of an offer that lacks the parameter);
+ *   - concurrencyLimit 10 (ws's own default; the limiter is process-wide): on one core, 1 cost ~20% more CPU per
+ *     broadcast and ~15% more wall time.
+ * MAX_PAYLOAD still bounds a client's message after inflating (1009).
+ */
+export const WS_DEFLATE = Object.freeze({
+  zlibDeflateOptions: Object.freeze({ level: 1, memLevel: 8 }),
+  serverNoContextTakeover: true,
+  threshold: 1024,
+  concurrencyLimit: 10,
+});
+
+/**
+ * Whether /ws offers permessage-deflate when BUNKER_WS_DEFLATE is neither "1" nor "0": no. On one core a 16 + 50
+ * broadcast then costs 3.2-3.9× the pre-X5 CPU (the X5.2 budget is 1×) for 5× fewer bytes (§11 X5.15).
+ */
+export const WS_DEFLATE_DEFAULT = false;
+
+/** The WebSocketServer's `perMessageDeflate` option: false, or a fresh copy of WS_DEFLATE. */
+export function wsDeflateOption(on) {
+  return on ? { ...WS_DEFLATE, zlibDeflateOptions: { ...WS_DEFLATE.zlibDeflateOptions } } : false;
+}
 const RATE_PER_SEC = 20;
 const BURST_WINDOW_MS = 10_000;
 const BURST_MAX = 200;
@@ -93,6 +127,8 @@ export function configFromEnv(env = process.env) {
     // §11 X9: exactly "1", like the other switches. `production` only guards against dev mode on the production unit.
     dev: env.BUNKER_DEV === '1',
     production: env.NODE_ENV === 'production',
+    // §11 X5.15: permessage-deflate on /ws (WS_DEFLATE): "1" on, "0" off, anything else the default (WS_DEFLATE_DEFAULT)
+    wsDeflate: env.BUNKER_WS_DEFLATE === '1' ? true : env.BUNKER_WS_DEFLATE === '0' ? false : WS_DEFLATE_DEFAULT,
   };
 }
 
@@ -180,6 +216,21 @@ export function statsAllowed(peer, headers) {
   if (!isLoopback(peer)) return false;
   const h = headers && typeof headers === 'object' ? headers : {};
   return FORWARDING_HEADERS.every((k) => h[k] === undefined);
+}
+
+/**
+ * §11 X5.2: sends UTF-8 chunks as ONE WebSocket text message, each chunk a fragment (RFC 6455 §5.4; every browser and
+ * `ws` reassemble them). The chunks are handed to the socket as they are, so a buffer shared by many recipients (the
+ * log, rooms.js) is neither copied nor re-encoded per recipient; `ws.send(string)` would encode the whole frame for each
+ * one, a fresh 100–180 KB allocation per recipient per broadcast. Safe because the fragments go out back to back: the
+ * calls are synchronous, and with perMessageDeflate off (and no Blob ever sent) `ws` writes each one at once, so no
+ * other message can come between them. With permessage-deflate on (§11 X5.15), `ws` compresses the fragments in order
+ * through the socket's one deflater and queues every later send behind them, so the order holds there too (ws decides
+ * whether to compress the message on its first fragment, the head, against WS_DEFLATE.threshold).
+ */
+export function sendFragments(ws, chunks) {
+  const last = chunks.length - 1;
+  for (let i = 0; i <= last; i++) ws.send(chunks[i], { binary: false, fin: i === last });
 }
 
 function sendText(res, status, text, extra = {}) {
@@ -401,7 +452,7 @@ export async function startServer(options = {}) {
     else socket.destroy();
   });
 
-  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD, perMessageDeflate: false, clientTracking: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD, perMessageDeflate: wsDeflateOption(cfg.wsDeflate === true), clientTracking: true });
   const perIp = new Map();
 
   server.on('upgrade', (req, socket, head) => {
@@ -433,6 +484,11 @@ export async function startServer(options = {}) {
       secCount: 0,
       send(obj) {
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+      },
+      // §11 X5.2: a state as the UTF-8 chunks of one JSON frame (rooms.js: this recipient's head, then the log's bytes,
+      // encoded once per language and shared by every recipient of it)
+      sendChunks(chunks) {
+        if (ws.readyState === ws.OPEN) sendFragments(ws, chunks);
       },
     };
     ws._bunkerConn = conn;
@@ -512,15 +568,31 @@ export async function startServer(options = {}) {
   };
 }
 
+/**
+ * The process-wide handlers of a server run from the command line: an error nothing else caught is logged to stderr
+ * instead of killing every room. A write to stdout or stderr after the process reading them has gone (a harness or a
+ * terminal that exited; production's journald never goes) fails with EPIPE, which the stream reports as an 'error'
+ * event. Unheard, that event is itself an uncaught exception, whose handler writes to stderr again, fails again, and so
+ * on: an orphaned server spun at ~80% of a core for hours. So a failed log write is dropped (the stream's 'error'
+ * listener), and the handler never throws.
+ */
+export function installProcessHandlers(proc = process) {
+  const drop = () => {};
+  proc.stdout.on('error', drop);
+  proc.stderr.on('error', drop);
+  const say = (line) => { try { proc.stderr.write(line); } catch { /* nowhere left to say it */ } };
+  proc.on('uncaughtException', (e) => say(`[bunker] uncaught: ${e?.stack || e}\n`));
+  proc.on('unhandledRejection', (e) => say(`[bunker] unhandled rejection: ${e?.stack || e}\n`));
+}
+
 if (import.meta.main) {
-  process.on('uncaughtException', (e) => { process.stderr.write(`[bunker] uncaught: ${e?.stack || e}\n`); });
-  process.on('unhandledRejection', (e) => { process.stderr.write(`[bunker] unhandled rejection: ${e?.stack || e}\n`); });
+  installProcessHandlers();
   const cfg = configFromEnv();
   startServer(cfg).then((srv) => {
     process.stdout.write(`BUNKER_LISTENING ${srv.port}\n`);
     process.stdout.write(`listening on ${srv.url}\n`);
     if (cfg.dev) process.stdout.write(`${DEV_BANNER}\n`);
-    process.stderr.write(`[bunker] public dir ${cfg.publicDir}; min players ${cfg.minPlayers}${cfg.seed !== null ? `; seed ${cfg.seed}` : ''}${cfg.noLimits ? '; limits OFF' : ''}${cfg.trustProxy ? '; trusting X-Forwarded-For from loopback' : ''}${cfg.dev ? '; DEV MODE (test shortcuts at /dev)' : ''}\n`);
+    process.stderr.write(`[bunker] public dir ${cfg.publicDir}; min players ${cfg.minPlayers}${cfg.seed !== null ? `; seed ${cfg.seed}` : ''}${cfg.noLimits ? '; limits OFF' : ''}${cfg.trustProxy ? '; trusting X-Forwarded-For from loopback' : ''}${cfg.wsDeflate ? '; WebSocket permessage-deflate on' : ''}${cfg.dev ? '; DEV MODE (test shortcuts at /dev)' : ''}\n`);
     const stop = () => { srv.close().finally(() => process.exit(0)); setTimeout(() => process.exit(0), 2000).unref(); };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);

@@ -30,6 +30,8 @@ function started(names, specials = {}) {
   return { g, ids };
 }
 const ok = (r) => assert.deepEqual(r, { ok: true }, JSON.stringify(r));
+/** A log as a server from before X5 sent it: no key, params or parts (the client reads the English text). */
+const textOnly = (log) => log.map(({ key, params, parts, ...e }) => e);
 const uid = (g, id, effect) => g.players.find((p) => p.id === id).specials.find((x) => x.effect === effect && !x.used).uid;
 /** Every vote goes to the last candidate (the voter excepted); the host presses Next otherwise. `hook(g)` runs first
  * on every step and returns true when it acted. */
@@ -130,6 +132,9 @@ describe('client f2: the round track reads what each played vote did (SPEC §11,
       return false;
     });
     const h = voteHistory(g.view(ids[5]).log);
+    // (SPEC §11 X5.3: the keys, the English text without keys and a Russian view all read the same history)
+    assert.deepEqual([...voteHistory(textOnly(g.view(ids[5]).log))], [...h]);
+    assert.deepEqual([...voteHistory(g.view(ids[5], 'ru').log)], [...h]);
     assert.deepEqual([...h.keys()], [1, 2, 3, 4, 5, 6, 7, 'OT']);
     for (const r of [1, 2, 3, 4]) assert.deepEqual(h.get(r), { out: 0, cancelled: false, due: 0 }, `round ${r}`);
     assert.deepEqual(h.get(5), { out: 0, cancelled: true, due: 1 });
@@ -152,12 +157,15 @@ describe('client f2: the round track reads what each played vote did (SPEC §11,
     assert.equal(g.players.find((p) => p.id === ids[3]).status, 'ejected');
     const log = g.view(ids[2]).log;
     assert.deepEqual(voteHistory(log).get(2), { out: 0, cancelled: false, due: 0 });
-    // a name that reads like a vote line or an ejection changes nothing (only the server's shapes with a round prefix)
-    const hostile = log.map((e) => ({ ...e, text: e.text.split('Cy').join('is ejected and stays in the forest') }));
+    assert.deepEqual([...voteHistory(textOnly(log))], [...voteHistory(log)]);
+    // a name that reads like a vote line or an ejection changes nothing (only the server's shapes with a round prefix;
+    // the text path, a line without a key)
+    const hostile = textOnly(log).map((e) => ({ ...e, text: e.text.split('Cy').join('is ejected and stays in the forest') }));
     assert.deepEqual([...voteHistory(hostile)], [...voteHistory(log)]);
     // the lines of round 1 cut off (the log keeps the last 200): round 1 is absent, the caller uses its plan
     const cut = log.slice(log.findIndex((e) => /^Round 2 of /.test(e.text)));
     assert.deepEqual([...voteHistory(cut).keys()], [2]);
+    assert.deepEqual([...voteHistory(textOnly(cut)).keys()], [2]);
     // a new game after Play again starts the history afresh
     playOut(g);
     ok(g.handle(g.hostId, { t: 'playAgain' }));

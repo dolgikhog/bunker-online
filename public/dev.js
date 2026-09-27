@@ -163,6 +163,8 @@ function inRoom(seat) { return !!(seat && seat.ready && seat.state && seat.statu
 function hostSeat() { return seatsInOrder().find((s) => inRoom(s) && s.state.you.isHost) || null; }
 function opSeat() { return hostSeat() || seatsInOrder().find(inRoom) || null; }
 function viewState() { const s = hostSeat() || opSeat(); return s ? s.state : null; }
+/** The language of a seat's page ('en' until its state says otherwise). */
+function seatLang(seat) { const l = seat && seat.state && seat.state.you ? seat.state.you.lang : null; return typeof l === 'string' && l ? l : 'en'; }
 function godSeat() { return seatsInOrder().find((s) => inRoom(s) && s.state.god && typeof s.state.god === 'object') || null; }
 
 /* ------------------------------------------------------------------ sound: one seat reads the catastrophe (see the top) */
@@ -235,7 +237,8 @@ window.addEventListener('message', (e) => {
       // `replaced`: this seat was opened in another tab (↗), which is what that button is for; ⟳ takes it back
       if (m.code === 'replaced') { logLine(seat, 'opened in another tab: this frame stopped (⟳ takes the seat back)'); break; }
       seat.errors++;
-      logLine(seat, `✖ ${m.code}: ${m.message}`, 'err');
+      // (the message is in the seat's language, SPEC §11 X5.1: a seat switched to Russian says so, in this English log)
+      logLine(seat, `✖ ${m.code}${seatLang(seat) !== 'en' ? ` [${seatLang(seat)}]` : ''}: ${m.message}`, 'err');
       if (m.code === 'no_room' && T.room && seat.status && !seat.status.room) logLine(null, `room ${T.room} is gone (a server restart?): press New test game`, 'err');
       break;
     default: return;
@@ -562,7 +565,10 @@ function renderGod(gs) {
   const sig = JSON.stringify([g, s.players.map((p) => [p.id, p.status, p.cards])]);
   if (ui.godPanel.dataset.sig === sig) return;
   ui.godPanel.dataset.sig = sig;
-  const cats = Array.isArray(s.categories) && s.categories.length ? s.categories : CATS_FALLBACK;
+  // the columns in the seat's order, named in English like the rest of this table: the god view's texts are English
+  // (server godView), while the seat's own categories[].label follow its language (a seat switched to Russian)
+  const cats = (Array.isArray(s.categories) && s.categories.length ? s.categories : CATS_FALLBACK)
+    .map((c) => ({ id: c.id, label: (CATS_FALLBACK.find((f) => f.id === c.id) || c).label }));
   let hidden = 0;
   const rows = s.players.map((p) => {
     const gp = g[p.id] || {};

@@ -6,10 +6,18 @@
  * through data-act attributes. */
 
 import { KICKS, estimateGame, airlockDeal } from './kicks.js';
-import { airlockLine, parseSpecialLine, cardLine, finalCause, isLeaveLine, voteHistory } from './loglines.js';
+import {
+  airlockLine, parseSpecialLine, cardLine, finalCause, isLeaveLine, voteHistory,
+  keyed, airlockOf, isEndGameLine, isGameStartLine, isRoundOneLine, hostChangeOf, revealOf, flashParts, partsText, partName,
+} from './loglines.js';
 import { PROFILE, pkey, withProfile } from './profile.js';
-import { STR } from './strings.js';
 import { appVersion, loadVersion, issueUrl, ideaUrl } from './feedback.js';
+// SPEC §11 X5.7: every string on screen comes from public/i18n (en.js, ru.js). `tr` and `trn` are i18n's t() and tn():
+// this file names the turn `t` everywhere, so the translator gets names that nothing here shadows.
+import {
+  initLang, onLang, lang as uiLang, setLang as commitDict, saveLang, langStorageKey, t as tr, tn as trn, tIn as trIn, catLabel as dictCat, has as hasKey, latinCode,
+} from './i18n/index.js';
+import { list as fmtList, normLang } from './i18n/core.js';
 
 const params = new URLSearchParams(location.search);
 const MOCK = params.has('mock') ? (params.get('mock') || 'index') : null;
@@ -24,7 +32,6 @@ const ID_KEY = 'bunker.identity';
 const NAME_KEY = 'bunker.name';
 const PREFS_KEY = 'bunker.b.prefs';
 const GAME_PHASES = ['reveal', 'discussion', 'vote', 'defense'];
-const PHASE_LABEL = { lobby: 'Lobby', reveal: 'Reveals', discussion: 'Discussion', vote: 'Vote', defense: 'Defense', final: 'Final' };
 const LOG_GLYPH = { system: '::', reveal: '◆', special: '✦', vote: '▣', eject: '✖', info: '·' };
 // Double-send guard: after sending a turn-advancing action (reveal, End turn, Next, Close vote, Start, Play again) those
 // buttons stay disabled until the answer arrives AND at least LOCK_MS have passed, so a double click (or two quick taps)
@@ -38,7 +45,8 @@ const GUARD_MS = 350;
 const VOTE_HOLD_MS = 1100;
 // Liveness (a phone that switches networks keeps a dead socket that never closes): any send expects an answer within
 // ANSWER_MS, an idle socket is pinged every PING_EVERY_MS and must answer within PING_WAIT_MS, and a socket that is still
-// not joined CONNECT_MS after it was opened is given up and retried.
+// not joined CONNECT_MS after it was opened is given up and retried. On a slow link the waits for an answer grow by the
+// time a state takes to arrive there (waitMs(), "the link's speed" below).
 const ANSWER_MS = 4000;
 const PING_EVERY_MS = 5000;
 const PING_WAIT_MS = 8000;
@@ -59,11 +67,13 @@ const SHIELD_ACTS = new Set(['picker-confirm', 'picker-cancel', 'rules-close', '
 // opened for ends or ejects someone (the card would silently apply to the next vote instead).
 const STEP_SENSITIVE = new Set(['cancel_vote', 'double_vote']);
 const BRIEF_KEY = 'bunker.briefed';
+// (the names are preset.<id>; the hint reads the values)
 const TIMER_PRESETS = [
-  { id: 'quick', label: 'Quick', hint: 'turns 20 s · talk 60 s', v: { speechSeconds1: 40, speechSeconds: 20, discussionSeconds: 60, defenseSeconds: 20 } },
-  { id: 'standard', label: 'Standard', hint: 'turns 30 s · talk 90 s', v: { speechSeconds1: 60, speechSeconds: 30, discussionSeconds: 90, defenseSeconds: 30 } },
-  { id: 'relaxed', label: 'Relaxed', hint: 'turns 45 s · talk 150 s', v: { speechSeconds1: 90, speechSeconds: 45, discussionSeconds: 150, defenseSeconds: 45 } },
+  { id: 'quick', v: { speechSeconds1: 40, speechSeconds: 20, discussionSeconds: 60, defenseSeconds: 20 } },
+  { id: 'standard', v: { speechSeconds1: 60, speechSeconds: 30, discussionSeconds: 90, defenseSeconds: 30 } },
+  { id: 'relaxed', v: { speechSeconds1: 90, speechSeconds: 45, discussionSeconds: 150, defenseSeconds: 45 } },
 ];
+const presetName = (p) => tr('preset.' + p.id);
 const mq = (q) => typeof window.matchMedia === 'function' && window.matchMedia(q).matches;
 const isConsole = () => mq('(min-width: 1180px)');   // desktop console layout: fixed-height columns, side rail
 const isMatrix = () => mq('(min-width: 1024px)');    // the players x categories matrix
@@ -107,12 +117,12 @@ function savePrefs() { sSet('local', PREFS_KEY, prefs); }
 const ui = {
   screen: 'landing',          // landing | resuming | replaced | room (lobby/game/final come from state.phase)
   landing: { name: '', room: '', invite: '' },   // invite: the code from an invite link (/?room=CODE)
-  notice: null,               // {kind:'info'|'warn', text} shown on the landing page
+  notice: null,               // {kind:'info'|'warn', key, params} shown on the landing page (or {kind, text}: a mock's)
   rejoinOffer: null,          // identity from localStorage, offered as "Rejoin as <name>"
   pending: false,             // create / join / resume in flight
   pendingName: '',
   askedSpectator: null,
-  picker: null,               // {uid, targetId, category, note}
+  picker: null,               // {uid, targetId, category, note: {key, params} | ''}
   pickerFocused: '',
   expanded: new Set(),
   showLast: null,             // null = default (open while the result is fresh), else the viewer's choice
@@ -138,10 +148,12 @@ const ui = {
   optDraft: {},               // lobby timer fields being typed in (not sent yet): the estimate follows them (X4)
   rulesOpener: '',            // the button that opened the rules sheet (a selector; the picker keeps its own)
   refocus: null,              // {q, until}: give the focus back to the button that opened a sheet closed unplayed
-  voteWiped: null,            // {key, text}: the viewer's vote was wiped because its target left (SPEC §3), this ballot
+  voteWiped: null,            // {key, p, kicked}: the viewer's vote was wiped because its target p left or was kicked (SPEC §3), this ballot
   lastStepSend: null,         // {key, at}: the step this page's last Next / Close vote / End turn was aimed at
   voteHoldUntil: 0,           // a ballot this page's own tap opened: its buttons wait until then (VOTE_HOLD_MS)
   menuOpen: false,            // the header menu (SPEC §11 X10: Report an issue / Suggest an idea)
+  langPending: null,          // {lang, at, until}: a language switch in a room, waiting for the server's answer (§11 X5.7)
+  langQuietUntil: 0,          // the log and the bar status are not aria-live until then (a language commit rewrote them)
 };
 
 /* ------------------------------------------------------------------ tiny DOM builder + morph */
@@ -233,24 +245,39 @@ function morphChildren(from, to) {
 
 /* ------------------------------------------------------------------ small helpers */
 const pad2 = (n) => String(n).padStart(2, '0');
-const plural = (n, one, many) => `${n} ${n === 1 ? one : (many || one + 's')}`;
+// s.categories gives the order; the names come from the dictionary (design §9.4), so a language switch is instant. A
+// category the dictionary does not know keeps the state's label.
 function cats(s) { return s && Array.isArray(s.categories) && s.categories.length ? s.categories : CATS_FALLBACK; }
-function catLabel(s, id) { const c = cats(s).find((x) => x.id === id); return c ? c.label : id; }
+function catLabel(s, id) {
+  if (hasKey('cat.' + id)) return dictCat(id);
+  const c = cats(s).find((x) => x.id === id);
+  return c ? c.label : id;
+}
+// a category param for tr(): a known id (rendered with the form its template asks for), else the state's label as text
+function catP(s, id) { return hasKey('cat.' + id) ? id : catLabel(s, id); }
 function byId(s, id) { return (s && s.players.find((p) => p.id === id)) || null; }
 function nameOf(s, id) {
   const p = byId(s, id) || (s.spectators || []).find((x) => x.id === id);
-  return p ? p.name : 'someone';
+  return p ? p.name : tr('common.someone');
 }
 function namesOf(s, ids) { return ids.map((id) => nameOf(s, id)); }
-function listText(names) {
-  if (names.length <= 1) return names.join('');
-  return names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1];
-}
+// names as "A, B" in the current language (core.js list; "A, B and C" lists are {list@and} in the templates)
+function commaList(names) { return fmtList(uiLang(), names); }
 function hiddenCatsOf(s, p) { return cats(s).map((c) => c.id).filter((c) => p.cards[c] == null); }
 function clip(t, n) { t = String(t); return t.length > n ? t.slice(0, n - 1).trimEnd() + '…' : t; }
-// The card the current speaker revealed on this turn, from the log ("Round N — <name> revealed <Label>: <text>"),
-// scanning back to the start of the phase. null when there is none (or the log was cut).
+// Whether this state's log is read by keys (SPEC §11 X5.3): its newest line has one. A pre-X5 server or a mock
+// fixture has none, and its lines are read from their English text (public/loglines.js, the legacy path).
+function keyedLog(s) { const log = (s && s.log) || []; return log.length > 0 && keyed(log[log.length - 1]); }
+// The card the current speaker revealed on this turn, scanning back to the start of the phase: the last `log.reveal`
+// of this player in this round (its category param; the text is the card on the table, or the line's own value).
+// Without keys: read from the English line ("Round N — <name> revealed <Label>: <text>"). null when there is none (or
+// the log was cut).
 function turnReveal(s, sp) {
+  if (keyedLog(s)) {
+    const r = revealOf(s.log, sp.id, s.round, !!s.overtime);
+    if (!r || typeof r.cat !== 'string') return null;
+    return { cat: r.cat, label: catLabel(s, r.cat), text: sp.cards[r.cat] != null ? sp.cards[r.cat] : r.value };
+  }
   const log = s.log || [];
   const pre = `${s.overtime ? 'Overtime' : `Round ${s.round}`} — ${sp.name} revealed `;
   for (let i = log.length - 1; i >= 0; i--) {
@@ -290,7 +317,8 @@ function capName(t) {
   return out;
 }
 function cleanName(v) { return capName(String(v || '').replace(/[\u0000-\u001f\u007f-\u009f]/g, '').trim()).trim(); }
-function cleanCode(v) { return String(v || '').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 4); }
+// (a Russian keyboard types Cyrillic look-alikes: К, М, Т, Х… become K, M, T, X; design §9.2)
+function cleanCode(v) { return latinCode(v).slice(0, 4); }
 function timerTotal(s) {
   const o = s.options || {};
   if (s.phase === 'reveal') return (s.round === 1 ? o.speechSeconds1 : o.speechSeconds) * 1000;
@@ -308,7 +336,7 @@ function derive(s) {
   d.isSpectator = s.you.role === 'spectator';
   d.alive = d.isPlayer && d.meP.status === 'alive';
   d.isHost = !!s.you.isHost;
-  d.online = MOCK ? !ui.mockConn : (conn.status === 'open' && joinedOnSocket);
+  d.online = MOCK ? !ui.mockConn : socketOnline();
   d.hostName = s.hostId ? nameOf(s, s.hostId) : '';
   d.aliveList = s.players.filter((p) => p.status === 'alive');
   d.outList = s.players.filter((p) => p.status !== 'alive');
@@ -404,36 +432,18 @@ function orderPosition(s, d) {
   if (!t || !d.isPlayer) return '';
   if (!d.alive) return '';
   const i = t.order.indexOf(d.meId);
-  if (i === -1) return t.kind === 'reveal' ? 'You have no turn this round.' : '';
-  if (i < t.index) return t.kind === 'reveal' ? 'You already spoke this round.' : 'You already defended.';
+  if (i === -1) return t.kind === 'reveal' ? tr('order.noTurn') : '';
+  if (i < t.index) return t.kind === 'reveal' ? tr('order.spoke') : tr('order.defended');
   if (i === t.index) return '';
   let n = 0;
   for (let k = t.index + 1; k < i; k++) { const p = byId(s, t.order[k]); if (p && p.status === 'alive') n++; }
-  if (t.kind === 'defense') return n === 0 ? 'You defend next.' : `You defend after ${plural(n, 'more player')}.`;
-  return n === 0 ? 'You are next.' : `You speak after ${plural(n, 'more player')}.`;
+  if (t.kind === 'defense') return n === 0 ? tr('order.defendNext') : tr('order.defendAfter', { n });
+  return n === 0 ? tr('order.youNext') : tr('order.speakAfter', { n });
 }
 
 /* ------------------------------------------------------------------ specials */
-const EFFECT_INFO = {
-  swap_card: 'Swap a card with another player — both become public',
-  reroll_card: 'Replace a card with a freshly drawn one (revealed)',
-  force_reveal: 'Force another player to reveal a hidden card',
-  peek: 'Secretly look at a hidden card of another player',
-  mass_reveal: 'Every alive player reveals a category',
-  shuffle_category: 'Shuffle one category among all alive players',
-  immunity: 'Nobody can vote against you in the next vote',
-  protect: 'Nobody can vote against another player in the next vote',
-  double_vote: 'Your vote counts twice in the current or next vote',
-  block_vote: 'Another player cannot vote in the next vote',
-  cancel_vote: 'Cancel the current or the next vote',
-  eject: 'Retired one-player eject (no card deals it any more, SPEC §11 X1)',
-  airlock: 'Needs a partner: a second Airlock on the same player before that round’s discussion ends throws them out',
-  revive: 'Bring an ejected player back into the game',
-  capacity_plus: 'The bunker gets one more bed',
-  capacity_minus: 'The bunker loses one bed',
-  bunker_add_feature: 'Discover a new feature of the bunker',
-};
-const TARGET_LABEL = { none: 'No target', self: 'Yourself', other: 'Another alive player', ejected: 'An ejected player' };
+// a special's target kind in words (target.none, target.self, target.other, target.ejected)
+function targetLabel(kind) { return hasKey('target.' + kind) ? tr('target.' + kind) : kind; }
 
 /* ------------------------------------------------------------------ airlocks (SPEC §11 X1) */
 // The open airlocks: [] when none are open, and also when a server that predates X1 sends no `airlocks` at all.
@@ -443,31 +453,36 @@ function airlockOn(s, id) { return airlocksOf(s).find((a) => a.targetId === id) 
 // is not on the viewer (only this round's airlock combines; the server jams older ones anyway).
 function joinsAirlock(s, a) { return !!a && a.targetId !== s.you.id && !a.byIds.includes(s.you.id) && (!a.round || a.round === s.round); }
 function myAirlock(s) { return s.me ? (s.me.specials || []).find((x) => x.effect === 'airlock' && !x.used) || null : null; }
-function whoName(s, id) { return id === s.you.id ? 'you' : nameOf(s, id); }
+function whoName(s, id) { return id === s.you.id ? tr('air.you') : nameOf(s, id); }
 // What the viewer's Airlock would do to this player now: 'join' (close an open one), 'open' (start one), 'mine'.
 function airlockKey(s, id) { const a = airlockOn(s, id); return !a ? 'open' : joinsAirlock(s, a) ? 'join' : 'mine'; }
-function airlockCount(a) { return `${Math.min(2, Math.max(1, a.byIds.length))}/2`; }
+function airlockN(a) { return Math.min(2, Math.max(1, a.byIds.length)); }
+function airlockCount(a) { return `${airlockN(a)}/2`; }
 // When an open airlock jams (SPEC §11 X1.2): at the end of its round's discussion, whether a vote follows or not. So
 // its deadline is never "the vote": in a round without one (rounds 2–4 with 6 players) a partner who waits for the
 // next vote only opens a new airlock (SPEC §11, f2).
-function airEnd(s) { return s && s.overtime ? 'the overtime discussion ends' : 'this round’s discussion ends'; }
+// (every sentence that names it carries both wordings as {ot:…|…}: this is its `ot` param)
+function airEnd(s) { return !!(s && s.overtime); }
 // Airlock cards not played yet: the deal (SPEC §11 X1.3, from the seated players; left and kicked ones stay listed in a
 // game) minus the Airlocks in everyone's played specials, never less than the viewer's own. 0: an open airlock can no
 // longer be closed by anyone, so it will jam, and nobody should be told "one more Airlock and you are out".
 function airlocksLeft(s) {
-  const played = s.players.reduce((n, p) => n + p.playedSpecials.filter((x) => x && x.title === 'Airlock').length, 0);
+  // (a played special's catalogue id; a state without ids, a mock or a pre-X5 server, names it by its English title)
+  const isAirlock = (x) => !!x && (typeof x.id === 'string' ? x.id === 'airlock' : x.title === 'Airlock');
+  const played = s.players.reduce((n, p) => n + p.playedSpecials.filter(isAirlock).length, 0);
   return Math.max(myAirlock(s) ? 1 : 0, airlockDeal(s.players.length).airlocks - played);
 }
-function airlockStarters(s, a) { return listText(a.byIds.map((id) => whoName(s, id))) || 'someone'; }
+// who started an airlock, as a list param ({by@and}): "you" for the viewer, "someone" when nobody is known
+function airlockStarters(s, a) { const by = a.byIds.map((id) => whoName(s, id)); return by.length ? by : [tr('common.someone')]; }
 // The Airlock picker's note when there is nothing to join. An airlock may still be cycling (on the viewer, whose own
 // card can never close it), so "nobody has started one" is said only when none is open.
 function airlockPickNote(s) {
   const open = airlocksOf(s).filter((a) => (byId(s, a.targetId) || {}).status === 'alive');
-  const rest = `another player then has to play theirs on the same player before ${airEnd(s)}, or it jams.`;
-  if (!open.length) return `Nobody has started an airlock yet. Yours opens it (1/2): ${rest}`;
+  const ot = airEnd(s);
+  if (!open.length) return tr('air.pickNone', { ot });
   const onMe = open.find((a) => a.targetId === s.you.id);
-  if (onMe) return `An airlock is cycling on you (started by ${airlockStarters(s, onMe)}), and your own card cannot close it. Yours starts a new one (1/2) on the player you pick: ${rest}`;
-  return `Your card cannot close the open airlock${open.length > 1 ? 's' : ''} on ${listText(open.map((a) => nameOf(s, a.targetId)))}. Yours starts a new one (1/2) on the player you pick: ${rest}`;
+  if (onMe) return tr('air.pickOnMe', { by: airlockStarters(s, onMe), ot });
+  return tr('air.pickCannot', { n: open.length, list: open.map((a) => nameOf(s, a.targetId)), ot });
 }
 // Airlocks the viewer can close right now with their own card (the card is playable and someone else started them).
 function joinableAirlocks(s, d) {
@@ -535,9 +550,26 @@ function segmentsOf(text) {
   return segs;
 }
 function richText(text, keyBase, kicker) { return richSegs(segmentsOf(text), keyBase, kicker); }
+// A keyed line (SPEC §11 X5.3, design §8.2) straight from its parts: text runs, the player's name (a span with its id),
+// a special card as a chip with the card's title and text from the part itself (no card-book lookup: the server wrote
+// the card, in the viewer's language), and the special's own rules text dimmed.
+function partsNodes(parts, keyBase, kicker) {
+  return (Array.isArray(parts) ? parts : []).map((x, i) => {
+    if (typeof x === 'string') return x;
+    if (!x || typeof x !== 'object') return null;
+    if (x.t === 'card') return cardChip(String(x.title ?? ''), String(x.text ?? ''), { label: String(x.label || x.v || x.title || ''), cls: 'in-text', popKey: `${keyBase}:${i}`, kicker: kicker || tr('pop.special') });
+    if (x.t === 'cardtext') return h('span', { class: 'lt-card', text: x.v });
+    if (x.t === 'player') return h('span', { class: 'lt-name', 'data-player-id': x.id, text: x.v });
+    return String(x.v ?? '');
+  });
+}
+// A log line's text with its chips: from its parts (keyed), else read from its English text (the legacy path).
+function lineNodes(e, keyBase) {
+  return keyed(e) && Array.isArray(e.parts) ? partsNodes(e.parts, keyBase) : richText(e.text, keyBase);
+}
 function richSegs(segs, keyBase, kicker) {
   return segs.map((g, i) => {
-    if (g.t === 'card') return cardChip(g.title, cardText(g.title), { label: g.v, cls: 'in-text', popKey: `${keyBase}:${i}`, kicker: kicker || 'Special card' });
+    if (g.t === 'card') return cardChip(g.title, cardText(g.title), { label: g.v, cls: 'in-text', popKey: `${keyBase}:${i}`, kicker: kicker || tr('pop.special') });
     if (g.t === 'dim') return h('span', { class: 'lt-card', text: g.v });
     return g.v;
   });
@@ -554,12 +586,12 @@ function cardChip(title, text, o = {}) {
   }, o.icon === false ? null : icon('spark', 'cc-ico'), h('span', { class: 'cc-t', text: o.label || title }));
 }
 function specialMeta(s, sp) {
-  const parts = [`Target: ${TARGET_LABEL[sp.target] || sp.target}`];
-  if (sp.category === 'choose') parts.push('Category: you choose');
-  else if (sp.category === 'random') parts.push('Category: random hidden');
-  else if (sp.category) parts.push(`Category: ${catLabel(s, sp.category)}`);
-  parts.push(sp.timing === 'before_vote' ? 'Before the vote' : 'Any time in play');
-  if (sp.minRound > 1) parts.push(`From round ${sp.minRound}`);
+  const parts = [tr('meta.target', { text: targetLabel(sp.target) })];
+  if (sp.category === 'choose') parts.push(tr('meta.catChoose'));
+  else if (sp.category === 'random') parts.push(tr('meta.catRandom'));
+  else if (sp.category) parts.push(tr('meta.cat', { cat: catP(s, sp.category) }));
+  parts.push(sp.timing === 'before_vote' ? tr('meta.beforeVote') : tr('meta.anyTime'));
+  if (sp.minRound > 1) parts.push(tr('meta.fromRound', { r: sp.minRound }));
   return parts.join(' · ');
 }
 function validTargets(s, sp) {
@@ -580,60 +612,60 @@ function allowedCats(s, sp, targetId) {
   return cats(s).map((c) => c.id);
 }
 function specialStatus(s, d, sp) {
-  if (sp.used) return { ok: false, why: 'Already played' };
-  if (s.phase === 'final') return { ok: false, why: 'The game is over' };
-  if (!GAME_PHASES.includes(s.phase)) return { ok: false, why: 'Not in this phase' };
-  if (!d.meP || d.meP.status !== 'alive') return { ok: false, why: 'Only players still in the game can play specials' };
-  if (!s.me.canPlaySpecial) return { ok: false, why: 'One special per round — you already played one' };
-  if (s.round < (sp.minRound || 1)) return { ok: false, why: `Playable from round ${sp.minRound}` };
+  if (sp.used) return { ok: false, why: tr('why.played') };
+  if (s.phase === 'final') return { ok: false, why: tr('why.over') };
+  if (!GAME_PHASES.includes(s.phase)) return { ok: false, why: tr('why.phase') };
+  if (!d.meP || d.meP.status !== 'alive') return { ok: false, why: tr('why.out') };
+  if (!s.me.canPlaySpecial) return { ok: false, why: tr('why.onePerRound') };
+  if (s.round < (sp.minRound || 1)) return { ok: false, why: tr('why.fromRound', { r: sp.minRound }) };
   if (sp.timing === 'before_vote' && s.phase !== 'reveal' && s.phase !== 'discussion') {
-    return { ok: false, why: 'Only before the vote (reveals or discussion)' };
+    return { ok: false, why: tr('why.beforeVote') };
   }
   if (sp.effect === 'cancel_vote' && s.phase !== 'vote' && s.phase !== 'defense' && s.voteMods.cancelNext) {
-    return { ok: false, why: 'The next vote is already cancelled' };
+    return { ok: false, why: tr('why.cancelled') };
   }
   // SPEC §11 Z3: a ×2 needs a vote to double. A vote block lasts the whole vote step, and a player who is not a voter
   // of the open ballot stays out of the rest of the step, so the card would be spent for nothing.
   if (sp.effect === 'double_vote') {
     const inStep = s.phase === 'vote' || s.phase === 'defense';
-    if (s.voteMods.blocked.includes(d.meId)) return { ok: false, why: `Your vote is blocked in ${inStep ? 'this' : 'the next'} vote, so ×2 would do nothing` };
-    if (s.phase === 'vote' && s.vote && !s.vote.voters.includes(d.meId)) return { ok: false, why: 'You have no vote in this ballot, so ×2 would do nothing' };
+    if (s.voteMods.blocked.includes(d.meId)) return { ok: false, why: tr('why.blockedDouble', { now: inStep }) };
+    if (s.phase === 'vote' && s.vote && !s.vote.voters.includes(d.meId)) return { ok: false, why: tr('why.noBallot') };
   }
   if ((sp.target === 'other' || sp.target === 'ejected') && validTargets(s, sp).length === 0) {
-    return { ok: false, why: sp.target === 'ejected' ? 'Nobody has been ejected' : 'No valid target right now' };
+    return { ok: false, why: sp.target === 'ejected' ? tr('why.noEjected') : tr('why.noTarget') };
   }
-  if (!d.online) return { ok: false, why: 'Offline — reconnecting' };
+  if (!d.online) return { ok: false, why: tr('why.offline') };
   return { ok: true, why: '' };
 }
 function describePlay(s, sp, target, cat) {
-  const tn = target ? target.name : 'the target';
-  const cl = cat ? catLabel(s, cat) : (sp.category && sp.category !== 'choose' && sp.category !== 'random' ? catLabel(s, sp.category) : null);
+  const tname = target ? target.name : tr('play.theTarget');
+  const cid = cat || (sp.category && sp.category !== 'choose' && sp.category !== 'random' ? sp.category : null);
+  // (a card that needs a category and has none prints "null", as it always did)
+  const p = { t: tname, cat: cid ? catP(s, cid) : 'null' };
   const inStep = s.phase === 'vote' || s.phase === 'defense';
   switch (sp.effect) {
-    case 'swap_card': return `Swap your ${cl} with ${tn}'s ${cl}. Both cards become public.`;
-    case 'reroll_card': return sp.target === 'self'
-      ? `Replace your ${cl} with a freshly drawn card. The new card is revealed to everyone.`
-      : `Replace ${tn}'s ${cl} with a freshly drawn card. The new card is revealed to everyone.`;
-    case 'force_reveal': return cl ? `${tn} must reveal their ${cl} to everyone.` : `${tn} must reveal a random hidden card to everyone.`;
-    case 'peek': return cl ? `You secretly see ${tn}'s ${cl}. Only you get the result, under Private intel.` : `You secretly see a random hidden card of ${tn}. Only you get the result, under Private intel.`;
-    case 'mass_reveal': return `Every alive player's ${cl} becomes public.`;
-    case 'shuffle_category': return `Everyone's ${cl} is collected, shuffled and dealt back. All of them become public.`;
-    case 'immunity': return 'Nobody can vote against you during the next vote (a cancelled vote uses it up too).';
-    case 'protect': return `Nobody can vote against ${tn} during the next vote (a cancelled vote uses it up too).`;
-    case 'double_vote': return inStep ? 'Your vote counts twice in this vote.' : 'Your vote counts twice in the next vote (a cancelled vote uses it up too).';
-    case 'block_vote': return `${tn} cannot vote during the next vote (a cancelled vote uses it up too).`;
-    case 'cancel_vote': return inStep ? 'The rest of this vote is cancelled right now. Nobody else is ejected in it.' : 'The next vote is cancelled.';
-    case 'eject': return `${tn} is ejected from the bunker immediately.`;
+    case 'swap_card': return tr('play.swap', p);
+    case 'reroll_card': return sp.target === 'self' ? tr('play.rerollSelf', p) : tr('play.rerollOther', p);
+    case 'force_reveal': return cid ? tr('play.force', p) : tr('play.forceRandom', p);
+    case 'peek': return cid ? tr('play.peek', p) : tr('play.peekRandom', p);
+    case 'mass_reveal': return tr('play.mass', p);
+    case 'shuffle_category': return tr('play.shuffle', p);
+    case 'immunity': return tr('play.immunity');
+    case 'protect': return tr('play.protect', p);
+    case 'double_vote': return inStep ? tr('play.doubleNow') : tr('play.doubleNext');
+    case 'block_vote': return tr('play.block', p);
+    case 'cancel_vote': return inStep ? tr('play.cancelNow') : tr('play.cancelNext');
+    case 'eject': return tr('play.eject', p);
     case 'airlock': {
       const a = target ? airlockOn(s, target.id) : null;
-      if (a && joinsAirlock(s, a)) return `${tn} is thrown out of the bunker right now, with no vote: you close the airlock ${listText(namesOf(s, a.byIds))} started.`;
-      return `You start cycling the airlock on ${tn}. If another player plays an Airlock on ${tn} before ${airEnd(s)}, ${tn} is out, with no vote. If nobody does, it jams then.${airlocksLeft(s) <= 1 ? ' Yours is the last Airlock in this game, so nobody can close it: it will jam.' : ''}`;
+      if (a && joinsAirlock(s, a)) return tr('play.airlockJoin', { t: tname, by: namesOf(s, a.byIds) });
+      return tr(airlocksLeft(s) <= 1 ? 'play.airlockStartLast' : 'play.airlockStart', { t: tname, ot: airEnd(s) });
     }
-    case 'revive': return `${tn} comes back from the forest and is in the game again.`;
-    case 'capacity_plus': return 'The bunker gets one more bed.';
-    case 'capacity_minus': return 'The bunker loses one bed.';
-    case 'bunker_add_feature': return 'A new feature of the bunker is discovered.';
-    default: return 'Play this card.';
+    case 'revive': return tr('play.revive', p);
+    case 'capacity_plus': return tr('play.plus');
+    case 'capacity_minus': return tr('play.minus');
+    case 'bunker_add_feature': return tr('play.feature');
+    default: return tr('play.default');
   }
 }
 function pickerSteps(sp) {
@@ -676,7 +708,7 @@ function validatePicker() {
   if (!sp || !specialStatus(state, d, sp).ok) {
     closeOverlay();
     shield();
-    if (sp && !sp.used && d.online) toast('info', 'special', `${sp.title} can't be played right now.`);
+    if (sp && !sp.used && d.online) toast('info', 'special', { key: 'toast.cantPlay', params: { title: sp.title } });
     return;
   }
   // The vote this card was opened for is over (or ejected someone): "cancel the rest of this vote" would now cancel
@@ -688,13 +720,13 @@ function validatePicker() {
     if (p.voteKey !== null && STEP_SENSITIVE.has(sp.effect)) {
       closeOverlay();
       shield();
-      toast('info', 'special', `The vote moved on before you played “${sp.title}”, so it was not played. It is still in your hand.`);
+      toast('info', 'special', { key: 'toast.voteMoved', params: { title: sp.title } });
       return;
     }
     p.voteKey = vk;
   }
   if (p.targetId && !validTargets(state, sp).some((t) => t.id === p.targetId)) {
-    p.targetId = null; p.category = null; p.note = 'That target is no longer valid — pick again.';
+    p.targetId = null; p.category = null; p.note = { key: 'picker.targetGone' };
     pickerMoved();
   }
   // An Airlock's meaning depends on the target's airlock (SPEC §11 X1): when one opens on the chosen target, or the
@@ -702,10 +734,7 @@ function validatePicker() {
   if (sp.effect === 'airlock') {
     const ak = p.targetId ? airlockKey(state, p.targetId) : '';
     if (p.targetId && p.airFor === p.targetId && ak !== p.airKey) {
-      const tn = nameOf(state, p.targetId);
-      p.note = ak === 'join'
-        ? `An airlock was just started on ${tn}: playing now throws ${tn} out, with no vote.`
-        : `The airlock on ${tn} is no longer open: playing now starts a new one.`;
+      p.note = { key: ak === 'join' ? 'picker.airJustStarted' : 'picker.airClosed', params: { t: nameOf(state, p.targetId) } };
       pickerMoved();
     }
     p.airKey = ak;
@@ -721,35 +750,91 @@ function validatePicker() {
       const gone = before.filter((id) => !joinIds.includes(id) && list.some((t) => t.id === id));
       // (unless this state already explained itself above: the chosen target is gone)
       if (p.note === note0) {
-        if (fresh.length) p.note = `An airlock was just started on ${listText(fresh.map((id) => nameOf(state, id)))}: ${fresh.length === 1 ? 'that player is' : 'they are'} now listed first. Picking one of them throws them out, with no vote.`;
-        else if (gone.length) p.note = `The airlock on ${listText(gone.map((id) => nameOf(state, id)))} is no longer open.`;
+        if (fresh.length) p.note = { key: 'picker.airListFirst', params: { list: fresh.map((id) => nameOf(state, id)), n: fresh.length } };
+        else if (gone.length) p.note = { key: 'picker.airGone', params: { list: gone.map((id) => nameOf(state, id)) } };
       }
       pickerMoved();
     }
     p.listKey = key;
   }
   if (p.category && sp.category === 'choose' && !allowedCats(state, sp, p.targetId).includes(p.category)) {
-    p.category = null; p.note = 'That category is no longer available — pick again.';
+    p.category = null; p.note = { key: 'picker.catGone' };
     pickerMoved();
   }
 }
 
 /* ------------------------------------------------------------------ connection */
 // probeAt: when the oldest unanswered send or ping went out (0 = nothing unanswered); probeBy: when an answer is due;
-// probeWhy: 'action' (a user's move is waiting for its answer), 'keepalive' or 'wake'.
+// probeWhy: 'action' (a user's move is waiting for its answer), 'keepalive', 'wake' or 'lang' (a language switch waits).
 // why: 'busy' when the last attempt was refused with server_busy (said in the banner), else ''.
 const conn = { status: 'idle', attempt: 0, timer: 0, nextAt: 0, lastMsgAt: 0, openedAt: 0, probeAt: 0, probeBy: 0, probeWhy: '', why: '' };
 let ws = null;
 let wsGen = 0;
 let hello = null;
 let joinedOnSocket = false;
+let stateOnSocket = false;    // a state has come on this socket (after `joined`, the old socket's state is on screen)
 let resumeInFlight = false;
 let stopped = false;          // after `replaced`: never reconnect by ourselves
+
+/* ------------------------------------------------------------------ the link's speed (SPEC §11 X5.2; review-switch-i2)
+ * An answer (a pong, a state) queues behind whatever the server sent before it, and a 16-player state is up to ~120 KB:
+ * on a slow link it takes seconds, and the browser hands over a message only once it is whole. So every wait for an
+ * answer grows by 1.5 times what the latest state takes on this link (linkSlackMs), measured from this page's states:
+ *  - the server sends a state right behind `joined` (a hello's answer), and right behind the pong of the ping that goes
+ *    out just before every action and setLang. The state's bytes over the time since that message arrived is the
+ *    link's speed or less, never more: its bytes cannot arrive before the message ahead of them;
+ *  - the slowest of the last LINK_SAMPLES counts;
+ *  - while such a state is on its way (after `joined` or that pong), the waits also allow for it at LINK_FLOOR, since
+ *    the samples may come from a faster network than the one the page is on now;
+ *  - a socket called dead with nothing coming back doubles the next waits (up to 4 times) until a state arrives, so a
+ *    link that got slower than the samples say still gets its state through, instead of reconnecting forever.
+ * The ping ahead of an action also answers the action's probe in one round trip while its state is still downloading. */
+const LINK_SAMPLES = 4;
+const LINK_SLACK_MAX_MS = 30000;
+const LINK_FLOOR = 4.096;          // bytes per ms (4 KB/s): the slowest link a state on its way is waited for
+const LINK_FIRST_BYTES = 65536;    // a first state's size, before this page has seen one
+// bytes: the latest state's size (UTF-8); rates: bytes per ms; markAt: when the message a state follows arrived (0:
+// none); pings: this socket's unanswered pings, 'req' for one sent ahead of an action or setLang; misses: probes that
+// ran out since the last state
+const link = { bytes: 0, rates: [], markAt: 0, pings: [], misses: 0 };
+const utf8 = typeof TextEncoder === 'function' ? new TextEncoder() : null;
+function linkSlackMs() {
+  let ms = link.bytes && link.rates.length ? 1.5 * link.bytes / Math.min(...link.rates) : 0;
+  if (link.markAt && Date.now() - link.markAt < 60000) ms = Math.max(ms, (link.bytes || LINK_FIRST_BYTES) / LINK_FLOOR);
+  return Math.min(LINK_SLACK_MAX_MS, Math.round(ms));
+}
+/** How long to wait for an answer that takes up to `base` ms on a fast link. */
+function waitMs(base) { return (base + linkSlackMs()) * (1 << Math.min(link.misses, 2)); }
+function sendPing(kind) {
+  ws.send('{"t":"ping"}');
+  link.pings.push(kind);
+}
+// Every message, when it has arrived whole (at: its time, size: its UTF-8 bytes)
+function linkOnMessage(m, at, size) {
+  if (m.t === 'state') {
+    // (a mark a minute old is not this state's: every answered request is followed by its state at once)
+    if (link.markAt && at - link.markAt < 60000) {
+      link.rates.push(size / Math.max(20, at - link.markAt));
+      if (link.rates.length > LINK_SAMPLES) link.rates.shift();
+    }
+    link.markAt = 0;
+    link.bytes = size;
+    link.misses = 0;
+    return;
+  }
+  if (m.t === 'pong') { if (link.pings.shift() === 'req') link.markAt = at; return; }
+  if (m.t === 'joined') { link.markAt = at; return; }
+  if (m.t === 'error' || m.t === 'kicked') { link.markAt = 0; return; }
+  // anything else between a mark and its state (a small message the state follows): the state starts after it
+  if (link.markAt) link.markAt = at;
+}
 
 function wsUrl() { return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws'; }
 function dropSocket() {
   joinedOnSocket = false;
+  stateOnSocket = false;
   conn.probeAt = 0; conn.probeBy = 0; conn.probeWhy = '';
+  link.markAt = 0; link.pings = [];
   if (ws) { const s = ws; ws = null; wsGen++; try { s.close(); } catch { /* ignore */ } }
 }
 function openSocket(first) {
@@ -774,15 +859,18 @@ function openSocket(first) {
   };
   sock.onmessage = (ev) => {
     if (gen !== wsGen) return;
-    conn.lastMsgAt = Date.now();
+    const at = Date.now();
+    conn.lastMsgAt = at;
     conn.probeAt = 0; conn.probeBy = 0; conn.probeWhy = '';
     let m;
     try { m = JSON.parse(ev.data); } catch { return; }
-    if (m && typeof m === 'object') onMessage(m);
+    if (!m || typeof m !== 'object') return;
+    if (typeof ev.data === 'string') linkOnMessage(m, at, m.t === 'state' && utf8 ? utf8.encode(ev.data).length : ev.data.length);
+    onMessage(m);
   };
   sock.onclose = () => {
     if (gen !== wsGen) return;
-    ws = null; joinedOnSocket = false;
+    ws = null; joinedOnSocket = false; stateOnSocket = false;
     onSocketGone();
   };
   sock.onerror = () => { /* a close event follows */ };
@@ -794,21 +882,178 @@ function socketDead() {
   if (!ws) return;
   const why = conn.probeWhy;
   dropSocket();
-  if (why === 'action' && identity) toast('error', 'offline', 'No answer from the server — reconnecting. Check that your move went through.');
+  if (why === 'action' && identity) toast('error', 'offline', { key: 'toast.noAnswer' });
   onSocketGone();
 }
-// create / join / resume: `joined` (or an error) must come back within CONNECT_MS
+// create / join / resume: `joined` (or an error) must come back within CONNECT_MS. Every hello carries the viewer's
+// language (SPEC §11 X5.1), so its answer (an error too) and every state after it are in it; a server from before X5
+// ignores the field.
 function sendHello(sock, msg) {
   resumeInFlight = msg.t === 'resume';
-  try { sock.send(JSON.stringify(msg)); } catch { socketDead(); return; }
+  // (the new socket's states will be in this language; a setLang sent on an earlier socket does not hold back the
+  // reconcile of this one's first state)
+  langWire.asked = wantLang(); langWire.heard = ''; langWire.sentAt = 0;
+  try { sock.send(JSON.stringify({ ...msg, lang: wantLang() })); } catch { socketDead(); return; }
   probe(CONNECT_MS, 'hello');
+}
+
+/* ------------------------------------------------------------------ the language (SPEC §11 X5.1/X5.7, design §9.3)
+ * One switch (EN | RU) on the landing page and in the header. The choice is stored at once (per ?profile=). In a room
+ * the page keeps its language until the server answers with a state in the new one, then everything (the client's
+ * words and the server's: log, cards, catastrophe) changes in that one render, so no screen mixes two languages. While
+ * the socket stays open the page waits for that answer (a big state on a slow link can take seconds), and the setLang
+ * goes out with a liveness probe: a socket that silently died is found (socketDead: reconnect, the banner up) and the
+ * switch then happens at once, offline, where the reconnect's hello carries the language. A switch made while a resume's
+ * hello is on its way waits the same way (`joined` sends its setLang). langCap() caps the wait.
+ * Elsewhere (landing, reconnecting, offline, mock, a server from before X5 whose states carry no you.lang) it switches
+ * at once, and the next hello carries the language; the banner stays up until the new socket's state replaces the old
+ * one (staleLangScreen). */
+const LANG_WAIT_MS = 1500;     // how often a waiting switch looks at the socket again
+const LANG_CAP_MS = 10000;     // a switch in a room commits by then whatever the socket does (plus a slow link's slack)
+const LANG_SEND_MS = 250;      // setLang goes out this long after the last tap (trailing): a tap there and back sends nothing
+const LANG_RESEND_MS = 5000;   // the reconcile asks again no sooner than this after the last setLang
+const LANG_QUIET_MS = 1000;    // the live regions (log, bar status) stay silent this long after a language commit
+// sentAt/asked: the last setLang and its language, until a state in that language answers it; heard: the language of
+// the last state (skipped ones too); timer/want: the trailing send and the choice it carries
+const langWire = { sentAt: 0, timer: 0, want: '', asked: '', heard: '' };
+/** The language the viewer chose: the one on screen, or the one a switch in a room is waiting for. */
+function wantLang() { return ui.langPending ? ui.langPending.lang : uiLang(); }
+function liveSocket() { return !MOCK && !!ws && ws.readyState === 1 && joinedOnSocket; }
+/** A resume (or join) is on its way on an open socket: its answer and first state come there, in the hello's language. */
+function helloInFlight() { return !MOCK && !!ws && ws.readyState === 1 && !joinedOnSocket && conn.probeWhy === 'hello'; }
+/** The language this socket's states will be in once every setLang sent has been answered. */
+function serverLang() { return langWire.asked || langWire.heard; }
+function switchLang(l, o = {}) {
+  const x = normLang(l);
+  if (!x) return;
+  if (o.store !== false) saveLang(x);
+  const s = state;
+  // a server that speaks languages (its states carry you.lang) and an open socket, joined or with its hello on the way
+  // (that hello carried the old language: `joined` sends the setLang, and the first state shows whole in the old
+  // language): wait for its answer
+  if (ui.screen === 'room' && (liveSocket() || helloInFlight()) && s && s.you && typeof s.you.lang === 'string') {
+    if (!langWire.heard) langWire.heard = normLang(s.you.lang) || '';
+    // back to the language on screen, which is the server's too, before anything went out (a tap there and back):
+    // nothing to send, nothing to wait for
+    if (x === uiLang() && serverLang() === x) { cancelLangSwitch(); scheduleRender(); return; }
+    // the state on screen is already in that language (the page and the server disagreed): it is the answer
+    if (!langWire.asked && normLang(s.you.lang) === x) { cancelLangSwitch(); commitLang(x); return; }
+    const now = Date.now();
+    ui.langPending = { lang: x, at: now, until: now + LANG_WAIT_MS };
+    queueLangSend(x);
+    setTimeout(langDeadline, LANG_WAIT_MS + 20);
+    scheduleRender();
+    return;
+  }
+  cancelLangSwitch();
+  commitLang(x);
+}
+/** When a switch in a room commits whatever the socket does: LANG_CAP_MS, and longer while its answer is on the way
+ * over a slow link (linkSlackMs). */
+function langCap(p) { return p.at + LANG_CAP_MS + linkSlackMs(); }
+function cancelLangSwitch() {
+  ui.langPending = null;
+  if (langWire.timer) { clearTimeout(langWire.timer); langWire.timer = 0; }
+}
+// A quiet send (no lock, no "not connected" toast; nothing when the socket is not open), on the trailing edge: every
+// tap restarts the wait, and only the last choice goes out.
+function queueLangSend(x) {
+  langWire.want = x;
+  if (langWire.timer) clearTimeout(langWire.timer);
+  langWire.timer = setTimeout(() => { langWire.timer = 0; sendLangNow(); }, LANG_SEND_MS);
+}
+function sendLangNow() {
+  const x = langWire.want;
+  // (offline: the reconnect's hello carries the language; a hello on its way: `joined` sends it)
+  if (!x || !liveSocket()) return;
+  const p = ui.langPending;
+  // the server speaks it already, and the state on screen is in it: nothing to ask (a skipped state was not shown,
+  // so then the server is asked again: it answers with a fresh state)
+  if (x === serverLang() && state && normLang(state.you.lang) === x) {
+    if (p && p.lang === x) { ui.langPending = null; commitLang(x); }
+    return;
+  }
+  // a ping goes just ahead: its pong comes back in one round trip, ahead of the answering state (seconds on a slow
+  // link), so the probe hears from a live socket at once; a socket that silently died is found by the probe
+  // (socketDead reconnects with the banner up, and the waiting switch commits then)
+  try { sendPing('req'); ws.send(JSON.stringify({ t: 'setLang', lang: x })); } catch { return; /* the socket's own checks notice */ }
+  langWire.sentAt = Date.now();
+  langWire.asked = x;
+  if (p) probe(waitMs(PING_WAIT_MS), 'lang');
+}
+function langDeadline() {
+  const p = ui.langPending;
+  if (!p) return;
+  const now = Date.now();
+  if (now < p.until) return;   // a later switch waits on its own timer
+  // the socket is open: the answer is on its way (a slow link), or the probe finds the socket dead. Until one of them,
+  // or the cap, the page stays whole in its old language
+  if ((liveSocket() || helloInFlight()) && now < langCap(p)) {
+    p.until = Math.min(langCap(p), now + LANG_WAIT_MS);
+    setTimeout(langDeadline, p.until - now + 20);
+    return;
+  }
+  ui.langPending = null;
+  commitLang(p.lang);
+}
+// Switches what is on screen: the dictionary, <html lang>, the page title (the render), and drops every toast (their
+// words are the old language's) and the card popover (it copied its text when it opened). The render that follows
+// rewrites every log line and the bar: their live regions stay silent for it (LANG_QUIET_MS), so a screen reader
+// does not queue the whole log again in the new language.
+function commitLang(x) {
+  if (commitDict(x, { store: false })) {
+    ui.toasts = [];
+    hidePop();
+    ui.langQuietUntil = Date.now() + LANG_QUIET_MS;
+    setTimeout(scheduleRender, LANG_QUIET_MS + 20);
+  }
+  scheduleRender();
+}
+/** aria-live for the log and the bar status: 'off' for a moment after a language commit (their text all changes). */
+function liveMode() { return ui.langQuietUntil > Date.now() ? 'off' : 'polite'; }
+// Every state: the answer a switch waits for commits it. Returns true for a state the page skips: the answer to a
+// choice the viewer has already left (a quick switch there and back), while the setLang of the latest choice is queued
+// or unanswered: messages on one socket arrive in order, so its answer follows (states are whole snapshots). Past the
+// switch's cap such a state is followed, so the screen never shows one language's words around the other's server text.
+// Without a switch pending, a server that speaks another language than this page (a resume of an old identity, a tab
+// left open in the other language) is asked once (design §9.3, "reconcile"). A state without you.lang comes from a
+// server from before X5: it is never sent a setLang (it would answer bad_request).
+function langOnState(s) {
+  const sl = normLang(s && s.you ? s.you.lang : null);
+  if (!sl) return false;
+  langWire.heard = sl;
+  if (langWire.asked === sl) langWire.asked = '';
+  const p = ui.langPending;
+  if (p) {
+    if (sl === p.lang) { ui.langPending = null; commitLang(sl); return false; }
+    if (sl === uiLang()) return false;
+    if ((langWire.timer || langWire.asked === p.lang) && Date.now() < langCap(p)) return true;
+    commitLang(sl);
+    return false;
+  }
+  if (sl !== uiLang() && liveSocket() && Date.now() - langWire.sentAt > LANG_RESEND_MS) {
+    langWire.want = uiLang();
+    sendLangNow();
+  }
+  return false;
+}
+// While a switch waits for the server, the button already shows the choice (data-lang, the highlight). Its name is then
+// the chosen language's own ("Язык: русский. Переключить на английский"), which says what a tap does now (go back), in
+// that language (lang=), and aria-busy says that the switch is not done yet.
+function vLangSwitch(where) {
+  const cur = wantLang();
+  const waiting = cur !== uiLang();
+  const label = waiting ? trIn(cur, 'lang.switch') : tr('lang.switch');
+  return h('button', { class: ['lang-switch', 'ls-' + where, ui.langPending && 'is-pending'], key: 'lang-switch', testid: 'lang-switch', act: 'lang', 'data-lang': cur,
+    lang: waiting ? cur : null, 'aria-busy': waiting ? 'true' : null, title: label, 'aria-label': label },
+    h('span', { class: ['ls-opt', cur === 'en' && 'on'], text: 'EN' }), h('span', { class: ['ls-opt', cur === 'ru' && 'on'], text: 'RU' }));
 }
 // Expect an answer (any message) within `ms`: the server answers every action with a state or an error, a hello with
 // `joined` or an error, and a ping with a pong. Nothing by then means the connection is gone.
 function probe(ms, why) {
   if (!ws || ws.readyState !== 1) return;
   const now = Date.now();
-  if (why === 'keepalive' || why === 'wake') { try { ws.send('{"t":"ping"}'); } catch { /* the check below notices */ } }
+  if (why === 'keepalive' || why === 'wake') { try { sendPing('alive'); } catch { /* the check below notices */ } }
   if (!conn.probeAt) { conn.probeAt = now; conn.probeBy = now + ms; conn.probeWhy = why; }
   else {
     conn.probeBy = Math.min(conn.probeBy, now + ms);
@@ -819,11 +1064,17 @@ function probe(ms, why) {
 }
 function checkLiveness() {
   if (!ws || !conn.probeAt) return;
-  if (Date.now() >= conn.probeBy) socketDead();
+  if (Date.now() < conn.probeBy) return;
+  // (the next waits are longer until a state gets through: the link may be slower than its samples say)
+  if (conn.probeWhy !== 'hello') link.misses = Math.min(3, link.misses + 1);
+  socketDead();
 }
 function onSocketGone() {
   resumeInFlight = false;
   conn.why = '';
+  // a language switch that waited for this socket's answer happens now, offline (the banner is up); the reconnect's
+  // hello carries the language (design §9.3 step 3)
+  if (ui.langPending) { const l = ui.langPending.lang; cancelLangSwitch(); commitLang(l); }
   ui.inflight = null;
   ui.voteInflight = null;
   ui.adminInflight = null;
@@ -833,7 +1084,7 @@ function onSocketGone() {
     conn.status = 'idle';
     if (ui.pending) {
       ui.pending = false;
-      toast('error', 'offline', 'Could not reach the game server. Check the address and try again.');
+      toast('error', 'offline', { key: 'toast.unreachable' });
     }
   }
   scheduleRender();
@@ -854,14 +1105,17 @@ function reconnectNow() {
 function send(msg) {
   if (MOCK) { mockSend(msg); return true; }
   if (ws && ws.readyState === 1 && joinedOnSocket) {
-    try { ws.send(JSON.stringify(msg)); } catch { socketDead(); return false; }
-    if (msg.t !== 'leave') probe(ANSWER_MS, 'action');
+    // a ping goes just ahead: its pong comes back in one round trip, while the state that answers the action can take
+    // seconds on a slow link (the probe wants any answer: a live socket)
+    const ask = msg.t !== 'leave';
+    try { if (ask) sendPing('req'); ws.send(JSON.stringify(msg)); } catch { socketDead(); return false; }
+    if (ask) probe(waitMs(ANSWER_MS), 'action');
     return true;
   }
   // "open" but the socket is closing or gone: make the "reconnecting" below true
   if (ws && ws.readyState !== 1 && conn.status === 'open') socketDead();
   else if (!ws && identity && conn.status !== 'waiting' && conn.status !== 'connecting' && !stopped) onSocketGone();
-  toast('error', 'offline', 'Not connected — reconnecting. Try again in a moment.');
+  toast('error', 'offline', { key: 'toast.notConnected' });
   return false;
 }
 function lockSend(msg, slot) {
@@ -869,7 +1123,8 @@ function lockSend(msg, slot) {
   const token = { at: Date.now(), replied: false };
   ui[slot] = token;
   setTimeout(() => { if (ui[slot] === token && token.replied) { ui[slot] = null; scheduleRender(); } }, LOCK_MS + 10);
-  setTimeout(() => { if (ui[slot] === token) { ui[slot] = null; scheduleRender(); } }, ANSWER_MS + 250);
+  // (a state that is still downloading keeps the buttons held: the probe drops a dead socket, which releases them)
+  setTimeout(() => { if (ui[slot] === token) { ui[slot] = null; scheduleRender(); } }, waitMs(ANSWER_MS) + 250);
 }
 function sendTurnAction(msg) {
   if (msg.t === 'next' || msg.t === 'closeVote' || msg.t === 'endTurn') ui.lastStepSend = { key: ui.stepKey, at: Date.now() };
@@ -925,6 +1180,8 @@ function setUrlRoom(room) {
 function resetToLanding(notice) {
   state = null;
   window.__bunkerState = null;
+  // a switch that was waiting for the room's answer: there is no room any more, so it happens now
+  if (ui.langPending) { const l = ui.langPending.lang; cancelLangSwitch(); commitLang(l); }
   ui.screen = 'landing';
   ui.picker = null;
   ui.pending = false;
@@ -955,6 +1212,13 @@ function onMessage(m) {
       ui.pending = false;
       conn.attempt = 0;
       conn.why = '';
+      // a language switch made while this hello was on its way (the hello carried the old language): ask now, without
+      // the trailing wait. The answer comes right behind this socket's first state, which shows whole in the old one
+      if (ui.langPending && langWire.asked !== ui.langPending.lang) {
+        if (langWire.timer) { clearTimeout(langWire.timer); langWire.timer = 0; }
+        langWire.want = ui.langPending.lang;
+        sendLangNow();
+      }
       if (ui.screen !== 'replaced') ui.screen = 'room';
       setUrlRoom(m.room);
       devPost({ ev: 'joined', room: m.room, id: m.id });
@@ -971,8 +1235,10 @@ function onMessage(m) {
       clearIdentity();
       dropSocket();
       conn.status = 'idle';
-      const reason = typeof m.reason === 'string' && m.reason.trim() ? m.reason.trim().replace(/\.$/, '') : '';
-      resetToLanding({ kind: 'warn', text: reason ? `${reason} (room ${room}).` : `The host removed you from room ${room}.` });
+      // the client's own words, not the server's `reason` (design §2.2), so a later language switch re-renders it; a
+      // server that gives a reason (every one does today) gets the wording the page always showed for it
+      const reason = typeof m.reason === 'string' && m.reason.trim() !== '';
+      resetToLanding({ kind: 'warn', key: reason ? 'landing.kicked' : 'landing.kickedPlain', params: { code: room } });
       break;
     }
     default: break;
@@ -981,7 +1247,7 @@ function onMessage(m) {
 }
 function onError(m) {
   const code = typeof m.code === 'string' && m.code ? m.code : 'error';
-  const message = typeof m.message === 'string' && m.message ? m.message : 'Something went wrong.';
+  const message = typeof m.message === 'string' && m.message ? m.message : tr('err.generic');
   devPost({ ev: 'error', code, message });
   ui.inflight = null;
   ui.voteInflight = null;
@@ -1003,12 +1269,7 @@ function onError(m) {
     conn.status = 'idle';
     // a room that is gone must not come back as an invite on the next reload (the URL still has its ?room=)
     if (code === 'no_room') { setUrlRoom(null); ui.landing.room = ''; }
-    resetToLanding({
-      kind: 'warn',
-      text: code === 'no_room'
-        ? `Room ${room} no longer exists (games are lost when the server restarts). Create or join a new game.`
-        : `Your seat in room ${room} is no longer valid. Join again with the form.`,
-    });
+    resetToLanding({ kind: 'warn', key: code === 'no_room' ? 'landing.roomGone' : 'landing.seatInvalid', params: { code: room } });
     toast('error', code, message);
     return;
   }
@@ -1032,7 +1293,7 @@ function onError(m) {
     ui.landing.room = '';
     setUrlRoom(null);
     if (ui.rejoinOffer && ui.rejoinOffer.room === room) { sDel('local', ID_KEY); ui.rejoinOffer = null; }
-    ui.notice = { kind: 'warn', text: `Room ${room} does not exist any more (an old link, or the server was restarted: games are lost then). Ask the host for a new link, or start a game of your own.` };
+    ui.notice = { kind: 'warn', key: 'landing.inviteGone', params: { code: room } };
   }
   ui.pending = false;
   toast('error', code, message);
@@ -1052,7 +1313,9 @@ function normalize(s) {
     p.connected = p.connected !== false;
   }
   s.spectators = arr(s.spectators);
-  s.log = arr(s.log);
+  // (an entry that comes without its text, only its parts, gets the text back: the parts join to exactly it, §8.1)
+  s.log = arr(s.log).filter((e) => e && typeof e === 'object');
+  for (const e of s.log) if (typeof e.text !== 'string') e.text = Array.isArray(e.parts) ? partsText(e.parts) : '';
   s.categories = arr(s.categories).length ? s.categories : CATS_FALLBACK;
   s.options = { speechSeconds1: 60, speechSeconds: 30, discussionSeconds: 90, defenseSeconds: 30, ...(s.options || {}) };
   s.schedule = { kicksByRound: [], outCount: 0, kicksThisStep: 0, nextVoteRound: null, ...(s.schedule || {}) };
@@ -1085,6 +1348,10 @@ function onState(s) {
   normalize(s);
   if (ui.screen === 'replaced') return;
   const prev = state;
+  // SPEC §11 X5.7: a language switch commits with the state that answers it (before this state's flashes are made); the
+  // answer to a choice already left is skipped while the latest one is on its way
+  if (langOnState(s)) return;
+  stateOnSocket = true;
   learnFromState(s);
   // lobby timer drafts (X4): the server's value wins once it changed, except in the field being typed in
   if (prev && prev.room === s.room) {
@@ -1104,7 +1371,7 @@ function onState(s) {
   // the game just ended: bring the final hero into view (a phone player may be scrolled down to their hand)
   if (prev && prev.room === s.room && prev.phase !== 'final' && s.phase === 'final') ui.scrollFinal = true;
   if (ui.askedSpectator === false && s.you.role === 'spectator' && (!prev || prev.room !== s.room)) {
-    toast('info', 'spectator', 'That game has already started (or is full), so you joined as a spectator.');
+    toast('info', 'spectator', { key: 'toast.joinedAsSpectator' });
   }
   ui.askedSpectator = null;
   state = s;
@@ -1116,7 +1383,7 @@ function onState(s) {
     const hadKey = !!ui.stepKey && !!prev && prev.room === s.room;
     // a ballot that follows right on the step this page's own Next / Close vote / End turn was aimed at: this page
     // opened it, and the finger that did it may tap that spot again (VOTE_HOLD_MS)
-    const own = hadKey && s.phase === 'vote' && !!ui.lastStepSend && ui.lastStepSend.key === ui.stepKey && Date.now() - ui.lastStepSend.at < ANSWER_MS;
+    const own = hadKey && s.phase === 'vote' && !!ui.lastStepSend && ui.lastStepSend.key === ui.stepKey && Date.now() - ui.lastStepSend.at < waitMs(ANSWER_MS);
     ui.stepKey = key;
     ui.stepAt = hadKey ? Date.now() : 0;
     ui.voteHoldUntil = own ? Date.now() + VOTE_HOLD_MS : 0;
@@ -1136,8 +1403,8 @@ function onState(s) {
   // itself is flashed by announce())
   if (identity && s.you && identity.id === s.you.id && (!prev || prev.room !== s.room)) {
     if (identity.wasHost && !s.you.isHost && s.phase !== 'final') {
-      const e = s.log.slice().reverse().find((x) => x.kind === 'info' && / is now the host$/.test(x.text));
-      toast('info', 'host', e ? `${flashText(e)}. You are no longer the host.` : `${s.hostId ? nameOf(s, s.hostId) : 'Nobody'} is the host now.`);
+      const e = s.log.slice().reverse().find((x) => hostChangeOf(x));
+      toast('info', 'host', e ? { key: 'toast.noLongerHost', params: { text: flashText(e) } } : s.hostId ? { key: 'toast.hostNow', params: { p: nameOf(s, s.hostId) } } : { key: 'toast.noHost' });
     }
   }
   if (identity && s.you && identity.id === s.you.id && !!identity.wasHost !== !!s.you.isHost) { identity.wasHost = !!s.you.isHost; saveIdentity(); }
@@ -1153,46 +1420,51 @@ function announce(prev, next) {
   if (ui.quiet || !prev || prev.room !== next.room || !Array.isArray(next.log)) return;
   const lastId = prev.log && prev.log.length ? prev.log[prev.log.length - 1].id : 0;
   // A player who leaves or is kicked in the middle of a game is out for good (§6), and the votes cast for them are
-  // wiped (§3): that is flashed like an ejection, not left to the log (SPEC §11, f2). Only the exact line shapes of a
-  // listed player count (public/loglines.js), never a name that happens to read "… left the game".
+  // wiped (§3): that is flashed like an ejection, not left to the log (SPEC §11, f2). Only the leave keys count (and,
+  // without keys, the exact line shapes of a listed player: public/loglines.js), never a name that happens to read
+  // "… left the game". The viewer's own leave is not flashed to them.
   const names = [...new Set([...prev.players, ...next.players].map((p) => p.name))];
   const inGame = GAME_PHASES.includes(next.phase);
-  const leaves = inGame ? next.log.filter((e) => e.id > lastId && isLeaveLine(e, names) && !e.text.startsWith(`${next.you.name} `)) : [];
+  const mine = (e) => (keyed(e) ? e.params.p === next.you.id : e.text.startsWith(`${next.you.name} `));
+  const leaves = inGame ? next.log.filter((e) => e.id > lastId && isLeaveLine(e, names) && !mine(e)) : [];
   // The viewer's vote went to a player who just left: §3 wiped it, and the ballot waits for them again (or the host's
   // Close vote counts them as abstaining). Say why, here and in the bar (ui.voteWiped), instead of a silent re-prompt.
   const wiped = voteWipe(prev, next, leaves);
-  ui.voteWiped = wiped ? { key: ballotKey(next), text: wiped.text } : ui.voteWiped && ui.voteWiped.key === ballotKey(next) && !(next.me && next.me.myVote) ? ui.voteWiped : null;
+  ui.voteWiped = wiped ? { key: ballotKey(next), p: wiped.p, kicked: wiped.kicked } : ui.voteWiped && ui.voteWiped.key === ballotKey(next) && !(next.me && next.me.myVote) ? ui.voteWiped : null;
   const fresh = next.log.filter((e) => e.id > lastId && (e.kind === 'special' || e.kind === 'eject' || (leaves.includes(e) && !(wiped && wiped.line === e))));
   // the host role moved (handed over, or passed on after 45 s offline): flashed to everyone with its reason, and the
   // new host is told what it means for them (a returning ex-host sees the same line, so they know why)
-  const hostNews = next.log.filter((e) => e.id > lastId && e.kind === 'info' && / is now the host$/.test(e.text)).pop();
+  const hostNews = next.log.filter((e) => e.id > lastId && hostChangeOf(e)).pop();
   // the move that ends the game is told by the final banner itself: no flash over it
   if (next.phase !== 'final') {
-    // an airlock line (SPEC §11 X1's exact shapes, never a 🚪 in a name) gets its own kicker
+    // an airlock line (its key; without keys, SPEC §11 X1's exact shapes, never a 🚪 in a name) gets its own kicker
     // the last Airlock of the game was just played: an earlier "one more Airlock … is out" flash is no longer true
     const spent = airlocksLeft(next) === 0;
     if (spent) ui.toasts = ui.toasts.filter((t) => !t.threat);
     // (phones keep one flash at a time, desktops two: the vote note below comes last, so it is the one that stays)
     for (const e of fresh.slice(isNarrow() ? -1 : -2)) {
-      const air = airlockLine(e.text, e.kind);
+      const air = airlockOf(e);
       let text = flashText(e);
       // the last Airlock of the game just opened one: nobody is left to close it, so it is no threat (SPEC §11, f2)
-      if (air && air.kind === 'start' && spent) text = `🚪 ${air.by} started cycling the airlock on ${air.target}. That was the last Airlock in the game, so nobody can close it: it jams when ${airEnd(next)}.`;
+      if (air && air.kind === 'start' && spent) {
+        const a = keyed(e) ? air.byName || nameOf(next, air.a) : air.by;
+        const t = keyed(e) ? air.target || nameOf(next, air.t) : air.target;
+        text = { key: 'toast.airLastStarted', params: { a, t, ot: airEnd(next) } };
+      }
       toast('info', leaves.includes(e) ? 'leave' : e.kind, text, { air: !!air, threat: !!air && air.kind === 'start' && !spent });
     }
-    if (wiped) toast('info', 'vote', wiped.text);
+    if (wiped) toast('info', 'vote', wipedMsg(ui.voteWiped, false));
     // SPEC §11 X6: the host ended the game mid-way: everyone lands in the lobby, and is told why
     if (GAME_PHASES.includes(prev.phase) && next.phase === 'lobby' && next.log.some((e) => e.id > lastId && isEndGameLine(e))) {
-      const host = next.hostId ? nameOf(next, next.hostId) : 'The host';
-      toast('info', 'ended', next.you.isHost ? 'You ended the game. Late arrivals can take a seat now.'
-        : next.you.role === 'spectator' ? `${host} ended the game. You can take a seat now.`
-          : `${host} ended the game. Back to the lobby, same seats.`);
+      const host = next.hostId ? nameOf(next, next.hostId) : tr('common.TheHost');
+      toast('info', 'ended', next.you.isHost ? { key: 'toast.endedHost' }
+        : { key: next.you.role === 'spectator' ? 'toast.endedSpectator' : 'toast.endedPlayer', params: { host } });
     }
     if (hostNews) {
-      const who = next.players.find((p) => hostNews.text.endsWith(` — ${p.name} is now the host`));
-      const why = who ? hostNews.text.slice(0, -` — ${who.name} is now the host`.length) : '';
       if (next.you.isHost && !prev.you.isHost) {
-        toast('info', 'host', `${why ? why + '. ' : ''}You are the host now: you move the game on with ${next.phase === 'lobby' ? 'Start' : 'Next'}.`);
+        const mode = next.phase === 'lobby' ? 0 : 1;
+        const why = hostWhy(next, hostNews);
+        toast('info', 'host', why ? { key: 'toast.youAreHostWhy', params: { text: why, mode } } : { key: 'toast.youAreHost', params: { mode } });
       } else toast('info', 'host', flashText(hostNews));
     }
   } else ui.toasts = ui.toasts.filter((t) => t.kind !== 'info');
@@ -1201,37 +1473,61 @@ function announce(prev, next) {
   const isMine = next.turn && next.turn.speakerId === next.you.id && (!prev.turn || prev.turn.speakerId !== next.turn.speakerId || prev.turn.kind !== next.turn.kind);
   if (isMine && !wasMine) { try { if (navigator.vibrate) navigator.vibrate(120); } catch { /* not supported */ } }
 }
-// SPEC §11 X6: the server's line for an End game, and whether the lobby on screen came from one (no game began since).
-function isEndGameLine(e) { return !!e && e.kind === 'system' && e.text === 'The host ended the game'; }
+// Why the host role moved, as the new host's flash says it ("Anna handed over the host role"), or '' without a reason.
+// By key: the nested reason's own words in the client's dictionary (the server's line is never cut apart, design
+// §8.2a); without keys: the English line before " — {name} is now the host".
+function hostWhy(s, e) {
+  if (keyed(e)) {
+    const w = (hostChangeOf(e) || {}).why;
+    const key = w ? { 'host.offline': 'toast.whyOffline', 'host.handover': 'toast.whyHandover' }[w.key] : null;
+    if (!key) return '';
+    const id = w.params && w.params.p;
+    return tr(key, { p: partName(e, id) || nameOf(s, id) });
+  }
+  const who = s.players.find((p) => e.text.endsWith(` — ${p.name} is now the host`));
+  return who ? e.text.slice(0, -` — ${who.name} is now the host`.length) : '';
+}
+// SPEC §11 X6: whether the lobby on screen came from an End game (its line, public/loglines.js, and no game began since).
 function endedByHost(s) {
   const log = s.log || [];
   for (let i = log.length - 1; i >= 0; i--) {
     if (isEndGameLine(log[i])) return true;
-    if (log[i].kind === 'system' && /^The game (begins|started)\b/.test(log[i].text)) return false;
+    if (isGameStartLine(log[i])) return false;
   }
   return false;
 }
 // The ballot a vote belongs to (the viewer's vote is per ballot and stage).
 function ballotKey(s) { return s && s.vote ? [s.room, s.round, !!s.overtime, s.vote.ballot, s.vote.stage].join('|') : ''; }
-// {text, line} when the viewer's vote in the running ballot was for a player who has just left or been kicked (the
-// server then drops it, SPEC §3), else null.
+// {p, kicked, line} when the viewer's vote in the running ballot was for a player p who has just left or been kicked
+// (the server then drops it, SPEC §3), else null.
 function voteWipe(prev, next, leaves) {
   const was = prev.me && prev.me.myVote;
   if (!was || !next.me || next.me.myVote || next.phase !== 'vote' || !prev.vote || ballotKey(prev) !== ballotKey(next)) return null;
   const p = byId(next, was);
   if (!p || p.status !== 'left') return null;
-  const line = leaves.find((e) => e.text === `${p.name} left the game` || e.text === `${p.name} was removed by the host`) || null;
-  const how = line && line.text.endsWith(' was removed by the host') ? 'was removed by the host' : 'left the game';
-  return { line, text: `${p.name} ${how}, so your vote for them no longer counts: vote again.` };
+  const line = leaves.find((e) => (keyed(e) ? e.params.p === p.id : e.text === `${p.name} left the game` || e.text === `${p.name} was removed by the host`)) || null;
+  const kicked = !!line && (keyed(line) ? line.key === 'log.kicked' : line.text.endsWith(' was removed by the host'));
+  return { line, p: p.name, kicked };
+}
+// what the viewer is told about a wiped vote: the flash and the bar ("…: vote again."), or the vote panel's own words
+function wipedMsg(w, panel) {
+  const key = (w.kicked ? 'vote.wipedKicked' : 'vote.wipedLeft') + (panel ? 'Panel' : '');
+  return { key, params: { p: w.p } };
 }
 // A flash leads with the outcome: "Anna played “Spy” → …", without the round prefix and the card's rules text
-// (both stay in the log).
+// (both stay in the log). By key: the line's parts without its `prefix` and `cardtext` parts (design §8.2), in the
+// viewer's language; without keys: read from the English text.
 function flashText(e) {
-  let t = String(e.text || '');
-  // a special's own line is read from its player's name (a name may itself read "X played “T”: …")
-  const m = e.kind === 'special' ? specialLine(t) : null;
-  if (m) t = `${m.name} played “${m.title}” → ${m.result}`;
-  else t = t.replace(/^(?:Round \d+|Overtime)\s+—\s+/, '');
+  const fp = flashParts(e);
+  let t;
+  if (fp) t = partsText(fp);
+  else {
+    t = String(e.text || '');
+    // a special's own line is read from its player's name (a name may itself read "X played “T”: …")
+    const m = e.kind === 'special' ? specialLine(t) : null;
+    if (m) t = `${m.name} played “${m.title}” → ${m.result}`;
+    else t = t.replace(/^(?:Round \d+|Overtime)\s+—\s+/, '');
+  }
   return t.length > 170 ? t.slice(0, 167) + '…' : t;
 }
 function resultSig(r) {
@@ -1240,12 +1536,15 @@ function resultSig(r) {
 function trackChanges(prev, next) {
   const now = Date.now();
   let fresh = false;
+  // SPEC §11 X5 (design §9.3): the first state in another language changes the text of every revealed card; that is
+  // not a game event, so there only a card that was hidden and is shown now counts as new
+  const relang = !!prev && typeof prev.you.lang === 'string' && typeof next.you.lang === 'string' && prev.you.lang !== next.you.lang;
   if (prev && prev.room === next.room && next.phase !== 'final' && prev.phase !== 'lobby') {
     for (const p of next.players) {
       const op = prev.players.find((x) => x.id === p.id);
       if (!op) continue;
       for (const c of Object.keys(p.cards || {})) {
-        if (p.cards[c] != null && p.cards[c] !== op.cards[c]) { freshAt.set(p.id + ':' + c, now); fresh = true; }
+        if (p.cards[c] != null && (relang ? op.cards[c] == null : p.cards[c] !== op.cards[c])) { freshAt.set(p.id + ':' + c, now); fresh = true; }
       }
       if (op.status === 'alive' && p.status !== 'alive') { outAt.set(p.id, now); fresh = true; }
     }
@@ -1268,9 +1567,14 @@ function trackChanges(prev, next) {
 }
 
 /* ------------------------------------------------------------------ toasts */
+// `message`: a string (the server's words, a flash of a log line) or {key, params} (the client's own words: rendered when
+// drawn, and compared by key and params, not by the rendered text)
+function msgSig(m) { return typeof m === 'string' ? m : '\u0001' + m.key + '\u0001' + JSON.stringify(m.params || {}); }
+function msgText(m) { return typeof m === 'string' ? m : m ? tr(m.key, m.params) : ''; }
 function toast(kind, code, message, extra) {
   const now = Date.now();
-  const dup = ui.toasts.find((t) => t.code === code && t.message === message);
+  const sig = msgSig(message);
+  const dup = ui.toasts.find((t) => t.code === code && msgSig(t.message) === sig);
   if (dup) { dup.until = Math.max(dup.until, now + 5000); scheduleRender(); return; }
   const t = { id: ++toastSeq, kind, code, message, air: !!(extra && extra.air), threat: !!(extra && extra.threat), until: now + (kind === 'error' ? 5500 : 4200) };
   ui.toasts.push(t);
@@ -1550,13 +1854,14 @@ function render() {
     tree = h('div', null, h('div', { class: 'screen center' },
       h('div', { class: 'hz-strip', 'aria-hidden': 'true' }),
       h('div', { class: 'panel narrow' },
-        h('div', { class: 'panel-head' }, h('h2', { text: 'Display error' })),
-        h('p', { class: 'big-line', text: 'Something unexpected arrived and this screen could not be drawn. Your seat is safe.' }),
-        h('div', { class: 'row gap' }, h('button', { class: 'btn primary', act: 'reload' }, 'Reload the page')))), vToasts());
+        h('div', { class: 'panel-head' }, h('h2', { text: tr('screen.errorTitle') })),
+        h('p', { class: 'big-line', text: tr('screen.errorText') }),
+        h('div', { class: 'row gap' }, h('button', { class: 'btn primary', act: 'reload' }, tr('screen.reload'))))), vToasts());
   }
   morphChildren(root, tree);
   const logAfter = root.querySelector('[data-testid="log"]');
   if (logAfter && stick) logAfter.scrollTop = logAfter.scrollHeight;
+  fitHeader(root);
   measureChrome(root);
   pinPage();
   fitBoard(root);
@@ -1698,6 +2003,50 @@ function measureChrome(root) {
 }
 // Matrix text: as many lines per card cell as fit with every row still on screen (2..8), or all of it on request.
 // The clamp is tried against the real layout (a few synchronous reflows), so short rows leave room for long ones.
+// A long phase name (RU «Переголосование», or "Discussion" beside "Overtime") must not push the header's last buttons
+// (Rules, ⋯) onto a row of their own on a narrow phone (+42 px of header): when the header's first line overflows, the
+// phase value gives way, first by a smaller size (down to 10 px), then by an ellipsis. The word itself stays in the DOM
+// (testid "phase") and the action bar names the phase in full. Measured after every render (morph drops the inline
+// style), before measureChrome reads the header's height. A header that fits is left exactly as rendered.
+function fitHeader(root) {
+  const row = root.querySelector('.hdr > .hdr-row');
+  const cell = row && row.querySelector('.phase-cell');
+  const v = cell && cell.querySelector('.v');
+  if (!v) return;
+  let over = headerOverflow(row, cell);
+  if (over <= 0) return;
+  v.classList.add('squeezed');
+  const w = v.getBoundingClientRect().width;
+  const fs = parseFloat(getComputedStyle(v).fontSize) || 14;
+  v.style.fontSize = `${Math.max(10, Math.floor((fs * (w - over - 1)) / w * 10) / 10)}px`;
+  over = headerOverflow(row, cell);
+  if (over > 0) v.style.maxWidth = `${Math.max(40, Math.floor(v.getBoundingClientRect().width - over - 1))}px`;
+}
+/** How many px the header's first line lacks: the width of what wrapped onto a line of its own before the row break
+ *  (hdr-break), minus the room still free on the first line (the end of the line, and the spacer that pushes Rules to
+ *  the right). 0 when nothing wrapped (or the row has no break). */
+function headerOverflow(row, cell) {
+  const brk = row.querySelector('.hdr-break');
+  if (!brk || getComputedStyle(brk).display === 'none') return 0;
+  const top = cell.getBoundingClientRect().top;
+  const breakTop = brk.getBoundingClientRect().top;
+  const rcs = getComputedStyle(row);
+  const right = row.getBoundingClientRect().right - parseFloat(rcs.paddingRight);
+  let lastRight = 0;
+  let stray = 0;
+  let free = 0;
+  for (const e of row.children) {
+    if (e === brk) continue;
+    const r = e.getBoundingClientRect();
+    const first = Math.abs(r.top - top) < 8;
+    if (e.classList.contains('hdr-spacer')) { if (first) free += r.width; continue; }
+    if (!r.width) continue;
+    const cs = getComputedStyle(e);
+    if (first) lastRight = Math.max(lastRight, r.right + parseFloat(cs.marginRight));
+    else if (r.top > top + 8 && r.top < breakTop - 4) stray += r.width + parseFloat(cs.marginLeft) + parseFloat(cs.marginRight);
+  }
+  return stray > 0 ? Math.ceil(stray - free - Math.max(0, right - lastRight)) : 0;
+}
 function fitBoard(root) {
   const board = root.querySelector('.board.matrix');
   if (!board) return;
@@ -1762,12 +2111,12 @@ function centerTurnStrip(root) {
   list.scrollLeft = Math.max(0, list.scrollLeft + (li.left - box.left) - (box.width - li.width) / 2);
 }
 function pageTitle() {
-  if (!state || ui.screen !== 'room') return 'Bunker Online';
+  if (!state || ui.screen !== 'room') return tr('app.title');
   const d = derive(state);
-  let pre = '';
-  if (d.canReveal || d.canEndTurn) pre = '▶ Your turn · ';
-  else if (d.voteOpen && !d.myVote) pre = '▶ Vote · ';
-  return `${pre}Bunker ${state.room}`;
+  const code = state.room;
+  if (d.canReveal || d.canEndTurn) return tr('app.titleTurn', { code });
+  if (d.voteOpen && !d.myVote) return tr('app.titleVote', { code });
+  return tr('app.titleRoom', { code });
 }
 function focusPicker() {
   if (!ui.picker) { ui.pickerFocused = ''; return; }
@@ -1829,44 +2178,51 @@ function kv(k, v, cls, attrs) {
 }
 // SPEC §11 X10: "Report an issue" / "Suggest an idea" (new tab, prefilled GitHub forms) and the quiet version, the same
 // wherever they appear: the header menu, the rules sheet, the final screen and the landing footer. `room` only in a
-// room. Strings: public/strings.js; URLs and the version: public/feedback.js.
-function uiLang() { return document.documentElement.lang || 'en'; }   // EN|RU for the links (the i18n pass sets <html lang>)
+// room. Strings: fb.* in public/i18n/en.js (were public/strings.js); URLs and the version: public/feedback.js.
+// (the links carry the UI's language, EN|RU: uiLang() is i18n's lang())
 function feedbackLinks(where, room) {
-  const a = (testid, href, text) => h('a', { class: 'rep-link', testid, href, target: '_blank', rel: 'noopener noreferrer', title: STR.newTabHint, 'data-where': where }, text);
+  const a = (testid, href, text) => h('a', { class: 'rep-link', testid, href, target: '_blank', rel: 'noopener noreferrer', title: tr('fb.newTab'), 'data-where': where }, text);
   return h('span', { class: ['rep-links', 'rep-' + where] },
-    a('report-issue-link', issueUrl({ lang: uiLang(), room: room || '' }), STR.reportIssue),
-    a('suggest-idea-link', ideaUrl({ lang: uiLang() }), STR.suggestIdea));
+    a('report-issue-link', issueUrl({ lang: uiLang(), room: room || '' }), tr('fb.reportIssue')),
+    a('suggest-idea-link', ideaUrl({ lang: uiLang() }), tr('fb.suggestIdea')));
 }
 function versionTag(where) {
   const v = appVersion();
-  return h('span', { class: 'app-version mono', testid: 'app-version', 'data-version': v, 'data-where': where, title: STR.versionHint, text: STR.versionLine({ v }) });
+  return h('span', { class: 'app-version mono', testid: 'app-version', 'data-version': v, 'data-where': where, title: tr('fb.versionHint'), text: tr('fb.version', { code: v }) });
 }
 // the header menu ("⋯"): the links and the version in every in-room phase, one tap away and never in the way of play
 function vHdrMenu(s) {
   const open = !!ui.menuOpen;
   return h('div', { class: ['hdr-menu', open && 'is-open'], key: 'hdr-menu' },
-    h('button', { class: 'btn ghost sm hdr-menu-btn', act: 'hdr-menu', testid: 'header-menu-btn', 'aria-haspopup': 'true', 'aria-expanded': String(open), 'aria-label': STR.menuLabel, title: STR.menuHint },
+    h('button', { class: 'btn ghost sm hdr-menu-btn', act: 'hdr-menu', testid: 'header-menu-btn', 'aria-haspopup': 'true', 'aria-expanded': String(open), 'aria-label': tr('fb.menu'), title: tr('fb.menuHint') },
       h('span', { class: 'hm-dots', 'aria-hidden': 'true', text: '⋯' })),
-    open && h('div', { class: 'hdr-menu-pop', testid: 'header-menu', role: 'group', 'aria-label': STR.menuTitle },
+    open && h('div', { class: 'hdr-menu-pop', testid: 'header-menu', role: 'group', 'aria-label': tr('fb.menuTitle') },
       h('div', { class: 'hm-head' },
-        h('span', { class: 'hm-k', text: STR.menuTitle }),
-        h('button', { class: 'hm-x', act: 'hdr-menu', 'aria-label': STR.closeLabel }, '×')),
-      h('p', { class: 'hm-lead', text: STR.menuLead }),
+        h('span', { class: 'hm-k', text: tr('fb.menuTitle') }),
+        h('button', { class: 'hm-x', act: 'hdr-menu', 'aria-label': tr('common.close') }, '×')),
+      h('p', { class: 'hm-lead', text: tr('fb.menuLead') }),
       feedbackLinks('menu', s ? s.room : ''),
       h('div', { class: 'hm-foot' }, versionTag('menu'))));
 }
+/** Joined again, but the state on screen is the old socket's, and in another language than the page (a switch made
+ * while offline): still reconnecting until this socket's first state replaces it, so the mixed screen has the banner
+ * (design §9.3 step 3). */
+function staleLangScreen() {
+  return joinedOnSocket && !stateOnSocket && !!state && !!state.you && typeof state.you.lang === 'string' && normLang(state.you.lang) !== uiLang();
+}
+function socketOnline() { return conn.status === 'open' && joinedOnSocket && !staleLangScreen(); }
 function connBanner() {
   // an open socket that has not (re)joined yet is still reconnecting: the table on screen is not live
-  const st = MOCK ? ui.mockConn : (conn.status === 'open' && joinedOnSocket ? 'open' : conn.status === 'open' && identity ? 'connecting' : conn.status);
+  const st = MOCK ? ui.mockConn : (socketOnline() ? 'open' : conn.status === 'open' && identity ? 'connecting' : conn.status);
   if (!st || st === 'open' || st === 'idle') return null;
   const secs = conn.nextAt ? Math.max(0, Math.ceil((conn.nextAt - Date.now()) / 1000)) : 0;
-  const msg = st === 'waiting' ? `Retrying in ${secs}s (attempt ${conn.attempt}).` : 'Reconnecting…';
+  const msg = st === 'waiting' ? tr('conn.retrying', { secs, n: conn.attempt }) : tr('conn.reconnectingDots');
   const busy = st === 'waiting' && conn.why === 'busy';
   return h('div', { class: 'conn-banner', role: 'status', testid: 'conn-banner', 'data-why': busy ? 'busy' : null },
     h('span', { class: 'conn-pulse', 'aria-hidden': 'true' }),
-    h('strong', { text: busy ? 'The server is busy.' : 'Connection lost.' }), ' ',
-    busy ? 'Too many wrong room codes came from your network, so it asks everyone there to wait a moment. ' : null, msg, ' Your seat is kept.',
-    h('button', { class: 'btn xs', act: 'retry-now' }, 'Retry now'));
+    h('strong', { text: busy ? tr('conn.busy') : tr('conn.lost') }), ' ',
+    busy ? tr('conn.busyText') + ' ' : null, msg, ' ' + tr('conn.seatKept'),
+    h('button', { class: 'btn xs', act: 'retry-now' }, tr('conn.retryNow')));
 }
 
 /* ---------- landing */
@@ -1883,73 +2239,78 @@ function vLanding() {
   // the way back; Join would seat the same person twice ("Mia (2)"), or make them a spectator of their own game
   const sameSeat = !!offer && invited && offer.room === L.invite;
   let hint = '';
-  if (!nameOk) hint = invited ? `You are invited to room ${L.invite}. Enter your name first: it is what the others see at the table.` : 'Enter your name first. It is what the others see at the table.';
-  else if (L.room && !codeOk) hint = 'Room codes are 4 letters (there is no I or O).';
-  else if (!L.room) hint = 'Have a code? Type it to join or watch.';
-  else if (sameSeat && L.room === L.invite) hint = `You already have a seat in room ${L.room}${offer.name ? ` as ${offer.name}` : ''}: tap Rejoin above to take it back. Join adds a second, new player.`;
-  else if (invited && L.room === L.invite) hint = `You are invited to room ${L.room}. Press Join to take a seat at the table.`;
+  if (!nameOk) hint = invited ? tr('landing.hintInvitedName', { code: L.invite }) : tr('landing.hintName');
+  else if (L.room && !codeOk) hint = tr('landing.hintCode');
+  else if (!L.room) hint = tr('landing.hintHaveCode');
+  else if (sameSeat && L.room === L.invite) hint = offer.name ? tr('landing.hintSeatAs', { code: L.room, name: offer.name }) : tr('landing.hintSeat', { code: L.room });
+  else if (invited && L.room === L.invite) hint = tr('landing.hintInvited', { code: L.room });
   const nameField = h('label', { class: 'field' },
-    h('span', { class: 'field-k', text: 'Your name' }),
+    h('span', { class: 'field-k', text: tr('landing.name') }),
     h('input', {
       class: 'input', testid: 'name-input', 'data-field': 'name', maxlength: '80', autocomplete: 'nickname',
-      placeholder: 'e.g. Anna', spellcheck: 'false', value: L.name, enterkeyhint: 'go',
+      placeholder: tr('landing.namePh'), spellcheck: 'false', value: L.name, enterkeyhint: 'go',
     }));
   const codeField = h('label', { class: 'field code-field' },
-    h('span', { class: 'field-k', text: 'Room code' }),
+    h('span', { class: 'field-k', text: tr('landing.code') }),
     h('input', {
       class: 'input code', testid: 'room-input', 'data-field': 'room', maxlength: '4', autocomplete: 'off',
-      autocapitalize: 'characters', spellcheck: 'false', placeholder: 'ABCD', value: L.room, enterkeyhint: 'go',
+      autocapitalize: 'characters', spellcheck: 'false', placeholder: tr('landing.codePh'), value: L.room, enterkeyhint: 'go',
     }));
   const joinOff = !(nameOk && codeOk) || busy;
   const form = invited
     ? h('div', { class: 'panel form invited' },
-      h('div', { class: 'invite-head' }, h('span', { class: 'k', text: 'You are invited to room' }), h('span', { class: 'invite-code-big mono', text: L.room || L.invite })),
+      h('div', { class: 'invite-head' }, h('span', { class: 'k', text: tr('landing.invitedTo') }), h('span', { class: 'invite-code-big mono', text: L.room || L.invite })),
       nameField,
       h('button', { class: ['btn block', sameSeat && L.room === L.invite ? 'ghost' : 'primary big'], testid: 'join-btn', act: 'join', disabled: joinOff },
-        sameSeat && L.room === L.invite ? 'Join as a new player' : codeOk ? `Join room ${L.room}` : 'Join'),
+        sameSeat && L.room === L.invite ? tr('landing.joinNew') : codeOk ? tr('landing.joinRoom', { code: L.room }) : tr('landing.join')),
       h('div', { class: 'join-row invited-row' },
         codeField,
-        h('button', { class: 'btn ghost', testid: 'spectate-btn', act: 'spectate', disabled: joinOff }, 'Just watch')),
-      h('p', { class: 'fine hint', text: busy ? 'Connecting…' : hint }),
-      h('div', { class: 'or', 'aria-hidden': 'true' }, h('span', { text: 'not this room?' })),
-      h('button', { class: 'btn ghost block', testid: 'create-btn', act: 'create', disabled: !nameOk || busy }, 'Start a different game of my own'))
+        h('button', { class: 'btn ghost', testid: 'spectate-btn', act: 'spectate', disabled: joinOff }, tr('landing.justWatch'))),
+      h('p', { class: 'fine hint', text: busy ? tr('landing.connecting') : hint }),
+      h('div', { class: 'or', 'aria-hidden': 'true' }, h('span', { text: tr('landing.notThisRoom') })),
+      h('button', { class: 'btn ghost block', testid: 'create-btn', act: 'create', disabled: !nameOk || busy }, tr('landing.createOwn')))
     : h('div', { class: 'panel form' },
       nameField,
-      h('button', { class: 'btn primary block big', testid: 'create-btn', act: 'create', disabled: !nameOk || busy }, 'Create a new game'),
-      h('div', { class: 'or', 'aria-hidden': 'true' }, h('span', { text: 'or use a room code' })),
+      h('button', { class: 'btn primary block big', testid: 'create-btn', act: 'create', disabled: !nameOk || busy }, tr('landing.create')),
+      h('div', { class: 'or', 'aria-hidden': 'true' }, h('span', { text: tr('landing.orCode') })),
       h('div', { class: 'join-row' },
         codeField,
-        h('button', { class: 'btn', testid: 'join-btn', act: 'join', disabled: joinOff }, 'Join'),
-        h('button', { class: 'btn ghost', testid: 'spectate-btn', act: 'spectate', disabled: joinOff }, 'Watch')),
-      h('p', { class: 'fine hint', text: busy ? 'Connecting…' : hint }));
+        h('button', { class: 'btn', testid: 'join-btn', act: 'join', disabled: joinOff }, tr('landing.join')),
+        h('button', { class: 'btn ghost', testid: 'spectate-btn', act: 'spectate', disabled: joinOff }, tr('landing.watch'))),
+      h('p', { class: 'fine hint', text: busy ? tr('landing.connecting') : hint }));
+  // a notice is the client's own words ({key, params}, re-rendered in the current language) or a mock's plain text
+  const notice = ui.notice ? (ui.notice.key ? tr(ui.notice.key, ui.notice.params) : ui.notice.text) : '';
   return h('div', { class: 'screen landing' },
     h('div', { class: 'hz-strip', 'aria-hidden': 'true' }),
+    // SPEC §11 X5.7: the language switch above the brand, right-aligned (on screen at 360×640, above the form)
+    h('div', { class: 'landing-top' }, vLangSwitch('landing')),
     h('main', { class: 'landing-grid' },
       h('section', { class: 'brand' },
-        h('div', { class: 'brand-kicker' }, hazardSign(), h('span', { text: 'Shelter access terminal' }),
+        h('div', { class: 'brand-kicker' }, hazardSign(), h('span', { text: tr('landing.kicker') }),
           // SPEC §11 X9.1: this tab's storage profile (a separate player from tabs with another one)
-          PROFILE && h('span', { class: 'profile-tag mono', testid: 'profile-tag', 'data-profile': PROFILE, title: STR.profileTagHint, text: STR.profileTag({ id: PROFILE }) })),
-        h('h1', { class: 'brand-title' }, h('span', { class: 'bt-main', text: 'BUNKER' }), h('span', { class: 'bt-sub', text: 'online' })),
-        h('p', { class: 'brand-lede', text: 'A catastrophe has happened. The bunker has beds for only half of you. Reveal who you are, argue your case on voice, and vote on who stays outside.' }),
+          PROFILE && h('span', { class: 'profile-tag mono', testid: 'profile-tag', 'data-profile': PROFILE, title: tr('landing.profileHint'), text: tr('landing.profile', { code: PROFILE }) })),
+        h('h1', { class: 'brand-title' }, h('span', { class: 'bt-main', text: tr('landing.brandMain') }), h('span', { class: 'bt-sub', text: tr('landing.brandSub') })),
+        h('p', { class: 'brand-lede', text: tr('landing.lede') }),
         vFan()),
       h('section', { class: 'brand-how' },
         h('ol', { class: 'brand-steps' },
-          h('li', null, h('span', { class: 'n', text: '01' }), h('span', { text: 'Get everyone on a voice call (Discord, Telegram…). There is no chat here.' })),
-          h('li', null, h('span', { class: 'n', text: '02' }), h('span', { text: 'One person creates a game and shares the link or the 4-letter code.' })),
-          h('li', null, h('span', { class: 'n', text: '03' }), h('span', { text: 'This page deals the cards, runs the turns and counts the votes.' })))),
+          h('li', null, h('span', { class: 'n', text: '01' }), h('span', { text: tr('landing.step1') })),
+          h('li', null, h('span', { class: 'n', text: '02' }), h('span', { text: tr('landing.step2') })),
+          h('li', null, h('span', { class: 'n', text: '03' }), h('span', { text: tr('landing.step3') })))),
       h('section', { class: 'entry' },
-        ui.notice && h('div', { class: ['callout', ui.notice.kind === 'warn' ? 'warn' : 'info'], role: 'status', testid: 'landing-notice' }, ui.notice.text),
+        ui.notice && h('div', { class: ['callout', ui.notice.kind === 'warn' ? 'warn' : 'info'], role: 'status', testid: 'landing-notice' }, notice),
         offer && h('div', { class: 'panel rejoin' },
-          h('div', { class: 'panel-head' }, h('h2', { text: 'Your last seat' }), h('span', { class: 'meta', text: `Room ${offer.room}` })),
-          h('p', { class: 'rejoin-text' }, 'You were at the table in room ', h('b', { class: 'mono', text: offer.room }),
-            offer.name ? [' as ', h('b', { text: offer.name })] : null, '. Rejoin to take your seat back.'),
+          h('div', { class: 'panel-head' }, h('h2', { text: tr('landing.lastSeat') }), h('span', { class: 'meta', text: tr('landing.roomMeta', { code: offer.room }) })),
+          h('p', { class: 'rejoin-text' }, offer.name
+            ? trn('landing.rejoinTextAs', { code: h('b', { class: 'mono', text: offer.room }), name: h('b', { text: offer.name }) })
+            : trn('landing.rejoinText', { code: h('b', { class: 'mono', text: offer.room }) })),
           h('div', { class: 'row gap' },
-            h('button', { class: 'btn primary', testid: 'rejoin-btn', act: 'rejoin', disabled: busy }, `Rejoin as ${offer.name || 'before'}`),
-            h('button', { class: 'btn ghost', act: 'forget' }, 'Forget it')),
-          h('p', { class: 'fine', text: 'Or join as someone new with the form below.' })),
+            h('button', { class: 'btn primary', testid: 'rejoin-btn', act: 'rejoin', disabled: busy }, offer.name ? tr('landing.rejoinAs', { name: offer.name }) : tr('landing.rejoinBefore')),
+            h('button', { class: 'btn ghost', act: 'forget' }, tr('landing.forget'))),
+          h('p', { class: 'fine', text: tr('landing.orNew') })),
         form)),
     h('footer', { class: 'landing-foot' },
-      h('span', { text: 'An online party game in the style of the discussion game “Bunker” («Бункер»). 4–16 players · spectators welcome.' }),
+      h('span', { text: tr('landing.footer') }),
       h('span', { class: 'foot-meta' }, feedbackLinks('landing', ''), versionTag('landing'))));
 }
 // Decorative: a hand of cards on the table — two backs, two face-up cards and a special.
@@ -1957,8 +2318,8 @@ function vFan() {
   const face = (label, text) => h('div', { class: 'fc face' }, h('span', { class: 'fc-cat', text: label }), h('span', { class: 'fc-text', text }));
   const back = () => h('div', { class: 'fc back' }, h('span', { class: 'fc-emblem' }, trefoil('fc-tre')));
   return h('div', { class: 'fan', 'aria-hidden': 'true' },
-    back(), back(), face('Baggage', 'A live goat'), face('Profession', 'Surgeon, 12 years'),
-    h('div', { class: 'fc special' }, h('span', { class: 'fc-cat', text: 'Special' }), h('span', { class: 'fc-title', text: 'Airlock' }), h('span', { class: 'fc-text', text: 'Needs a partner: two on one player and they are out.' })));
+    back(), back(), face(dictCat('baggage'), tr('fan.goat')), face(dictCat('profession'), tr('fan.surgeon')),
+    h('div', { class: 'fc special' }, h('span', { class: 'fc-cat', text: tr('fan.special') }), h('span', { class: 'fc-title', text: tr('fan.airlock') }), h('span', { class: 'fc-text', text: tr('fan.airlockText') })));
 }
 function vResuming() {
   const room = identity ? identity.room : (state ? state.room : '');
@@ -1967,70 +2328,75 @@ function vResuming() {
   return h('div', { class: 'screen center' },
     h('div', { class: 'hz-strip', 'aria-hidden': 'true' }),
     h('div', { class: 'panel narrow' },
-      h('div', { class: 'panel-head' }, h('h2', { text: 'Reconnecting' }), h('span', { class: 'meta mono', text: room })),
-      h('p', { class: 'big-line' }, 'Rejoining room ', h('b', { class: 'mono', text: room || '…' }),
-        identity && identity.name ? [' as ', h('b', { text: identity.name })] : null, '…'),
-      h('p', { class: 'fine', text: st !== 'waiting' ? 'Connecting to the table.'
-        : conn.why === 'busy' ? `The server is busy: too many wrong room codes came from your network. Your seat is kept. Retrying in ${secs}s (attempt ${conn.attempt}).`
-          : `The server is not answering. Retrying in ${secs}s (attempt ${conn.attempt}).` }),
+      h('div', { class: 'panel-head' }, h('h2', { text: tr('conn.reconnecting') }), h('span', { class: 'meta mono', text: room })),
+      h('p', { class: 'big-line' }, identity && identity.name
+        ? trn('conn.rejoiningAs', { code: h('b', { class: 'mono', text: room || '…' }), name: h('b', { text: identity.name }) })
+        : trn('conn.rejoining', { code: h('b', { class: 'mono', text: room || '…' }) })),
+      h('p', { class: 'fine', text: st !== 'waiting' ? tr('conn.connecting')
+        : conn.why === 'busy' ? tr('conn.busyRetry', { secs, n: conn.attempt }) : tr('conn.noAnswerRetry', { secs, n: conn.attempt }) }),
       h('div', { class: 'row gap' },
-        st === 'waiting' && h('button', { class: 'btn', act: 'retry-now' }, 'Retry now'),
-        h('button', { class: 'btn ghost', act: 'cancel-resume' }, 'Cancel'))));
+        st === 'waiting' && h('button', { class: 'btn', act: 'retry-now' }, tr('conn.retryNow')),
+        h('button', { class: 'btn ghost', act: 'cancel-resume' }, tr('conn.cancel')))));
 }
 function vEntering() {
   return h('div', { class: 'screen center' },
     h('div', { class: 'hz-strip', 'aria-hidden': 'true' }),
     h('div', { class: 'panel narrow' },
-      h('div', { class: 'panel-head' }, h('h2', { text: 'Entering the room' }), h('span', { class: 'meta mono', text: identity ? identity.room : '' })),
-      h('p', { class: 'big-line', text: 'Loading the table…' })));
+      h('div', { class: 'panel-head' }, h('h2', { text: tr('conn.entering') }), h('span', { class: 'meta mono', text: identity ? identity.room : '' })),
+      h('p', { class: 'big-line', text: tr('conn.loading') })));
 }
 function vReplaced() {
   return h('div', { class: 'screen center' },
     h('div', { class: 'hz-strip', 'aria-hidden': 'true' }),
     h('div', { class: 'panel narrow' },
-      h('div', { class: 'panel-head' }, h('h2', { text: 'Opened somewhere else' })),
-      h('p', { class: 'big-line', text: 'Your seat is now open in another tab or device, so this tab stopped following the game.' }),
-      h('p', { class: 'fine', text: 'Taking it back here disconnects the other tab.' }),
+      h('div', { class: 'panel-head' }, h('h2', { text: tr('conn.replaced') })),
+      h('p', { class: 'big-line', text: tr('conn.replacedText') }),
+      h('p', { class: 'fine', text: tr('conn.replacedFine') }),
       h('div', { class: 'row gap' },
-        identity && h('button', { class: 'btn primary', act: 'take-over' }, 'Use this tab instead'),
-        h('button', { class: 'btn ghost', act: 'to-landing' }, 'Back to start'))));
+        identity && h('button', { class: 'btn primary', act: 'take-over' }, tr('conn.takeOver')),
+        h('button', { class: 'btn ghost', act: 'to-landing' }, tr('conn.toStart')))));
 }
 
 /* ---------- header */
 function vHeader(s, d) {
   const inPlay = s.phase !== 'lobby';
   const inGame = GAME_PHASES.includes(s.phase);
-  const phaseText = s.phase === 'vote' && s.vote && s.vote.stage === 'revote' ? 'Revote' : PHASE_LABEL[s.phase] || s.phase;
+  const phaseText = s.phase === 'vote' && s.vote && s.vote.stage === 'revote' ? tr('phase.revote') : hasKey('phase.' + s.phase) ? tr('phase.' + s.phase) : s.phase;
   const timer = s.timer;
   const total = timer ? timerTotal(s) : 0;
   const over = Math.max(0, d.aliveList.length - s.capacity);
   return h('header', { class: 'hdr' },
     h('div', { class: 'hdr-row' },
-      h('div', { class: 'hdr-brand' }, trefoil('hb-logo'), h('span', { class: 'hb-word', text: 'BUNKER' })),
-      h('div', { class: 'hcell room-cell' }, h('span', { class: 'k', text: 'Room' }), h('span', { class: 'v mono code', testid: 'room-code', text: s.room })),
+      h('div', { class: 'hdr-brand' }, trefoil('hb-logo'), h('span', { class: 'hb-word', text: tr('hdr.brand') })),
+      h('div', { class: 'hcell room-cell' }, h('span', { class: 'k', text: tr('hdr.room') }), h('span', { class: 'v mono code', testid: 'room-code', text: s.room })),
       inPlay && h('div', { class: ['hcell round-cell', s.overtime && 'ot'], testid: 'round', 'data-round': String(s.round), 'data-overtime': String(!!s.overtime) },
-        h('span', { class: 'k', text: s.overtime ? 'Round 7 +' : 'Round' }), ' ',
-        h('span', { class: 'v' }, s.overtime ? 'Overtime' : `${s.round}/${s.maxRounds}`)),
-      h('div', { class: ['hcell phase-cell', 'ph-' + s.phase] }, h('span', { class: 'k', text: 'Phase' }),
+        h('span', { class: 'k', text: s.overtime ? tr('hdr.roundOt') : tr('hdr.round') }), ' ',
+        h('span', { class: 'v' }, s.overtime ? tr('hdr.overtime') : `${s.round}/${s.maxRounds}`)),
+      h('div', { class: ['hcell phase-cell', 'ph-' + s.phase] }, h('span', { class: 'k', text: tr('hdr.phase') }),
         h('span', { class: 'v', testid: 'phase', 'data-phase': s.phase, text: phaseText })),
-      inPlay && h('div', { class: 'hcell beds-cell', title: 'Beds in the bunker vs players still in the game' },
-        h('span', { class: 'k', text: 'Beds / alive' }),
+      inPlay && h('div', { class: 'hcell beds-cell', title: tr('hdr.bedsTitle') },
+        h('span', { class: 'k', text: tr('hdr.beds') }),
         h('span', { class: 'v' }, h('b', { class: 'beds', text: String(s.capacity) }), h('span', { class: 'sep', text: ' / ' }), h('span', { text: String(d.aliveList.length) }),
-          inGame && over > 0 ? h('span', { class: 'over-chip', title: `${plural(over, 'player')} more than there are beds: that many must still leave` }, `${over} too many`) : null)),
+          inGame && over > 0 ? h('span', { class: 'over-chip', title: tr('hdr.overTitle', { n: over }) }, tr('hdr.over', { n: over })) : null)),
       inGame && (() => { const nv = nextVoteShort(s); return h('div', { class: 'hcell wide-only nv-cell', title: nv.title },
-        h('span', { class: 'k', text: 'Next vote' }), h('span', { class: ['v', nv.cls], text: nv.v })); })(),
+        h('span', { class: 'k', text: tr('hdr.nextVote') }), h('span', { class: ['v', nv.cls], text: nv.v })); })(),
       inGame && vRoundTrack(s, 'hdr-track'),
       h('div', { class: 'hdr-spacer' }),
       h('div', { class: 'hdr-break', 'aria-hidden': 'true' }),
       timer && h('div', { class: 'hcell timer-cell', 'data-timer-box': '' },
-        h('span', { class: 'k', text: timer.label || 'Timer' }),
-        h('span', { class: 'v mono', testid: 'timer', 'data-ends': String(timer.endsAt), text: fmtClock(timer.endsAt - serverNow()) })),
+        h('span', { class: 'k', text: timer.label || tr('hdr.timer') }),
+        // "time's up" beside the clock, shown by CSS once updateTimers marks the cell .over: outside the label, whose end
+        // gives way to a long name (on phones the red 0:00 says it alone)
+        h('span', { class: 'tv' },
+          h('span', { class: 'v mono', testid: 'timer', 'data-ends': String(timer.endsAt), text: fmtClock(timer.endsAt - serverNow()) }),
+          h('span', { class: 'over-tag', text: tr('hdr.timeUp') }))),
       inPlay && vJumpNav(s, d),
       h('div', { class: 'hcell you-cell' },
-        h('span', { class: 'k', text: d.isSpectator ? 'Watching as' : d.isHost ? 'You · host' : 'You' }),
+        h('span', { class: 'k', text: d.isSpectator ? tr('hdr.watchingAs') : d.isHost ? tr('hdr.youHost') : tr('hdr.you') }),
         h('span', { class: 'v you-name', text: s.you.name })),
       narrHook((n) => n.headerControl(s)),   // narrator hook: the header button + its popover
-      h('button', { class: 'btn ghost sm rules-btn', act: 'rules', title: 'How to play: the goal, a round, the vote and the specials', 'aria-label': 'How to play' }, 'Rules'),
+      vLangSwitch('header'),   // SPEC §11 X5.7: EN | RU, right before Rules
+      h('button', { class: 'btn ghost sm rules-btn', act: 'rules', title: tr('hdr.rulesTitle'), 'aria-label': tr('hdr.rulesAria') }, tr('hdr.rules')),
       vHdrMenu(s),   // SPEC §11 X10: Report an issue / Suggest an idea
       // phones in play: Leave moves to the foot of the page, away from the jump chips right under it
       isNarrow() && inPlay ? null : vLeaveBtn(s, d, 'header')),
@@ -2056,22 +2422,22 @@ function vLeaveBtn(s, d, where) {
   const final = leaveIsFinal(s, d);
   const armed = final && isArmed('leave');
   const settling = armed && !armReady('leave');
-  let title = d.isSpectator ? 'Stop watching' : final ? 'Leave this game for good: you cannot come back into it' : 'Leave the room';
-  if (!d.online) title = 'Reconnecting — you can leave once the connection is back';
+  let title = d.isSpectator ? tr('leave.stopWatching') : final ? tr('leave.titleFinal') : tr('leave.titleRoom');
+  if (!d.online) title = tr('leave.titleOffline');
   return h('button', {
     class: ['btn sm leave', where === 'foot' || armed ? 'danger' : 'ghost', armed && 'armed', settling && 'settling', 'at-' + where], testid: 'leave-btn', act: 'leave',
-    disabled: !d.online || d.shield || settling, title, 'aria-label': armed ? 'Tap again to leave the game for good' : null,
-  }, armed ? 'Tap again to leave' : d.isSpectator && where === 'foot' ? 'Stop watching' : 'Leave');
+    disabled: !d.online || d.shield || settling, title, 'aria-label': armed ? tr('leave.armedAria') : null,
+  }, armed ? tr('leave.armed') : d.isSpectator && where === 'foot' ? tr('leave.stopWatching') : tr('leave.btn'));
 }
 function vLeavePanel(s, d) {
   const final = leaveIsFinal(s, d);
   const armed = final && isArmed('leave');
   let text;
-  if (d.isSpectator) text = 'You can come back with the link at any time.';
-  else if (!final) text = 'Leave the table.';
-  else if (armed) text = 'Tap again to leave for good. You cannot come back into this game.';
-  else text = 'Leaving is for good: you cannot come back into this game, and you count as out.';
-  if (!d.online) text = 'Reconnecting — you can leave once the connection is back.';
+  if (d.isSpectator) text = tr('leave.panelSpectator');
+  else if (!final) text = tr('leave.panelLobby');
+  else if (armed) text = tr('leave.panelArmed');
+  else text = tr('leave.panelFinal');
+  if (!d.online) text = tr('leave.panelOffline');
   return h('section', { class: ['panel leave-panel', armed && 'armed'], id: 'sec-leave' },
     h('p', { class: 'leave-text', text }),
     vLeaveBtn(s, d, 'foot'));
@@ -2079,23 +2445,24 @@ function vLeavePanel(s, d) {
 function nextVoteShort(s) {
   const sch = s.schedule || {};
   const k = sch.kicksThisStep || 0;
-  if (s.phase === 'vote' || s.phase === 'defense') { const n = s.vote ? ballotsOf(s) : k; return { v: `now · ${n} out`, cls: 'red', title: `This vote step ejects ${plural(n, 'player')}` }; }
-  if (k > 0 && s.voteMods && s.voteMods.cancelNext) return { v: 'cancelled', cls: 'dim', title: 'The next vote was cancelled by a special card' };
-  if (k > 0) return { v: `this round · ${k} out`, cls: 'red', title: `After this round's discussion ${plural(k, 'player')} will be voted out` };
-  if (sch.nextVoteRound) return { v: `after R${sch.nextVoteRound}`, cls: '', title: `No vote this round; the next one is after round ${sch.nextVoteRound}` };
-  return { v: '—', cls: 'dim', title: 'No more votes scheduled' };
+  if (s.phase === 'vote' || s.phase === 'defense') { const n = s.vote ? ballotsOf(s) : k; return { v: tr('hdr.nvNow', { n }), cls: 'red', title: tr('hdr.nvNowTitle', { n }) }; }
+  if (k > 0 && s.voteMods && s.voteMods.cancelNext) return { v: tr('hdr.nvCancelled'), cls: 'dim', title: tr('hdr.nvCancelledTitle') };
+  if (k > 0) return { v: tr('hdr.nvRound', { k }), cls: 'red', title: tr('hdr.nvRoundTitle', { k }) };
+  if (sch.nextVoteRound) return { v: tr('hdr.nvAfter', { r: sch.nextVoteRound }), cls: '', title: tr('hdr.nvAfterTitle', { r: sch.nextVoteRound }) };
+  return { v: '—', cls: 'dim', title: tr('hdr.nvNoneTitle') };
 }
 function turnState(s, p) {
   const t = s.turn;
   if (!t) return null;
   const i = t.order.indexOf(p.id);
-  if (i === -1) return t.kind === 'reveal' && p.status === 'alive' ? { text: 'no turn', cls: 'dim', title: 'No turn this round (was out when the round started)' } : null;
-  if (i < t.index) return { text: t.kind === 'reveal' ? '✓ spoke' : '✓ defended', cls: 'ok' };
-  if (i === t.index) return { text: t.kind === 'reveal' ? (t.hasRevealed ? '▶ speaking' : '▶ picking') : '▶ defending', cls: 'hz', title: t.kind === 'reveal' && !t.hasRevealed ? 'Choosing a card to reveal' : null };
-  if (p.status !== 'alive') return { text: 'skipped', cls: 'dim' };
+  if (i === -1) return t.kind === 'reveal' && p.status === 'alive' ? { text: tr('turn.noTurn'), cls: 'dim', title: tr('turn.noTurnTitle') } : null;
+  if (i < t.index) return { text: t.kind === 'reveal' ? tr('turn.spoke') : tr('turn.defended'), cls: 'ok' };
+  if (i === t.index) return { text: t.kind === 'reveal' ? (t.hasRevealed ? tr('turn.speaking') : tr('turn.picking')) : tr('turn.defending'), cls: 'hz', title: t.kind === 'reveal' && !t.hasRevealed ? tr('turn.pickingTitle') : null };
+  if (p.status !== 'alive') return { text: tr('turn.skipped'), cls: 'dim' };
   let n = 0;
   for (let k = t.index + 1; k < i; k++) { const q = byId(s, t.order[k]); if (q && q.status === 'alive') n++; }
-  return n === 0 ? { text: 'up next', cls: 'hz' } : { text: `in ${n + 1}`, cls: 'dim', title: `Speaks in ${n + 1} turns` };
+  // (seat: what a player's panel says instead of the short tag, design §8.2a)
+  return n === 0 ? { text: tr('turn.upNext'), cls: 'hz' } : { text: tr('turn.inN', { n: n + 1 }), cls: 'dim', title: tr('turn.speaksIn', { n: n + 1 }), seat: tr('turn.speaksInLower', { n: n + 1 }) };
 }
 // The votes still to come, projected with the §2 formula from the table as it is now (who is out, the beds, a
 // cancelled next vote), "if nothing else changes". Played rounds show what their vote did, read from the log
@@ -2140,21 +2507,18 @@ function trackPlan(s) {
 }
 function vRoundTrack(s, cls) {
   const cells = trackPlan(s).map((c) => {
-    const name = c.ot ? 'Overtime' : `Round ${c.r}`;
+    const p = { title: c.ot ? tr('track.ot') : tr('track.round', { r: c.r }), k: c.k };
     let title;
     if (c.st === 'past') {
-      title = c.plan ? `${name}: played` : c.cancelled ? `${name}: played; its vote was cancelled by a special card`
-        : c.k > 0 ? `${name}: played; ${plural(c.k, 'player')} voted out${c.cut ? ', then the rest of the vote was cancelled by a special card' : ''}`
-          : `${name}: played, no one voted out`;
+      title = tr(c.plan ? 'track.pastPlan' : c.cancelled ? 'track.pastCancelled' : c.k > 0 ? (c.cut ? 'track.pastOutCut' : 'track.pastOut') : 'track.pastNone', p);
     }
-    else if (c.cancelled) title = `${name}: its vote (${plural(c.k, 'ejection')}) is cancelled by a special card; they move to later votes`;
-    else if (c.k > 0) title = c.st === 'now' && (s.phase === 'vote' || s.phase === 'defense') ? `${name}: voting now, ${plural(c.k, 'ejection')} in this vote`
-      : `${name}: a vote for ${plural(c.k, 'ejection')} ${c.st === 'now' ? 'after this round' : 'if nothing changes (leaves and specials move it)'}`;
-    else title = `${name}: no vote${c.st === 'future' ? ' planned' : ''}`;
+    else if (c.cancelled) title = tr('track.cancelled', p);
+    else if (c.k > 0) title = tr(c.st === 'now' && (s.phase === 'vote' || s.phase === 'defense') ? 'track.votingNow' : c.st === 'now' ? 'track.voteAfter' : 'track.voteIf', p);
+    else title = tr(c.st === 'future' ? 'track.noVotePlanned' : 'track.noVote', p);
     return h('li', { class: ['rt', 'rt-' + c.st, c.k > 0 && !c.cancelled && 'rt-vote', c.cancelled && 'rt-cancel'], key: String(c.r), title },
-      h('span', { class: 'rt-n', text: String(c.r) }), h('span', { class: 'rt-k', text: c.k > 0 ? '✖' + c.k : '·' }));
+      h('span', { class: 'rt-n', text: c.ot ? tr('track.otShort') : String(c.r) }), h('span', { class: 'rt-k', text: c.k > 0 ? '✖' + c.k : '·' }));
   });
-  return h('ol', { class: ['round-track', cls], 'aria-label': 'Rounds and the ejections due in them' }, cells);
+  return h('ol', { class: ['round-track', cls], 'aria-label': tr('track.aria') }, cells);
 }
 
 /* ---------- lobby */
@@ -2164,25 +2528,25 @@ function vLobby() {
   // the join link never carries ?profile= (SPEC §11 X9.1): a friend who opens it is somebody else
   const link = location.origin + '/?room=' + s.room;
   const n = s.players.length;
-  const copyLabel = ui.copied === 'ok' ? 'Copied ✓' : ui.copied === 'manual' ? 'Press Ctrl+C' : 'Copy link';
+  const copyLabel = ui.copied === 'ok' ? tr('lobby.copied') : ui.copied === 'manual' ? tr('lobby.pressCtrlC') : tr('lobby.copy');
   return h('div', { class: 'shell lobby' },
     h('div', { class: 'top' }, vHeader(s, d), connBanner()),
     h('div', { class: 'body' },
       h('main', { class: 'main-col' },
         h('section', { class: 'panel invite' },
           h('div', { class: 'invite-code' },
-            h('span', { class: 'k', text: 'Room code' }),
+            h('span', { class: 'k', text: tr('lobby.code') }),
             h('span', { class: 'invite-letters mono', text: s.room })),
           h('div', { class: 'invite-link' },
-            h('span', { class: 'k', text: 'Invite link — send it to everyone on the call' }),
+            h('span', { class: 'k', text: tr('lobby.inviteK') }),
             h('div', { class: 'link-row' },
-              h('input', { class: 'input mono link-input', id: 'invite-link', readonly: true, value: link, 'aria-label': 'Invite link', 'data-select-all': '' }),
+              h('input', { class: 'input mono link-input', id: 'invite-link', readonly: true, value: link, 'aria-label': tr('lobby.inviteAria'), 'data-select-all': '' }),
               h('button', { class: ['btn', ui.copied === 'ok' ? 'ok' : 'primary'], testid: 'copy-link-btn', act: 'copy-link' }, copyLabel)),
-            h('p', { class: 'fine', text: 'Friends open the link, type a name and press Join. Late arrivals can watch as spectators.' }))),
+            h('p', { class: 'fine', text: tr('lobby.inviteHint') }))),
         h('section', { class: 'panel' },
-          h('div', { class: 'panel-head' }, h('h2', { text: 'Players at the table' }), h('span', { class: 'meta', text: `${n}/${s.maxPlayers} seated · min ${s.minPlayers}` })),
+          h('div', { class: 'panel-head' }, h('h2', { text: tr('lobby.players') }), h('span', { class: 'meta', text: tr('lobby.seated', { n, max: s.maxPlayers, m: s.minPlayers }) })),
           h('ol', { class: 'lobby-list' }, s.players.map((p) => vLobbyPlayer(s, d, p))),
-          n < s.minPlayers && h('p', { class: 'fine pad', text: `Waiting for ${plural(s.minPlayers - n, 'more player')} before the game can start.` })),
+          n < s.minPlayers && h('p', { class: 'fine pad', text: tr('lobby.waitingFor', { n: s.minPlayers - n }) })),
         vSpectators(s, d)),
       // the estimated game length leads the side column: everyone sees it first, and the host sees it follow the timers
       h('aside', { class: 'side-col' },
@@ -2195,52 +2559,48 @@ function vLobbyPlayer(s, d, p) {
   const me = p.id === s.you.id;
   return h('li', { class: ['lp', me && 'me', !p.connected && 'offline'], key: p.id, testid: 'lobby-player', 'data-player-id': p.id, 'data-connected': String(p.connected) },
     h('span', { class: 'seat mono', text: pad2(p.seat + 1) }),
-    h('span', { class: ['dot', p.connected ? 'on' : 'off'], title: p.connected ? 'Online' : 'Offline' }),
+    h('span', { class: ['dot', p.connected ? 'on' : 'off'], title: p.connected ? tr('lobby.online') : tr('lobby.offline') }),
     h('span', { class: 'lp-name', text: p.name }),
-    h('span', { class: 'lp-tags' }, p.isHost && tag('Host', 'host'), me && tag('You', 'you'), !p.connected && tag('Offline', 'off')),
+    h('span', { class: 'lp-tags' }, p.isHost && tag(tr('tag.host'), 'host'), me && tag(tr('tag.you'), 'you'), !p.connected && tag(tr('tag.offline'), 'off')),
     d.isHost && !me && h('span', { class: 'admin' },
-      h('button', { class: 'btn xs ghost', testid: 'transfer-btn', act: 'transfer', 'data-player-id': p.id, disabled: !d.canAdmin, title: `Make ${p.name} the host` }, 'Make host'),
-      h('button', { class: 'btn xs danger', testid: 'kick-btn', act: 'kick', 'data-player-id': p.id, disabled: !d.canAdmin, title: `Remove ${p.name}` }, 'Kick')));
+      h('button', { class: 'btn xs ghost', testid: 'transfer-btn', act: 'transfer', 'data-player-id': p.id, disabled: !d.canAdmin, title: tr('host.makeTitle', { p: p.name }) }, tr('host.make')),
+      h('button', { class: 'btn xs danger', testid: 'kick-btn', act: 'kick', 'data-player-id': p.id, disabled: !d.canAdmin, title: tr('host.removeTitle', { p: p.name }) }, tr('host.kick'))));
 }
 function vSpectators(s, d) {
   const list = s.spectators || [];
   if (!list.length && s.phase !== 'lobby') return null;
   return h('section', { class: 'panel spectators' },
-    h('div', { class: 'panel-head' }, h('h2', { text: 'Spectators' }), h('span', { class: 'meta', text: String(list.length) })),
+    h('div', { class: 'panel-head' }, h('h2', { text: tr('lobby.spectators') }), h('span', { class: 'meta', text: String(list.length) })),
     list.length ? h('ul', { class: 'spec-list' }, list.map((x) => h('li', { key: x.id, class: ['sp-row', !x.connected && 'offline'] },
       h('span', { class: ['dot', x.connected ? 'on' : 'off'] }),
       h('span', { class: 'lp-name', text: x.name }),
-      x.id === s.you.id && tag('You', 'you'),
-      d.isHost && x.id !== s.you.id && h('button', { class: 'btn xs danger', testid: 'kick-btn', act: 'kick', 'data-player-id': x.id, disabled: !d.canAdmin, title: `Remove ${x.name}` }, 'Kick'))))
-      : h('p', { class: 'fine pad', text: 'Nobody is watching yet. Anyone with the link can press Watch.' }));
+      x.id === s.you.id && tag(tr('tag.you'), 'you'),
+      d.isHost && x.id !== s.you.id && h('button', { class: 'btn xs danger', testid: 'kick-btn', act: 'kick', 'data-player-id': x.id, disabled: !d.canAdmin, title: tr('host.removeTitle', { p: x.name }) }, tr('host.kick')))))
+      : h('p', { class: 'fine pad', text: tr('lobby.noSpectators') }));
 }
-const OPTION_FIELDS = [
-  ['speechSeconds1', 'Round 1 speech', 'Each player\'s turn in round 1'],
-  ['speechSeconds', 'Speech', 'Each turn from round 2'],
-  ['discussionSeconds', 'Discussion', 'Open discussion each round'],
-  ['defenseSeconds', 'Defense', 'Each tied player before a revote'],
-];
+// the lobby's timer fields: labels opts.<field>, hints opts.<field>.hint
+const OPTION_FIELDS = ['speechSeconds1', 'speechSeconds', 'discussionSeconds', 'defenseSeconds'];
 // Presets set all four timers at once; the one matching the current values is marked.
 function vPresets(s, d) {
   const o = draftOptions(s);
   const cur = TIMER_PRESETS.find((p) => Object.keys(p.v).every((k) => o[k] === p.v[k]));
-  return h('div', { class: 'presets', role: 'group', 'aria-label': 'Timer presets' },
+  return h('div', { class: 'presets', role: 'group', 'aria-label': tr('preset.aria') },
     TIMER_PRESETS.map((p) => h('button', {
       class: ['preset', cur === p && 'on'], key: p.id, act: 'preset', 'data-preset': p.id, 'aria-pressed': String(cur === p),
-      disabled: !d.isHost || !d.online, title: `Round 1 speech ${p.v.speechSeconds1} s, speeches ${p.v.speechSeconds} s, discussion ${p.v.discussionSeconds} s, defense ${p.v.defenseSeconds} s${d.isHost ? '' : ' (only the host can change the timers)'}`,
-    }, h('span', { class: 'pr-l', text: p.label }), h('span', { class: 'pr-h mono', text: p.hint }))));
+      disabled: !d.isHost || !d.online, title: tr(d.isHost ? 'preset.title' : 'preset.titleGuest', { n: p.v.speechSeconds1, secs: p.v.speechSeconds, m: p.v.discussionSeconds, k: p.v.defenseSeconds }),
+    }, h('span', { class: 'pr-l', text: presetName(p) }), h('span', { class: 'pr-h mono', text: tr('preset.hint', { secs: p.v.speechSeconds, m: p.v.discussionSeconds }) }))));
 }
 function vLobbySettings(s, d) {
   const o = s.options || {};
   return h('section', { class: 'panel settings' },
-    h('div', { class: 'panel-head' }, h('h2', { text: 'Timers' }), h('span', { class: 'meta', text: d.isHost ? 'seconds · you can edit' : 'seconds · set by host' })),
+    h('div', { class: 'panel-head' }, h('h2', { text: tr('lobby.timers') }), h('span', { class: 'meta', text: d.isHost ? tr('lobby.timersHost') : tr('lobby.timersGuest') })),
     vPresets(s, d),
-    h('div', { class: 'opt-list' }, OPTION_FIELDS.map(([key, label, hint]) => h('label', { class: 'opt-row', key },
-      h('span', { class: 'opt-text' }, h('span', { class: 'opt-label', text: label }), h('span', { class: 'opt-hint', text: hint })),
+    h('div', { class: 'opt-list' }, OPTION_FIELDS.map((key) => h('label', { class: 'opt-row', key },
+      h('span', { class: 'opt-text' }, h('span', { class: 'opt-label', text: tr('opts.' + key) }), h('span', { class: 'opt-hint', text: tr(`opts.${key}.hint`) })),
       d.isHost
-        ? h('input', { class: 'input num mono', type: 'number', min: '5', max: '600', step: '5', inputmode: 'numeric', 'data-field': 'opt:' + key, value: String(o[key]), 'aria-label': label + ' (seconds)', disabled: !d.online })
-        : h('span', { class: 'opt-val mono', text: `${o[key]} s` })))),
-    h('p', { class: 'fine pad', text: 'Timers are only a guide: nothing happens automatically when one runs out. The host moves the game on with Next.' }));
+        ? h('input', { class: 'input num mono', type: 'number', min: '5', max: '600', step: '5', inputmode: 'numeric', 'data-field': 'opt:' + key, value: String(o[key]), 'aria-label': tr('opts.aria', { title: tr('opts.' + key) }), disabled: !d.online })
+        : h('span', { class: 'opt-val mono', text: tr('lobby.secs', { secs: o[key] }) })))),
+    h('p', { class: 'fine pad', text: tr('lobby.timersNote') }));
 }
 // The timers the estimate uses: the room's, with the host's unsent edits on top (X4: it follows the typing).
 function draftOptions(s) {
@@ -2257,39 +2617,36 @@ function vEstimate(s, n) {
   const preset = TIMER_PRESETS.find((p) => Object.keys(p.v).every((k) => o[k] === p.v[k]));
   return h('div', { class: 'estimate', testid: 'time-estimate', 'data-minutes': String(est.mid), 'data-seconds': String(Math.round(est.seconds)), 'data-players': String(N) },
     h('div', { class: 'est-row' },
-      h('span', { class: 'k', text: 'Estimated game length' }),
+      h('span', { class: 'k', text: tr('est.k') }),
       h('span', { class: 'est-main' },
-        h('b', { class: 'est-v mono', text: `≈ ${est.mid} min` }),
-        h('span', { class: 'est-range mono', text: `(${est.lo}–${est.hi} min)` }))),
-    h('p', { class: 'est-sub', text: `${minimum ? `with ${s.minPlayers} players (minimum)` : `with ${plural(N, 'player')}`} · ${preset ? `${preset.label} timers` : 'custom timers'}` }),
-    h('p', { class: 'est-note', text: "Timers are a guide, so the real pace depends on the host's Next." }));
+        h('b', { class: 'est-v mono', text: tr('est.value', { m: est.mid }) }),
+        h('span', { class: 'est-range mono', text: tr('est.range', { lo: est.lo, hi: est.hi }) }))),
+    h('p', { class: 'est-sub', text: minimum
+      ? (preset ? tr('est.subMin', { n: s.minPlayers, title: presetName(preset) }) : tr('est.subMinCustom', { n: s.minPlayers }))
+      : (preset ? tr('est.sub', { n: N, title: presetName(preset) }) : tr('est.subCustom', { n: N })) }),
+    h('p', { class: 'est-note', text: tr('est.note') }));
 }
 function vLobbySchedule(s, n) {
   const kicks = (s.schedule && s.schedule.kicksByRound && s.schedule.kicksByRound.length) ? s.schedule.kicksByRound : (KICKS[n] || []);
   const beds = Math.floor(n / 2);
   const total = kicks.reduce((a, b) => a + b, 0);
   return h('section', { class: 'panel schedule' },
-    h('div', { class: 'panel-head' }, h('h2', { text: 'If you start now' }), h('span', { class: 'meta', text: plural(n, 'player') })),
+    h('div', { class: 'panel-head' }, h('h2', { text: tr('sched.title') }), h('span', { class: 'meta', text: tr('sched.players', { n }) })),
     vEstimate(s, n),
     n >= 2 ? h('div', { class: 'sched' },
       h('div', { class: 'sched-stats' },
-        kv('Beds', String(beds), 'big'), kv('Ejected', String(total), 'big'), kv('Rounds', '7', 'big')),
-      h('ol', { class: 'round-track wide' }, kicks.map((k, i) => h('li', { class: ['rt', k > 0 && 'rt-vote'], title: k > 0 ? `After round ${i + 1}: ${plural(k, 'ejection')}` : `Round ${i + 1}: no vote` },
+        kv(tr('sched.beds'), String(beds), 'big'), kv(tr('sched.ejected'), String(total), 'big'), kv(tr('sched.rounds'), '7', 'big')),
+      h('ol', { class: 'round-track wide' }, kicks.map((k, i) => h('li', { class: ['rt', k > 0 && 'rt-vote'], title: k > 0 ? tr('sched.after', { r: i + 1, k }) : tr('sched.noVote', { r: i + 1 }) },
         h('span', { class: 'rt-n', text: String(i + 1) }), h('span', { class: 'rt-k', text: k > 0 ? '✖' + k : '·' })))),
-      h('p', { class: 'fine', text: '✖ marks the rounds that end with a vote, and how many players leave in it.' }))
-      : h('p', { class: 'fine pad', text: 'The schedule appears once two players are seated.' }));
+      h('p', { class: 'fine', text: tr('sched.legend') }))
+      : h('p', { class: 'fine pad', text: tr('sched.none') }));
 }
 function vRules() {
   return h('section', { class: 'panel rules' },
-    h('div', { class: 'panel-head' }, h('h2', { text: 'How a round works' })),
-    h('p', { class: 'rules-goal' }, h('b', { text: 'The goal. ' }), 'The bunker has beds for half of you. Get a bed, and make sure the ones inside can rebuild humanity.'),
-    h('ol', { class: 'rules-list' },
-      h('li', null, h('b', { text: 'Reveals. ' }), 'In seat order each player reveals one hidden card and makes their case. Round 1 is always the Profession.'),
-      h('li', null, h('b', { text: 'Discussion. ' }), 'Everyone argues on voice about who the bunker needs.'),
-      h('li', null, h('b', { text: 'Vote. ' }), 'In the rounds marked ✖, players vote on who stays outside. Ties get a defense speech and a revote.'),
-      h('li', null, h('b', { text: 'Specials. ' }), 'Everyone holds 2 secret special cards. You may play one per round; the server applies it.'),
-      h('li', null, h('b', { text: 'Airlock. ' }), 'It needs a partner: two Airlocks from different players on the same player in the same round, before its discussion ends, throw them out, with no vote. Alone, it jams. From 4 players on, a Back from the Forest is always dealt too.'),
-      h('li', null, h('b', { text: 'The end. ' }), 'When the players left fit in the beds, the doors close. Every card is revealed.')));
+    h('div', { class: 'panel-head' }, h('h2', { text: tr('howto.title') })),
+    h('p', { class: 'rules-goal' }, h('b', { text: tr('howto.goalK') + ' ' }), tr('howto.goal')),
+    h('ol', { class: 'rules-list' }, ['reveals', 'discussion', 'vote', 'specials', 'airlock', 'end'].map((k) =>
+      h('li', null, h('b', { text: tr(`howto.${k}K`) + ' ' }), tr('howto.' + k)))));
 }
 
 /* ---------- game */
@@ -2326,11 +2683,12 @@ function vGame() {
 }
 // Round 1: the catastrophe and the bunker are what everyone argues from, so they open the table as a briefing
 // (everyone, until dismissed) wherever the full situation panel is not already open on screen.
+// (keyed by the game's round-1 line, else by the catastrophe's id: never by a title, which changes with the language)
 function briefingKey(s) {
   const log = s.log || [];
   let start = null;
-  for (let i = log.length - 1; i >= 0; i--) if (log[i].kind === 'system' && /^Round 1 of /.test(log[i].text)) { start = log[i]; break; }
-  return start ? `${s.room}:${start.id}` : `${s.room}:${s.catastrophe ? s.catastrophe.title : ''}`;
+  for (let i = log.length - 1; i >= 0; i--) if (isRoundOneLine(log[i])) { start = log[i]; break; }
+  return start ? `${s.room}:${start.id}` : `${s.room}:${s.catastrophe ? (s.catastrophe.id ?? s.catastrophe.title) : ''}`;
 }
 function vBriefing(s, d) {
   const c = s.catastrophe;
@@ -2341,36 +2699,39 @@ function vBriefing(s, d) {
   if (!ui.briefed) ui.briefed = sGet('session', BRIEF_KEY) || '';
   if (ui.briefed === key) return null;
   const n = s.players.length;
-  return h('section', { class: 'panel briefing', id: 'sec-briefing', 'aria-label': 'Briefing: the catastrophe and the bunker', 'data-key': key },
+  return h('section', { class: 'panel briefing', id: 'sec-briefing', 'aria-label': tr('brief.aria'), 'data-key': key },
     h('div', { class: 'brief-head' },
       h('div', { class: 'brief-head-text' },
-        h('div', { class: 'k', text: 'Briefing · what you argue about' }),
+        h('div', { class: 'k', text: tr('brief.k') }),
         narrTitle(h('h2', { class: 'brief-title', text: c.title }), s, 'briefing')),   // narrator hook: ▶ Listen
-      h('button', { class: 'btn sm', act: 'briefing-close', 'data-key': key, title: 'Hide the briefing (the Situation panel keeps it all)' }, 'Got it')),
+      h('button', { class: 'btn sm', act: 'briefing-close', 'data-key': key, title: tr('brief.hideTitle') }, tr('brief.gotIt'))),
     h('p', { class: 'brief-text', text: c.text }),
     c.details && c.details.length ? h('ul', { class: 'brief-facts' }, c.details.map((x, i) => h('li', { key: 'd' + i, text: x }))) : null,
     h('div', { class: 'brief-bunker' },
-      h('span', { class: 'k', text: 'The bunker' }),
+      h('span', { class: 'k', text: tr('brief.bunker') }),
       h('b', { text: b.name }),
       h('span', { text: ` · ${b.size} · ${b.duration} · ${b.food}` })),
-    b.features && b.features.length ? h('p', { class: 'brief-feats' }, h('span', { class: 'k', text: 'Inside ' }), b.features.join(' · ')) : null,
-    h('p', { class: 'brief-beds' }, h('b', { text: `${plural(s.capacity, 'bed')} for ${n} players` }), ` — ${plural(Math.max(0, n - s.capacity), 'player')} will stay in the forest.`));
+    b.features && b.features.length ? h('p', { class: 'brief-feats' }, h('span', { class: 'k', text: tr('brief.inside') + ' ' }), b.features.join(' · ')) : null,
+    h('p', { class: 'brief-beds' }, trn('brief.beds', { text: h('b', { text: tr('brief.bedsFor', { beds: s.capacity, n }) }), n: Math.max(0, n - s.capacity) })));
 }
 function vJumpNav(s, d) {
   const hand = d.isPlayer && s.me;
-  const items = [['sec-table', 'Table', 'The table'], [hand ? 'sec-hand' : 'sec-watch', hand ? 'Hand' : 'You', hand ? 'My hand' : 'Watching'], ['sec-situation', 'Info', 'Catastrophe and bunker'], ['sec-log', 'Log', 'Event log']];
-  return h('nav', { class: 'jump', 'aria-label': 'Jump to section' }, items.map(([id, label, title]) => h('button', { class: 'jump-btn', act: 'jump', 'data-target': id, title, 'aria-label': title }, label)));
+  const items = [['sec-table', 'table'], [hand ? 'sec-hand' : 'sec-watch', hand ? 'hand' : 'you'], ['sec-situation', 'info'], ['sec-log', 'log']];
+  return h('nav', { class: 'jump', 'aria-label': tr('jump.aria') }, items.map(([id, k]) => {
+    const title = tr(`jump.${k}Title`);
+    return h('button', { class: 'jump-btn', act: 'jump', 'data-target': id, title, 'aria-label': title }, tr('jump.' + k));
+  }));
 }
 function vRoleBanner(s, d) {
   if (d.isSpectator) {
     return h('div', { class: 'role-banner watch', role: 'note' },
-      h('span', { class: 'rb-k', text: 'Spectating' }),
-      h('span', { class: 'rb-t', text: 'You see only public information: revealed cards, played specials, votes and the log.' }));
+      h('span', { class: 'rb-k', text: tr('role.spectating') }),
+      h('span', { class: 'rb-t', text: tr('role.spectatingText') }));
   }
   if (d.isPlayer && d.meP.status === 'ejected') {
     return h('div', { class: 'role-banner out', role: 'note' },
-      h('span', { class: 'rb-k', text: 'You are out' }),
-      h('span', { class: 'rb-t', text: `You stay in the forest and watch. Your hidden cards stay secret until the end.${d.isHost ? ' You are still the host.' : ''}` }));
+      h('span', { class: 'rb-k', text: tr('role.out') }),
+      h('span', { class: 'rb-t', text: tr(d.isHost ? 'role.outTextHost' : 'role.outText') }));
   }
   return null;
 }
@@ -2382,36 +2743,32 @@ function vAirlockAlert(s, d) {
   if (!list.length) return null;
   const card = myAirlock(s);
   const canJoin = !!card && specialStatus(s, d, card).ok;
-  const end = airEnd(s);
+  const ot = airEnd(s);
   // every Airlock of the game is played: nothing can close these any more, so they only wait to jam (no threat)
   const spent = airlocksLeft(s) === 0;
-  return h('section', { class: ['panel airlock-alert', spent && 'spent'], id: 'sec-airlock', 'aria-label': 'Open airlocks', 'data-spent': spent ? 'true' : null },
+  return h('section', { class: ['panel airlock-alert', spent && 'spent'], id: 'sec-airlock', 'aria-label': tr('air.alertAria'), 'data-spent': spent ? 'true' : null },
     h('div', { class: 'aa-head' },
       icon('door', 'aa-ico'),
-      h('span', { class: 'aa-k', text: list.length > 1 ? `${list.length} airlocks cycling` : 'Airlock cycling' }),
-      h('span', { class: 'aa-when', text: spent
-        ? `every Airlock in this game has been played, so ${list.length > 1 ? 'each' : 'it'} jams when ${end}`
-        : `${list.length > 1 ? 'each jams' : 'jams'} if nobody closes it before ${end}` })),
+      h('span', { class: 'aa-k', text: list.length > 1 ? tr('air.cyclingN', { n: list.length }) : tr('air.cycling') }),
+      h('span', { class: 'aa-when', text: tr(spent ? 'air.whenSpent' : 'air.when', { n: list.length, ot }) })),
     h('ul', { class: 'aa-list' }, list.map((a) => {
       const t = byId(s, a.targetId);
       const onMe = a.targetId === s.you.id;
       const mine = a.byIds.includes(s.you.id);
       const join = canJoin && joinsAirlock(s, a);
+      const p = { by: airlockStarters(s, a), t: t.name, ot };
       let line;
-      if (spent) {
-        const who = onMe ? `It is cycling on you, started by ${airlockStarters(s, a)}.` : mine ? 'You started it.' : `Started by ${airlockStarters(s, a)}.`;
-        line = `${who} No Airlock card is left in the game, so ${onMe ? 'it cannot throw you out' : 'nobody can close it'}: it jams when ${end}.`;
-      }
-      else if (onMe) line = `It is cycling on you, started by ${airlockStarters(s, a)}. One more Airlock card from another player before ${end} and you are thrown out, with no vote. Make your case now.`;
-      else if (mine) line = `You started it. Another player has to play their Airlock on ${t.name} before ${end} to throw ${t.name} out; otherwise it jams then.`;
-      else if (join) line = `Started by ${airlockStarters(s, a)}. You hold an Airlock: play it on ${t.name} and ${t.name} is thrown out right now, with no vote.`;
-      else line = `Started by ${airlockStarters(s, a)}. One more Airlock card on ${t.name} before ${end} throws ${t.name} out, with no vote.`;
+      if (spent) line = tr(onMe ? 'air.spentOnMe' : mine ? 'air.spentMine' : 'air.spentOther', p);
+      else if (onMe) line = tr('air.onMe', p);
+      else if (mine) line = tr('air.mine', p);
+      else if (join) line = tr('air.join', p);
+      else line = tr('air.other', p);
       return h('li', { key: a.targetId, class: ['aa-item', onMe && 'on-me', join && 'joinable'], tabindex: join ? '-1' : null, 'data-focus-park': join ? '' : null },
         h('div', { class: 'aa-top' },
-          h('button', { class: 'aa-who', act: 'jump-player', 'data-player-id': a.targetId, title: `Show ${t.name} on the table` },
-            h('span', { class: 'aa-name', text: onMe ? `${t.name} (you)` : t.name }),
+          h('button', { class: 'aa-who', act: 'jump-player', 'data-player-id': a.targetId, title: tr('air.showTitle', { p: t.name }) },
+            h('span', { class: 'aa-name', text: onMe ? tr('air.nameYou', { p: t.name }) : t.name }),
             h('span', { class: 'aa-count mono', text: airlockCount(a) })),
-          join ? h('button', { class: 'btn sm danger aa-join', testid: 'airlock-join', act: 'special-open', 'data-uid': card.uid, 'data-player-id': a.targetId, disabled: d.shield || !d.online }, `Join: throw ${t.name} out`) : null),
+          join ? h('button', { class: 'btn sm danger aa-join', testid: 'airlock-join', act: 'special-open', 'data-uid': card.uid, 'data-player-id': a.targetId, disabled: d.shield || !d.online }, tr('air.joinBtn', { t: t.name })) : null),
         h('p', { class: 'aa-text', text: line }));
     })));
 }
@@ -2421,52 +2778,56 @@ function vAirlockStrip(s, p) {
   if (!a || p.status !== 'alive' || !GAME_PHASES.includes(s.phase)) return null;
   const onMe = p.id === s.you.id;
   const spent = airlocksLeft(s) === 0;
-  const end = airEnd(s);
+  const ot = airEnd(s);
   return h('div', { class: ['airlock-strip', onMe && 'on-me', spent && 'spent'], key: 'airlock' },
     h('span', { class: 'airlock-badge', testid: 'airlock-badge', 'data-player-id': p.id, 'data-count': String(a.byIds.length) },
-      icon('door', 'ab-ico'), h('b', { class: 'ab-k', text: `AIRLOCK ${airlockCount(a)}` }), h('span', { class: 'ab-by', text: ` · started by ${airlockStarters(s, a)}` })),
-    h('span', { class: 'ab-note', text: spent ? `no Airlock left in the game: it jams when ${end}`
-      : onMe ? `one more Airlock on you before ${end}: you are out` : `one more Airlock before ${end}: out, no vote` }));
+      icon('door', 'ab-ico'), h('b', { class: 'ab-k', text: tr('air.badge', { n: airlockN(a) }) }), h('span', { class: 'ab-by', text: ' ' + tr('air.badgeBy', { by: airlockStarters(s, a) }) })),
+    h('span', { class: 'ab-note', text: tr(spent ? 'air.stripSpent' : onMe ? 'air.stripOnMe' : 'air.stripOther', { ot }) }));
 }
 // What ended the game (the final banner): finalCause() in public/loglines.js reads the move logged right before "The
 // bunker door closes" from the exact line shapes (a vote, a special or a sealed airlock, a leave or a kick).
 function finalCauseText(s, c) {
   if (c.kind === 'special') return flashText(c.entry);
   if (c.kind === 'vote') return s.lastVoteResult ? resultSentence(s, s.lastVoteResult) : flashText(c.entry);
-  if (c.kind === 'leave') return `${flashText(c.entry).replace(/\.$/, '')}.`;
+  // (the sentence's end comes from the template, never by trimming the server's line; an English line without a key
+  // may still end in one of its own)
+  if (c.kind === 'leave') return tr('final.causeLine', { text: keyed(c.entry) ? flashText(c.entry) : flashText(c.entry).replace(/\.$/, '') });
   return '';
 }
-// The banner's special, as the flash reads it ("Anna played [Spy] → …"), with the chip only where the log line itself
-// earns one (cardLine: a known title and exactly its text); an airlock line keeps its own chip.
-function finalCauseSegs(s, c) {
+// The banner's special, as the flash reads it ("Anna played [Spy] → …"). By key: the line's parts without the round
+// prefix and the rules text, its card a chip. Without keys: the chip only where the log line itself earns one (cardLine:
+// a known title and exactly its text); an airlock line keeps its own chip.
+function finalCauseNodes(s, c) {
+  const fp = flashParts(c.entry);
+  if (fp) return partsNodes(fp, 'cause');
   const m = !airlockLine(c.entry.text, c.entry.kind) ? cardLine(c.entry.text, seatNames, cardText) : null;
-  if (m) return [{ t: 'text', v: `${m.name} played ` }, { t: 'card', title: m.title, v: m.title }, { t: 'text', v: ` → ${m.result}` }];
-  return segmentsOf(finalCauseText(s, c));
+  const segs = m ? [{ t: 'text', v: `${m.name} played ` }, { t: 'card', title: m.title, v: m.title }, { t: 'text', v: ` → ${m.result}` }] : segmentsOf(finalCauseText(s, c));
+  return richSegs(segs, 'cause');
 }
 function vFinalBanner(s, d) {
   const f = s.final || { survivors: [], out: [] };
   const inBunker = d.isPlayer && f.survivors.includes(d.meId);
-  const bunkerName = s.bunker && s.bunker.name ? s.bunker.name : 'the bunker';
+  const bunkerName = s.bunker && s.bunker.name ? s.bunker.name : tr('final.theBunker');
   const cause = finalCause(s);
   const causeText = finalCauseText(s, cause);
   return h('section', { class: 'final-banner' },
     h('div', { class: 'fb-hero' },
       trefoil('fb-wheel'),
       h('div', { class: 'fb-hero-text' },
-        h('div', { class: 'fb-kicker', text: s.catastrophe ? s.catastrophe.title : 'After the catastrophe' }),
-        h('h1', { class: 'fb-title', text: 'The door is sealed' }),
-        h('p', { class: 'fb-sum', text: `${f.survivors.length} made it into ${bunkerName}. ${f.out.length} stayed in the forest.` }))),
+        h('div', { class: 'fb-kicker', text: s.catastrophe ? s.catastrophe.title : tr('final.after') }),
+        h('h1', { class: 'fb-title', text: tr('final.title') }),
+        h('p', { class: 'fb-sum', text: tr('final.sum', { n: f.survivors.length, bname: bunkerName, k: f.out.length }) }))),
     causeText ? h('p', { class: ['fb-cause', 'c-' + cause.kind], testid: 'final-cause', 'data-cause': cause.kind },
-      h('span', { class: 'fb-cause-k', text: cause.kind === 'vote' ? 'The last vote' : cause.airlock ? 'Sealed by the airlock' : cause.kind === 'special' ? 'Sealed by a special' : 'Sealed by a departure' }),
-      h('span', { class: 'fb-cause-t' }, cause.kind === 'special' ? richSegs(finalCauseSegs(s, cause), 'cause') : causeText)) : null,
-    d.isPlayer && h('p', { class: ['fb-you', inBunker ? 'good' : 'bad'], text: inBunker ? 'You made it inside. Every card is face up now — was it the right crew?' : 'You stayed in the forest. Every card is face up now.' }),
+      h('span', { class: 'fb-cause-k', text: tr(cause.kind === 'vote' ? 'final.causeVote' : cause.airlock ? 'final.causeAirlock' : cause.kind === 'special' ? 'final.causeSpecial' : 'final.causeLeave') }),
+      h('span', { class: 'fb-cause-t' }, cause.kind === 'special' ? finalCauseNodes(s, cause) : causeText)) : null,
+    d.isPlayer && h('p', { class: ['fb-you', inBunker ? 'good' : 'bad'], text: inBunker ? tr('final.youIn') : tr('final.youOut') }),
     h('div', { class: 'fb-cols' },
-      h('div', { class: 'fb-col in' }, h('div', { class: 'k', text: 'In the bunker' }),
+      h('div', { class: 'fb-col in' }, h('div', { class: 'k', text: tr('final.inBunker') }),
         h('ul', { class: 'chips' }, f.survivors.map((id) => h('li', { class: 'chip good', key: id, text: nameOf(s, id) })))),
-      h('div', { class: 'fb-col out' }, h('div', { class: 'k', text: 'Stayed in the forest' }),
-        h('ul', { class: 'chips' }, f.out.map((id) => { const p = byId(s, id); return h('li', { class: 'chip bad', key: id }, nameOf(s, id), p && p.status === 'left' ? h('span', { class: 'chip-sub', text: ' (left)' }) : null); })))),
+      h('div', { class: 'fb-col out' }, h('div', { class: 'k', text: tr('final.stayed') }),
+        h('ul', { class: 'chips' }, f.out.map((id) => { const p = byId(s, id); return h('li', { class: 'chip bad', key: id }, nameOf(s, id), p && p.status === 'left' ? h('span', { class: 'chip-sub', text: ' ' + tr('final.left') }) : null); })))),
     // SPEC §11 X10: a quiet line under the result
-    h('p', { class: 'final-feedback' }, h('span', { class: 'final-fb-lead', text: STR.feedbackLead }), ' ', feedbackLinks('final', s.room)));
+    h('p', { class: 'final-feedback' }, h('span', { class: 'final-fb-lead', text: tr('fb.lead') }), ' ', feedbackLinks('final', s.room)));
 }
 // rail = the always-visible desktop version in the side column; otherwise a one-line summary that expands.
 function vSituation(s, d, rail) {
@@ -2476,36 +2837,36 @@ function vSituation(s, d, rail) {
   const open = rail || situationOpen(s);
   return h('section', { class: ['panel situation', open ? 'open' : 'closed', rail && 'rail'], id: 'sec-situation' },
     rail
-      ? h('div', { class: 'panel-head' }, h('h2', { text: 'Situation' }), h('span', { class: 'meta', text: `${s.capacity} beds` }))
+      ? h('div', { class: 'panel-head' }, h('h2', { text: tr('sit.title') }), h('span', { class: 'meta', text: tr('sit.beds', { beds: s.capacity }) }))
       : h('button', { class: 'sit-bar', act: 'toggle-situation', 'aria-expanded': String(open) },
-        h('span', { class: 'k', text: 'Situation' }),
+        h('span', { class: 'k', text: tr('sit.title') }),
         h('span', { class: 'sit-sum' },
           c && h('span', { class: 'sit-sum-cat', text: c.title }),
           b && h('span', { class: 'sit-sum-sep', text: ' · ' }),
           b && h('span', { class: 'sit-sum-b', text: `${b.name} · ${b.size} · ${b.duration}` })),
-        h('span', { class: 'sit-toggle mono', text: open ? 'Hide ▴' : 'Show ▾' })),
+        h('span', { class: 'sit-toggle mono', text: open ? tr('common.hide') : tr('common.show') })),
     open && h('div', { class: 'sit-grid' },
       c && h('div', { class: 'sit-block sit-cat' },
-        h('div', { class: 'k', text: 'Catastrophe' }),
+        h('div', { class: 'k', text: tr('sit.catastrophe') }),
         narrTitle(h('h3', { class: 'sit-title', text: c.title }), s, rail ? 'rail' : 'situation'),   // narrator hook: ▶ Listen
         h('p', { class: 'sit-text', text: c.text }),
         c.details && c.details.length ? h('ul', { class: 'facts' }, c.details.map((x, i) => h('li', { key: 'd' + i, text: x }))) : null),
       b && h('div', { class: 'sit-block sit-bunker' },
-        h('div', { class: 'k', text: 'The bunker' }),
+        h('div', { class: 'k', text: tr('sit.bunker') }),
         h('h3', { class: 'sit-title', text: b.name }),
         h('dl', { class: 'dl' },
-          h('dt', { text: 'Size' }), h('dd', { text: b.size }),
-          h('dt', { text: 'Stay' }), h('dd', { text: b.duration }),
-          h('dt', { text: 'Food' }), h('dd', { text: b.food }),
-          h('dt', { text: 'Beds' }), h('dd', { text: bedsText(s) })),
-        h('div', { class: 'k sub', text: `Features (${b.features.length})` }),
+          h('dt', { text: tr('sit.size') }), h('dd', { text: b.size }),
+          h('dt', { text: tr('sit.stay') }), h('dd', { text: b.duration }),
+          h('dt', { text: tr('sit.food') }), h('dd', { text: b.food }),
+          h('dt', { text: tr('sit.bedsK') }), h('dd', { text: bedsText(s) })),
+        h('div', { class: 'k sub', text: tr('sit.features', { n: b.features.length }) }),
         h('ul', { class: 'facts' }, b.features.map((x, i) => h('li', { key: 'f' + i, text: x }))))));
 }
 // The beds are half of the players at the start, until a special card adds or removes one.
 function bedsText(s) {
   const start = Math.floor(s.players.length / 2);
-  if (s.capacity === start) return `${s.capacity} (half of the ${s.players.length} players at the start)`;
-  return `${s.capacity} (${start} at the start; ${s.capacity > start ? 'a special card added' : 'a special card took away'} ${plural(Math.abs(s.capacity - start), 'bed')})`;
+  if (s.capacity === start) return tr('sit.bedsHalf', { beds: s.capacity, n: s.players.length });
+  return tr(s.capacity > start ? 'sit.bedsAdded' : 'sit.bedsRemoved', { beds: s.capacity, n: start, k: Math.abs(s.capacity - start) });
 }
 // Below the console layout (the rail there is always open): open by default on laptop widths (>= 1024 px);
 // collapsed on phones and tablets, so the player's own hand and the table come first — the one-line summary still
@@ -2522,24 +2883,24 @@ function vStakes(s, d) {
   const mustGo = Math.max(0, alive - s.capacity);
   const sch = s.schedule || {};
   let voteLine;
-  if (s.phase === 'vote' || s.phase === 'defense') voteLine = `Voting now: ${plural(s.vote ? ballotsOf(s) : sch.kicksThisStep || 0, 'ejection')} in this step`;
-  else if (s.voteMods && s.voteMods.cancelNext) voteLine = 'The next vote is cancelled by a special';
-  else if (sch.kicksThisStep > 0) voteLine = `Vote after this round's discussion: ${plural(sch.kicksThisStep, 'player')} out`;
-  else if (sch.nextVoteRound) voteLine = `No vote this round · next vote after round ${sch.nextVoteRound}`;
-  else voteLine = 'No more votes scheduled';
+  if (s.phase === 'vote' || s.phase === 'defense') voteLine = tr('stakes.votingNow', { k: s.vote ? ballotsOf(s) : sch.kicksThisStep || 0 });
+  else if (s.voteMods && s.voteMods.cancelNext) voteLine = tr('stakes.cancelled');
+  else if (sch.kicksThisStep > 0) voteLine = tr('stakes.voteAfter', { k: sch.kicksThisStep });
+  else if (sch.nextVoteRound) voteLine = tr('stakes.noVote', { r: sch.nextVoteRound });
+  else voteLine = tr('stakes.noMore');
   return h('section', { class: 'stakes' },
     vRoundTrack(s, 'stakes-track'),
     h('div', { class: 'stakes-nums' },
-      kv('Out', String(d.outList.length)),
-      kv('To leave', String(mustGo), mustGo > 0 ? 'red' : 'ok', { title: 'Players still in the game minus beds' })),
+      kv(tr('stakes.out'), String(d.outList.length)),
+      kv(tr('stakes.toLeave'), String(mustGo), mustGo > 0 ? 'red' : 'ok', { title: tr('stakes.toLeaveTitle') })),
     h('div', { class: 'stakes-vote', text: voteLine }));
 }
 // Odd rounds go up the seats ("clockwise"), even rounds come back down.
-function dirText(s) { return s.round % 2 === 1 ? 'clockwise (seats ↑)' : 'counter-clockwise (seats ↓)'; }
+function dirText(s) { return s.round % 2 === 1 ? tr('order.cw') : tr('order.ccw'); }
 function vTurnOrder(s, d) {
   const t = s.turn;
   if (!t) return null;
-  const title = t.kind === 'reveal' ? `Speaking order · round ${s.round} · ${dirText(s)}` : 'Defense order · then a revote';
+  const title = t.kind === 'reveal' ? tr('order.speaking', { r: s.round, text: dirText(s) }) : tr('order.defense');
   return h('section', { class: 'turn-order', 'aria-label': title },
     h('span', { class: 'k' }, t.kind === 'reveal' ? h('span', { class: 'dir-glyph', 'aria-hidden': 'true', text: s.round % 2 === 1 ? '↻' : '↺' }) : null, title),
     h('ol', { class: 'to-list' }, t.order.map((id, i) => {
@@ -2548,10 +2909,10 @@ function vTurnOrder(s, d) {
       const st = i < t.index ? 'done' : i === t.index ? 'now' : 'todo';
       const off = !!p && !skipped && !p.connected && st !== 'done';
       return h('li', { key: id + ':' + i },
-        h('button', { class: ['to', 'to-' + st, skipped && i !== t.index && 'to-skip', id === s.you.id && 'to-me', off && 'to-off'], act: 'jump-player', 'data-player-id': id, title: off ? `${p.name} is offline — show on the table` : 'Show this player on the table' },
+        h('button', { class: ['to', 'to-' + st, skipped && i !== t.index && 'to-skip', id === s.you.id && 'to-me', off && 'to-off'], act: 'jump-player', 'data-player-id': id, title: off ? tr('order.offTitle', { p: p.name }) : tr('order.showTitle') },
           h('span', { class: 'to-mark', text: st === 'done' ? '✓' : st === 'now' ? '▶' : String(i + 1) }),
           h('span', { class: 'to-name', text: p ? p.name : '?' }),
-          off ? h('span', { class: 'to-off-tag', text: 'offline' }) : null));
+          off ? h('span', { class: 'to-off-tag', text: tr('order.offline') }) : null));
     })));
 }
 
@@ -2567,37 +2928,35 @@ function vVotePanel(s, d) {
     let mine = null;
     if (d.amVoter) {
       mine = d.myVote
-        ? h('p', { class: 'vp-mine done' }, h('span', { class: 'vp-mine-k', text: 'You voted' }), h('b', { text: nameOf(s, d.myVote) }), ' stays outside — you can change it until the vote closes.')
-        : h('p', { class: 'vp-mine todo' }, h('span', { class: 'vp-mine-k', text: 'Your vote' }),
-          ui.voteWiped && ui.voteWiped.key === ballotKey(s) ? `${ui.voteWiped.text.replace(/: vote again\.$/, '')}: tap a name in the bar below.` : 'Not cast yet: tap a name in the bar below.');
+        ? h('p', { class: 'vp-mine done' }, h('span', { class: 'vp-mine-k', text: tr('vote.youVoted') }), trn('vote.youVotedText', { p: h('b', { text: nameOf(s, d.myVote) }) }))
+        : h('p', { class: 'vp-mine todo' }, h('span', { class: 'vp-mine-k', text: tr('vote.yourVote') }),
+          ui.voteWiped && ui.voteWiped.key === ballotKey(s) ? msgText(wipedMsg(ui.voteWiped, true)) : tr('vote.notCast'));
     } else if (d.isPlayer && d.alive && s.voteMods.blocked.includes(d.meId)) {
-      mine = h('p', { class: 'vp-mine none' }, h('span', { class: 'vp-mine-k', text: 'Blocked' }), 'A special card took your vote in this vote step.');
+      mine = h('p', { class: 'vp-mine none' }, h('span', { class: 'vp-mine-k', text: tr('vote.blocked') }), tr('vote.blockedText'));
     }
     return h('section', { class: ['panel vote-panel ballot', revote && 'revote'], id: 'sec-vote' },
       h('div', { class: 'vp-head' },
         h('div', { class: 'vp-head-text' },
-          h('div', { class: 'vp-kicker' }, revote ? 'Revote · tie-break' : 'Ballot', ` · ${v.ballot} of ${ballotsOf(s)}`),
-          h('h2', { class: 'vp-title', text: revote ? `Revote: ${listText(namesOf(s, v.candidates))}` : 'Who stays outside?' }),
-          h('p', { class: 'vp-sub', text: revote
-            ? 'They tied and have defended themselves; only they can be voted out now. Still tied → fate decides.'
-            : 'Secret until the vote closes, then everyone sees who voted for whom. Votes can be changed until then.' })),
+          h('div', { class: 'vp-kicker' }, tr(revote ? 'vote.kickerRevote' : 'vote.kicker', { ballot: v.ballot, ballots: ballotsOf(s) })),
+          h('h2', { class: 'vp-title', text: revote ? tr('vote.revoteTitle', { list: namesOf(s, v.candidates) }) : tr('vote.title') }),
+          h('p', { class: 'vp-sub', text: revote ? tr('vote.subRevote') : tr('vote.sub') })),
         h('div', { class: 'vp-progress' },
-          h('span', { class: 'vp-count mono', text: `${v.voted.length}/${v.voters.length} voted` }),
+          h('span', { class: 'vp-count mono', text: tr('vote.count', { n: v.voted.length, total: v.voters.length }) }),
           h('div', { class: 'vp-meter', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': String(v.voters.length), 'aria-valuenow': String(v.voted.length) },
             h('div', { class: 'vp-meter-fill', style: `width:${v.voters.length ? Math.round(100 * v.voted.length / v.voters.length) : 100}%` })),
-          h('p', { class: 'vp-wait' }, missing.length ? [h('span', { class: 'k', text: 'Waiting for ' }), missing.map((id) => { const p = byId(s, id); return nameOf(s, id) + (p && !p.connected ? ' (offline)' : ''); }).join(', ')] : 'Everyone has voted.'))),
+          h('p', { class: 'vp-wait' }, missing.length ? [h('span', { class: 'k', text: tr('vote.waitingFor') + ' ' }), commaList(missing.map((id) => { const p = byId(s, id); return p && !p.connected ? tr('vote.nameOffline', { p: nameOf(s, id) }) : nameOf(s, id); }))] : tr('vote.everyone')))),
       mine,
       (mods.immune.length || mods.blocked.length || mods.doubleVote.length || !d.amVoter) ? h('div', { class: 'vp-grid' },
-        !d.amVoter && h('div', { class: 'vp-col' }, h('span', { class: 'k', text: `Can be voted out (${v.candidates.length}) ` }), namesOf(s, v.candidates).join(', ')),
+        !d.amVoter && h('div', { class: 'vp-col' }, h('span', { class: 'k', text: tr('vote.canBeOut', { n: v.candidates.length }) + ' ' }), commaList(namesOf(s, v.candidates))),
         (mods.immune.length || mods.blocked.length || mods.doubleVote.length) ? h('ul', { class: 'mods' },
-          mods.immune.map((id) => h('li', { key: 'i' + id }, tag('Immune', 'immune'), ' ', nameOf(s, id), h('span', { class: 'fine', text: ' can’t be voted out' }))),
-          mods.blocked.map((id) => h('li', { key: 'b' + id }, tag('Blocked', 'blocked'), ' ', nameOf(s, id), h('span', { class: 'fine', text: ' can’t vote' }))),
-          mods.doubleVote.map((id) => h('li', { key: 'x' + id }, tag('×2', 'double'), ' ', nameOf(s, id), h('span', { class: 'fine', text: ' vote counts twice' })))) : null) : null,
+          mods.immune.map((id) => h('li', { key: 'i' + id }, tag(tr('tag.immune'), 'immune'), ' ', nameOf(s, id), h('span', { class: 'fine', text: ' ' + tr('vote.cantBeOut') }))),
+          mods.blocked.map((id) => h('li', { key: 'b' + id }, tag(tr('tag.blocked'), 'blocked'), ' ', nameOf(s, id), h('span', { class: 'fine', text: ' ' + tr('vote.cantVote') }))),
+          mods.doubleVote.map((id) => h('li', { key: 'x' + id }, tag('×2', 'double'), ' ', nameOf(s, id), h('span', { class: 'fine', text: ' ' + tr('vote.countsTwice') })))) : null) : null,
       r && h('div', { class: ['vp-last', showPrev && 'open'] },
         h('button', { class: 'sit-bar', act: 'toggle-last', 'aria-expanded': String(showPrev) },
-          h('span', { class: 'k', text: 'Previous result' }),
+          h('span', { class: 'k', text: tr('vote.previous') }),
           h('span', { class: 'sit-sum', text: resultSentence(s, r) }),
-          h('span', { class: 'sit-toggle mono', text: showPrev ? 'Hide ▴' : 'Details ▾' })),
+          h('span', { class: 'sit-toggle mono', text: showPrev ? tr('common.hide') : tr('common.details') })),
         showPrev && vResults(s, r)));
   }
   if (s.phase === 'defense' && s.turn) {
@@ -2605,10 +2964,10 @@ function vVotePanel(s, d) {
     return h('section', { class: 'panel vote-panel defense', id: 'sec-vote' },
       h('div', { class: 'vp-head' },
         h('div', { class: 'vp-head-text' },
-          h('div', { class: 'vp-kicker', text: 'Tie · defense speeches' }),
-          h('h2', { class: 'vp-title', text: `${listText(namesOf(s, tied))} tied` }),
-          h('p', { class: 'vp-sub', text: `Each of them gets ${s.options.defenseSeconds} s to defend themselves, in seat order. Then a revote between them only. If that ties too, fate decides.` }))),
-      r && h('div', { class: 'vp-last' }, h('div', { class: 'k', text: 'Why there is a defense' }), vResults(s, r)));
+          h('div', { class: 'vp-kicker', text: tr('vote.defenseKicker') }),
+          h('h2', { class: 'vp-title', text: tr('vote.tied', { list: namesOf(s, tied) }) }),
+          h('p', { class: 'vp-sub', text: tr('vote.defenseSub', { secs: s.options.defenseSeconds }) }))),
+      r && h('div', { class: 'vp-last' }, h('div', { class: 'k', text: tr('vote.whyDefense') }), vResults(s, r)));
   }
   return null;
 }
@@ -2627,12 +2986,12 @@ function vLastVote(s) {
     const open = lastOpen(s);
     const brief = !open && lastBrief(s) && r.tally.some((x) => x.votes > 0);
     // at the final, a vote that did not end the game is an earlier one (the banner tells what did)
-    const label = s.phase === 'final' && finalCause(s).kind !== 'vote' ? 'Earlier vote' : 'Last vote';
+    const label = s.phase === 'final' && finalCause(s).kind !== 'vote' ? tr('vote.earlier') : tr('vote.last');
     return h('section', { class: ['panel last-vote', open && 'open', brief && 'brief'] },
       h('button', { class: 'sit-bar', act: 'toggle-last', 'aria-expanded': String(open) },
         h('span', { class: 'k', text: label }),
         h('span', { class: 'sit-sum', text: resultSentence(s, r) }),
-        h('span', { class: 'sit-toggle mono', text: open ? 'Hide ▴' : 'Details ▾' })),
+        h('span', { class: 'sit-toggle mono', text: open ? tr('common.hide') : tr('common.details') })),
       brief && vTallyBrief(s, r),
       open && h('div', { class: 'lv-body' }, vResults(s, r)));
   }
@@ -2641,23 +3000,29 @@ function vLastVote(s) {
 // "Sasha 6 ← Alex, Ivan, …" for every candidate who got votes, flowing on one or two lines.
 function vTallyBrief(s, r) {
   const rows = r.tally.filter((x) => x.votes > 0);
-  return h('ul', { class: 'tally-brief', 'aria-label': 'Who voted for whom' }, rows.map((x) => h('li', { key: x.targetId, class: [x.targetId === r.ejectedId && 'out', r.tie && r.tie.includes(x.targetId) && 'tie'] },
+  return h('ul', { class: 'tally-brief', 'aria-label': tr('vote.tallyAria') }, rows.map((x) => h('li', { key: x.targetId, class: [x.targetId === r.ejectedId && 'out', r.tie && r.tie.includes(x.targetId) && 'tie'] },
     h('b', { class: 'tb-name', text: nameOf(s, x.targetId) }),
     h('span', { class: 'tb-n mono', text: String(x.votes) }),
     h('span', { class: 'tb-arrow', 'aria-hidden': 'true', text: '←' }),
-    h('span', { class: 'tb-v', text: x.voterIds.length ? namesOf(s, x.voterIds).join(', ') + (x.votes > x.voterIds.length ? ' (incl. a ×2 vote)' : '') : '—' }))));
+    h('span', { class: 'tb-v', text: votersText(s, x, ' ') }))));
+}
+// who voted for this candidate: "Anna, Boris", plus "(incl. a ×2 vote)" after `gap` when a ×2 counted; '—' for nobody
+function votersText(s, x, gap) {
+  if (!x.voterIds.length) return '—';
+  const names = commaList(namesOf(s, x.voterIds));
+  return x.votes > x.voterIds.length ? names + gap + tr('vote.inclX2') : names;
 }
 function resultSentence(s, r) {
-  if (r.cancelled) return 'The vote was cancelled by a special card — nobody was ejected.';
+  if (r.cancelled) return tr('result.cancelled');
   if (r.ejectedId) {
     const top = r.tally.find((x) => x.targetId === r.ejectedId);
-    const votes = top ? ` with ${plural(top.votes, 'vote')}` : '';
-    if (r.random && r.tally.every((x) => x.votes === 0)) return `Nobody voted — fate decided: ${nameOf(s, r.ejectedId)} is out.`;
-    if (r.random) return `Still tied — fate decided: ${nameOf(s, r.ejectedId)} is out.`;
-    return `${nameOf(s, r.ejectedId)} was voted out${votes}.`;
+    const p = nameOf(s, r.ejectedId);
+    if (r.random && r.tally.every((x) => x.votes === 0)) return tr('result.nobodyVoted', { p });
+    if (r.random) return tr('result.stillTied', { p });
+    return top ? tr('result.out', { p, votes: top.votes }) : tr('result.outNoCount', { p });
   }
-  if (r.tie) return `Tie between ${listText(namesOf(s, r.tie))} → defense speeches, then a revote.`;
-  return 'Nobody was left to eject.';
+  if (r.tie) return tr('result.tie', { list: namesOf(s, r.tie) });
+  return tr('result.none');
 }
 function vResults(s, r) {
   if (r.cancelled) return h('p', { class: 'callout info', testid: 'vote-result', text: resultSentence(s, r) });
@@ -2665,14 +3030,14 @@ function vResults(s, r) {
   const withVotes = r.tally.filter((x) => x.votes > 0);
   const zero = r.tally.filter((x) => x.votes === 0);
   return h('div', { class: 'results', testid: 'vote-result' },
-    h('p', { class: ['result-line', r.ejectedId ? 'bad' : r.tie ? 'warn' : ''], text: `${r.stage === 'revote' ? 'Revote' : 'Main vote'}: ${resultSentence(s, r)}` }),
+    h('p', { class: ['result-line', r.ejectedId ? 'bad' : r.tie ? 'warn' : ''], text: tr(r.stage === 'revote' ? 'result.lineRevote' : 'result.lineMain', { text: resultSentence(s, r) }) }),
     withVotes.length ? h('table', { class: 'rtable' },
-      h('thead', null, h('tr', null, h('th', { text: 'Against' }), h('th', { class: 'num', text: 'Votes' }), h('th', { text: 'Voted by' }))),
+      h('thead', null, h('tr', null, h('th', { text: tr('result.against') }), h('th', { class: 'num', text: tr('result.votes') }), h('th', { text: tr('result.votedBy') }))),
       h('tbody', null, withVotes.map((x) => h('tr', { key: x.targetId, class: [x.targetId === r.ejectedId && 'ejected', r.tie && r.tie.includes(x.targetId) && 'tied'] },
-        h('th', { scope: 'row' }, h('span', { text: nameOf(s, x.targetId) }), x.targetId === r.ejectedId ? h('span', { class: 'tag tag-out', text: 'Out' }) : null, r.tie && r.tie.includes(x.targetId) && !r.ejectedId ? h('span', { class: 'tag tag-tie', text: 'Tie' }) : null),
+        h('th', { scope: 'row' }, h('span', { text: nameOf(s, x.targetId) }), x.targetId === r.ejectedId ? h('span', { class: 'tag tag-out', text: tr('result.tagOut') }) : null, r.tie && r.tie.includes(x.targetId) && !r.ejectedId ? h('span', { class: 'tag tag-tie', text: tr('result.tagTie') }) : null),
         h('td', { class: 'num' }, h('span', { class: 'bar-mini', style: `width:${Math.round(56 * x.votes / max)}px` }), h('b', { class: 'mono', text: String(x.votes) })),
-        h('td', { class: 'voters', text: x.voterIds.length ? namesOf(s, x.voterIds).join(', ') + (x.votes > x.voterIds.length ? '  (incl. a ×2 vote)' : '') : '—' }))))) : null,
-    zero.length ? h('p', { class: 'fine', text: `No votes: ${namesOf(s, zero.map((x) => x.targetId)).join(', ')}` }) : null);
+        h('td', { class: 'voters', text: votersText(s, x, '  ') }))))) : null,
+    zero.length ? h('p', { class: 'fine', text: tr('result.noVotes', { list: namesOf(s, zero.map((x) => x.targetId)) }) }) : null);
 }
 
 /* ---------- board */
@@ -2694,12 +3059,12 @@ function vHostTools(s, d, p) {
   const armed = isArmed('kick:' + p.id);
   const settling = armed && !armReady('kick:' + p.id);
   return h('span', { class: 'hostx' },
-    h('button', { class: 'icon-btn', testid: 'transfer-btn', act: 'transfer', 'data-player-id': p.id, disabled: !d.canAdmin, title: `Make ${p.name} the host`, 'aria-label': `Make ${p.name} the host` }, icon('crown')),
+    h('button', { class: 'icon-btn', testid: 'transfer-btn', act: 'transfer', 'data-player-id': p.id, disabled: !d.canAdmin, title: tr('host.makeTitle', { p: p.name }), 'aria-label': tr('host.makeTitle', { p: p.name }) }, icon('crown')),
     h('button', {
       class: ['icon-btn danger', armed && 'armed', settling && 'settling'], testid: 'kick-btn', act: 'kick', 'data-player-id': p.id, disabled: !d.canAdmin || settling,
-      title: armed ? `Tap again to remove ${p.name} for good` : `Remove ${p.name} from the game (no undo; tap twice)`,
-      'aria-label': armed ? `Tap again to remove ${p.name} for good` : `Kick ${p.name}`,
-    }, armed ? h('span', { class: 'arm-text', text: 'Remove?' }) : icon('kick')));
+      title: armed ? tr('host.kickArmedTitle', { p: p.name }) : tr('host.kickTitle', { p: p.name }),
+      'aria-label': armed ? tr('host.kickArmedTitle', { p: p.name }) : tr('host.kickAria', { p: p.name }),
+    }, armed ? h('span', { class: 'arm-text', text: tr('host.armed') }) : icon('kick')));
 }
 // table = the players x categories matrix (desktop), cards = one panel per player with every text in full.
 // Phones and small tablets always get the panels (hidden cards collapse into one row of card backs).
@@ -2733,21 +3098,21 @@ function playerFlags(s, d, p) {
   const oa = outAt.get(p.id);
   o.slam = !!oa && Date.now() - oa < 1500;
   const stamp = !o.final && p.status !== 'alive'
-    ? h('span', { class: ['stamp-tag', p.status === 'left' ? 'grey' : 'red', o.slam && 'slam'], title: p.status === 'left' ? 'Left the game' : 'Voted out or ejected: stays in the forest', text: p.status === 'left' ? 'Left' : 'Ejected' })
+    ? h('span', { class: ['stamp-tag', p.status === 'left' ? 'grey' : 'red', o.slam && 'slam'], title: p.status === 'left' ? tr('status.leftTitle') : tr('status.ejectedTitle'), text: p.status === 'left' ? tr('status.left') : tr('status.ejected') })
     : null;
   o.tags = [
-    o.speaking && tag(t.kind === 'defense' ? 'Defending' : 'Speaking', 'speak'),
-    !o.speaking && o.isNext && tag('Next', 'next'),
-    o.isMe && tag('You', 'you'),
-    p.isHost && tag('Host', 'host'),
+    o.speaking && tag(t.kind === 'defense' ? tr('tag.defending') : tr('tag.speaking'), 'speak'),
+    !o.speaking && o.isNext && tag(tr('tag.next'), 'next'),
+    o.isMe && tag(tr('tag.you'), 'you'),
+    p.isHost && tag(tr('tag.host'), 'host'),
     stamp,
-    o.final && p.status === 'left' && tag('Left', 'left'),
-    !p.connected && p.status !== 'left' && !o.final && tag('Offline', 'off'),
-    v && o.voter && tag(o.voted ? '✓ voted' : 'voting…', o.voted ? 'voted' : 'voting', o.voted ? 'Has voted (the choice stays secret until the vote closes)' : 'Has not voted yet'),
-    o.myPick && tag('Your vote', 'myvote', 'You voted to eject this player'),
-    !o.final && o.immune && tag('Immune', 'immune', 'Nobody can vote against them in this vote step'),
-    !o.final && o.blocked && tag('Blocked', 'blocked', 'Cannot vote in this vote step'),
-    !o.final && o.dbl && tag('×2', 'double', 'Their vote counts twice'),
+    o.final && p.status === 'left' && tag(tr('tag.left'), 'left'),
+    !p.connected && p.status !== 'left' && !o.final && tag(tr('tag.offline'), 'off'),
+    v && o.voter && tag(o.voted ? tr('tag.voted') : tr('tag.voting'), o.voted ? 'voted' : 'voting', o.voted ? tr('tag.votedTitle') : tr('tag.votingTitle')),
+    o.myPick && tag(tr('tag.myVote'), 'myvote', tr('tag.myVoteTitle')),
+    !o.final && o.immune && tag(tr('tag.immune'), 'immune', tr('tag.immuneTitle')),
+    !o.final && o.blocked && tag(tr('tag.blocked'), 'blocked', tr('tag.blockedTitle')),
+    !o.final && o.dbl && tag('×2', 'double', tr('tag.doubleTitle')),
   ].filter(Boolean);
   return o;
 }
@@ -2758,15 +3123,18 @@ function vBoard(s, d) {
   const n = s.players.length;
   const density = n <= 8 ? 'roomy' : n <= 12 ? 'medium' : 'dense';
   const tools = isMatrix() ? h('div', { class: 'board-tools' },
-    h('div', { class: 'seg', role: 'group', 'aria-label': 'Board view' },
-      h('button', { class: ['seg-btn', view === 'table' && 'on'], act: 'board-view', 'data-view': 'table', 'aria-pressed': String(view === 'table'), title: 'Players × categories: compare everyone at a glance' }, 'Table'),
-      h('button', { class: ['seg-btn', view === 'cards' && 'on'], act: 'board-view', 'data-view': 'cards', 'aria-pressed': String(view === 'cards'), title: 'One panel per player with every card text in full' }, 'Cards')),
-    view === 'table' && h('button', { class: ['seg-btn solo', prefs.fullText && 'on'], act: 'full-text', 'aria-pressed': String(!!prefs.fullText), title: 'Show every card text in full (rows get taller)' }, 'Full text')) : null;
+    h('div', { class: 'seg', role: 'group', 'aria-label': tr('board.viewAria') },
+      h('button', { class: ['seg-btn', view === 'table' && 'on'], act: 'board-view', 'data-view': 'table', 'aria-pressed': String(view === 'table'), title: tr('board.tableTitle') }, tr('board.table')),
+      h('button', { class: ['seg-btn', view === 'cards' && 'on'], act: 'board-view', 'data-view': 'cards', 'aria-pressed': String(view === 'cards'), title: tr('board.cardsTitle') }, tr('board.cards'))),
+    view === 'table' && h('button', { class: ['seg-btn solo', prefs.fullText && 'on'], act: 'full-text', 'aria-pressed': String(!!prefs.fullText), title: tr('board.fullTextTitle') }, tr('board.fullText'))) : null;
+  // (the play-time meta is a ' · ' list of independent parts: the counts, the direction, the hint)
   const meta = final
-    ? `${s.final ? s.final.survivors.length : 0} in the bunker · ${s.final ? s.final.out.length : 0} in the forest · NEW = first seen now`
-    : `${d.aliveList.length} alive · ${d.outList.length} out${s.turn && s.turn.kind === 'reveal' ? ` · ${s.round % 2 === 1 ? '↻' : '↺'} ${dirText(s)}` : ''}${view === 'table' ? ' · hover or tap a card, or click a name, for full text' : ''}`;
+    ? tr('board.metaFinal', { n: s.final ? s.final.survivors.length : 0, k: s.final ? s.final.out.length : 0 })
+    : [tr('board.meta', { alive: d.aliveList.length, n: d.outList.length }),
+      s.turn && s.turn.kind === 'reveal' ? `${s.round % 2 === 1 ? '↻' : '↺'} ${dirText(s)}` : '',
+      view === 'table' ? tr('board.hoverHint') : ''].filter(Boolean).join(' · ');
   const head = h('div', { class: 'panel-head' },
-    h('h2', { text: final ? 'Every card, face up' : 'The table' }),
+    h('h2', { text: final ? tr('board.titleFinal') : tr('board.title') }),
     h('span', { class: 'meta', text: meta }),
     tools);
   if (view === 'cards') {
@@ -2776,33 +3144,33 @@ function vBoard(s, d) {
       const out = s.players.filter((p) => !s.final.survivors.includes(p.id));
       body = [
         h('div', { class: 'seat-group in', key: 'g-in' },
-          h('h3', { class: 'sg-title' }, trefoil('sg-ico'), h('span', { text: 'In the bunker' }), h('span', { class: 'sg-count', text: String(surv.length) })),
+          h('h3', { class: 'sg-title' }, trefoil('sg-ico'), h('span', { text: tr('final.inBunker') }), h('span', { class: 'sg-count', text: String(surv.length) })),
           h('div', { class: ['seats', density] }, surv.map((p) => vSeat(s, d, p)))),
         h('div', { class: 'seat-group out', key: 'g-out' },
-          h('h3', { class: 'sg-title' }, h('span', { class: 'sg-tree', 'aria-hidden': 'true', text: '▲' }), h('span', { text: 'Stayed in the forest' }), h('span', { class: 'sg-count', text: String(out.length) })),
+          h('h3', { class: 'sg-title' }, h('span', { class: 'sg-tree', 'aria-hidden': 'true', text: '▲' }), h('span', { text: tr('final.stayed') }), h('span', { class: 'sg-count', text: String(out.length) })),
           h('div', { class: ['seats', density] }, out.map((p) => vSeat(s, d, p)))),
       ];
     } else body = h('div', { class: ['seats', density] }, s.players.map((p) => vSeat(s, d, p)));
     return h('section', { class: ['panel board-panel', 'view-cards'], id: 'sec-table' }, head, body);
   }
   const hd = h('div', { class: 'brow bhead', role: 'row' },
-    h('div', { class: 'bc who', role: 'columnheader', text: 'Seat · player' }),
-    cs.map((c) => h('div', { class: 'bc cat', role: 'columnheader', key: c.id, text: c.label })),
-    h('div', { class: 'bc st', role: 'columnheader', text: s.phase === 'vote' ? 'Vote' : 'Status' }));
+    h('div', { class: 'bc who', role: 'columnheader', text: tr('board.seatPlayer') }),
+    cs.map((c) => h('div', { class: 'bc cat', role: 'columnheader', key: c.id, text: catLabel(s, c.id) })),
+    h('div', { class: 'bc st', role: 'columnheader', text: s.phase === 'vote' ? tr('board.vote') : tr('board.status') }));
   let rows;
   if (final && s.final) {
     const surv = s.final.survivors.map((id) => byId(s, id)).filter(Boolean);
     const out = s.players.filter((p) => !s.final.survivors.includes(p.id));
     rows = [
-      h('div', { class: 'bgroup good', key: 'g-in', role: 'row' }, h('span', { text: 'In the bunker' }), h('span', { class: 'meta', text: String(surv.length) })),
+      h('div', { class: 'bgroup good', key: 'g-in', role: 'row' }, h('span', { text: tr('final.inBunker') }), h('span', { class: 'meta', text: String(surv.length) })),
       surv.map((p) => vPlayerRow(s, d, p)),
-      h('div', { class: 'bgroup bad', key: 'g-out', role: 'row' }, h('span', { text: 'Stayed in the forest' }), h('span', { class: 'meta', text: String(out.length) })),
+      h('div', { class: 'bgroup bad', key: 'g-out', role: 'row' }, h('span', { text: tr('final.stayed') }), h('span', { class: 'meta', text: String(out.length) })),
       out.map((p) => vPlayerRow(s, d, p)),
     ];
   } else rows = s.players.map((p) => vPlayerRow(s, d, p));
   return h('section', { class: 'panel board-panel', id: 'sec-table' }, head,
     h('div', {
-      class: ['board', 'matrix', density, d.isHost && 'with-adm', prefs.fullText && 'full'], role: 'table', 'aria-label': 'Players and their revealed cards',
+      class: ['board', 'matrix', density, d.isHost && 'with-adm', prefs.fullText && 'full'], role: 'table', 'aria-label': tr('board.aria'),
       'data-cl': boardCl, style: boardCl !== 'none' ? `--cl:${boardCl}` : null,
     }, hd, rows));
 }
@@ -2814,7 +3182,7 @@ function vPlayerRow(s, d, p) {
     'data-connected': String(p.connected), 'data-speaking': o.speaking ? 'true' : null, 'data-voted': s.vote ? String(o.voted) : null,
   },
   h('div', { class: 'bc who', role: 'rowheader' },
-    h('button', { class: 'who-main', act: 'expand', 'data-player-id': p.id, 'aria-expanded': String(o.expanded), title: o.expanded ? 'Collapse' : 'Show full card texts and specials' },
+    h('button', { class: 'who-main', act: 'expand', 'data-player-id': p.id, 'aria-expanded': String(o.expanded), title: o.expanded ? tr('board.collapse') : tr('board.expand') },
       h('span', { class: 'seat mono', text: pad2(p.seat + 1) }),
       h('span', { class: ['dot', p.status === 'left' ? 'gone' : p.connected ? 'on' : 'off'], 'aria-hidden': 'true' }),
       h('span', { class: 'pname', text: p.name })),
@@ -2836,10 +3204,12 @@ function cardInfo(s, p, c) {
 }
 function vCell(s, p, c) {
   const { txt, fresh, late } = cardInfo(s, p, c);
+  const label = catLabel(s, c.id);
+  const cat = catP(s, c.id);
   if (txt == null) {
-    return h('div', { class: 'bc card hidden', role: 'cell', key: c.id, 'data-cat': c.id, title: `${c.label}: still hidden` },
-      h('span', { class: 'clabel', text: c.label }),
-      h('span', { class: 'cval', 'aria-label': 'hidden' }, h('span', { class: 'facedown' })));
+    return h('div', { class: 'bc card hidden', role: 'cell', key: c.id, 'data-cat': c.id, title: tr('board.stillHidden', { cat }) },
+      h('span', { class: 'clabel', text: label }),
+      h('span', { class: 'cval', 'aria-label': tr('board.hiddenAria') }, h('span', { class: 'facedown' })));
   }
   // a text the matrix clamps shows in full in a popover on hover, focus or tap (SPEC §11 X3); the table view only.
   // Only a cell whose text is really cut off is a Tab stop (the layout decides: syncCellStops() after each render), so
@@ -2848,12 +3218,12 @@ function vCell(s, p, c) {
   const popKey = `cell:${p.id}:${c.id}`;
   return h('div', {
     class: ['bc card up', fresh && 'fresh', late && 'late'], role: 'cell', key: c.id, 'data-cat': c.id, 'data-full': txt,
-    'data-pop': 'clamp', 'data-pop-title': `${p.name} · ${c.label}${late ? ' · first seen at the end' : ''}`, 'data-pop-text': txt,
-    'data-pop-key': popKey, tabindex: clampable && cutCells.has(popKey) ? '0' : null, 'aria-label': `${c.label}: ${txt}`,
+    'data-pop': 'clamp', 'data-pop-title': tr(late ? 'pop.cellLate' : 'pop.cell', { p: p.name, cat }), 'data-pop-text': txt,
+    'data-pop-key': popKey, tabindex: clampable && cutCells.has(popKey) ? '0' : null, 'aria-label': tr('board.cellAria', { cat, text: txt }),
   },
-  h('span', { class: 'clabel', text: c.label }),
+  h('span', { class: 'clabel', text: label }),
   h('span', { class: 'cval', text: txt }),
-  late ? h('span', { class: 'new-tag', text: 'New' }) : null);
+  late ? h('span', { class: 'new-tag', text: tr('board.new') }) : null);
 }
 function vStatusCell(s, d, p, o) {
   const parts = [];
@@ -2861,33 +3231,33 @@ function vStatusCell(s, d, p, o) {
   const unplayed = p.unplayedSpecials || [];
   if (s.phase === 'vote' && s.vote) {
     const line = [];
-    line.push(h('span', { class: ['vmark', o.voter ? (o.voted ? 'ok' : 'wait') : 'none'], title: o.voter ? (o.voted ? 'Has voted' : 'Has not voted yet') : 'Does not vote in this ballot', 'aria-label': o.voter ? (o.voted ? 'voted' : 'not voted yet') : 'no vote', text: o.voter ? (o.voted ? '✓' : '…') : '–' }));
+    line.push(h('span', { class: ['vmark', o.voter ? (o.voted ? 'ok' : 'wait') : 'none'], title: o.voter ? (o.voted ? tr('status.hasVoted') : tr('status.notVoted')) : tr('status.noVote'), 'aria-label': o.voter ? (o.voted ? tr('status.votedAria') : tr('status.notVotedAria')) : tr('status.noVoteAria'), text: o.voter ? (o.voted ? '✓' : '…') : '–' }));
     if (o.cand) {
       if (d.voteOpen && !o.isMe) {
-        line.push(h('button', { class: ['btn xs vote-row', o.myPick ? 'picked' : ''], act: 'vote', 'data-player-id': p.id, disabled: !d.canVote, 'aria-pressed': String(o.myPick), 'aria-label': o.myPick ? `Your vote: ${p.name}` : `Vote ${p.name} out`, title: o.myPick ? 'Your current vote' : `Vote ${p.name} out` },
-          o.myPick ? 'Yours ✓' : ['Vote', h('span', { class: 'xtra', text: ' out' })]));
-      } else line.push(h('span', { class: 'st-line cand', text: o.myPick ? 'your vote' : 'candidate' }));
+        line.push(h('button', { class: ['btn xs vote-row', o.myPick ? 'picked' : ''], act: 'vote', 'data-player-id': p.id, disabled: !d.canVote, 'aria-pressed': String(o.myPick), 'aria-label': o.myPick ? tr('status.yourVoteAria', { p: p.name }) : tr('status.voteOut', { p: p.name }), title: o.myPick ? tr('status.currentVote') : tr('status.voteOut', { p: p.name }) },
+          o.myPick ? tr('status.yours') : [tr('status.vote'), h('span', { class: 'xtra', text: ' ' + tr('status.voteXtra') })]));
+      } else line.push(h('span', { class: 'st-line cand', text: o.myPick ? tr('status.yourVoteLine') : tr('status.candidate') }));
     }
-    else if (p.status === 'alive' && (s.voteMods.immune || []).includes(p.id)) line.push(h('span', { class: 'st-line dim', text: 'immune' }));
+    else if (p.status === 'alive' && (s.voteMods.immune || []).includes(p.id)) line.push(h('span', { class: 'st-line dim', text: tr('status.immune') }));
     parts.push(h('span', { class: 'st-row' }, line));
   } else if (p.status === 'alive' || o.final) {
     const ts = turnState(s, p);
     parts.push(h('span', { class: 'st-row' },
       ts ? h('span', { class: ['st-line', ts.cls], title: ts.title || null, text: ts.text }) : null,
-      h('span', { class: 'st-line dim mono', title: 'Cards revealed during play', text: `${p.revealedCount}/8` })));
+      h('span', { class: 'st-line dim mono', title: tr('status.revealedTitle'), text: `${p.revealedCount}/8` })));
   } else {
-    parts.push(h('span', { class: 'st-row' }, h('span', { class: 'st-line dim', text: p.status === 'left' ? 'left the game' : 'in the forest' })));
+    parts.push(h('span', { class: 'st-row' }, h('span', { class: 'st-line dim', text: p.status === 'left' ? tr('status.leftGame') : tr('status.inForest') })));
   }
   if ((played.length || unplayed.length) && (s.phase !== 'vote' || o.expanded)) {
     parts.push(h('div', { class: ['sp-chips', o.final && 'wrap'] },
-      played.map((x, i) => cardChip(x.title, x.text, { cls: 'sp-chip played', key: 'p' + i, popKey: `pl:${p.id}:${i}`, kicker: `Played by ${p.name}` })),
-      unplayed.length ? h('span', { class: 'sp-never', key: 'nv', text: 'Never played:' }) : null,
-      unplayed.map((x, i) => cardChip(x.title, x.text, { cls: 'sp-chip unplayed', key: 'u' + i, popKey: `un:${p.id}:${i}`, kicker: `${p.name}’s card · never played` }))));
+      played.map((x, i) => cardChip(x.title, x.text, { cls: 'sp-chip played', key: 'p' + i, popKey: `pl:${p.id}:${i}`, kicker: tr('pop.playedBy', { p: p.name }) })),
+      unplayed.length ? h('span', { class: 'sp-never', key: 'nv', text: tr('status.neverPlayed') }) : null,
+      unplayed.map((x, i) => cardChip(x.title, x.text, { cls: 'sp-chip unplayed', key: 'u' + i, popKey: `un:${p.id}:${i}`, kicker: tr('pop.neverPlayed', { p: p.name }) }))));
   }
   if (o.expanded && (played.length || unplayed.length)) {
     parts.push(h('ul', { class: 'sp-detail' },
       played.map((x, i) => h('li', { key: 'dp' + i }, h('b', { text: x.title + ': ' }), x.text)),
-      unplayed.map((x, i) => h('li', { key: 'du' + i, class: 'unplayed' }, h('b', { text: x.title + ' (never played): ' }), x.text))));
+      unplayed.map((x, i) => h('li', { key: 'du' + i, class: 'unplayed' }, h('b', { text: tr('status.neverPlayedTitle', { title: x.title }) + ' ' }), x.text))));
   }
   return parts;
 }
@@ -2902,21 +3272,22 @@ function vSeat(s, d, p) {
   const downs = [];
   for (const c of cs) {
     const { txt, fresh, late } = cardInfo(s, p, c);
-    if (txt == null) { downs.push(h('span', { class: 'sc-back', key: c.id, title: `${c.label}: still hidden`, text: c.label })); continue; }
+    const label = catLabel(s, c.id);
+    if (txt == null) { downs.push(h('span', { class: 'sc-back', key: c.id, title: tr('board.stillHidden', { cat: catP(s, c.id) }), text: label })); continue; }
     ups.push(h('li', { class: ['sc', fresh && 'fresh', late && 'late'], key: c.id },
-      h('span', { class: 'sc-k', text: c.label }),
+      h('span', { class: 'sc-k', text: label }),
       h('span', { class: 'sc-v', text: txt }),
-      late ? h('span', { class: 'new-tag', text: 'New' }) : null));
+      late ? h('span', { class: 'new-tag', text: tr('board.new') }) : null));
   }
   let status = null;
   if (!o.final) {
     if (s.phase === 'vote' && s.vote && o.cand && d.voteOpen && !o.isMe) {
-      status = h('button', { class: ['btn sm vote-row', o.myPick ? 'picked' : ''], act: 'vote', 'data-player-id': p.id, disabled: !d.canVote, 'aria-pressed': String(o.myPick) }, o.myPick ? 'Your vote ✓' : `Vote ${p.name} out`);
+      status = h('button', { class: ['btn sm vote-row', o.myPick ? 'picked' : ''], act: 'vote', 'data-player-id': p.id, disabled: !d.canVote, 'aria-pressed': String(o.myPick) }, o.myPick ? tr('seat.yourVote') : tr('status.voteOut', { p: p.name }));
     } else if (p.status === 'alive') {
       const ts = turnState(s, p);
-      status = h('span', { class: 'st-row' }, ts ? h('span', { class: ['st-line', ts.cls], title: ts.title || null, text: ts.title && /^Speaks/.test(ts.title) ? ts.title.replace('Speaks', 'speaks') : ts.text }) : null,
-        o.cand ? h('span', { class: 'st-line cand', text: 'candidate' }) : null,
-        h('span', { class: 'st-line dim mono', text: `${p.revealedCount}/8 revealed` }));
+      status = h('span', { class: 'st-row' }, ts ? h('span', { class: ['st-line', ts.cls], title: ts.title || null, text: ts.seat || ts.text }) : null,
+        o.cand ? h('span', { class: 'st-line cand', text: tr('status.candidate') }) : null,
+        h('span', { class: 'st-line dim mono', text: tr('seat.revealed', { n: p.revealedCount }) }));
     }
   }
   return h('article', {
@@ -2932,13 +3303,13 @@ function vSeat(s, d, p) {
   o.tags.length ? h('div', { class: 'tags' }, o.tags) : null,
   vAirlockStrip(s, p),
   ups.length ? h('ul', { class: 'sc-ups' }, ups) : null,
-  downs.length ? h('div', { class: 'sc-downs', title: `${plural(downs.length, 'card')} still hidden` }, downs) : null,
+  downs.length ? h('div', { class: 'sc-downs', title: tr('seat.hiddenCards', { n: downs.length }) }, downs) : null,
   played.length ? h('ul', { class: ['sc-specials', !o.final && 'brief'] }, played.map((x, i) => h('li', { key: 'p' + i },
-    cardChip(x.title, x.text, { cls: 'scs-chip', popKey: `pl:${p.id}:${i}`, kicker: `Played by ${p.name}` }),
+    cardChip(x.title, x.text, { cls: 'scs-chip', popKey: `pl:${p.id}:${i}`, kicker: tr('pop.playedBy', { p: p.name }) }),
     o.final ? h('span', { class: 'scs-x', text: x.text }) : null))) : null,
-  unplayed.length ? h('div', { class: 'sc-never' }, h('span', { class: 'k', text: 'Never played' }),
+  unplayed.length ? h('div', { class: 'sc-never' }, h('span', { class: 'k', text: tr('seat.neverPlayed') }),
     h('ul', { class: 'sc-specials never' }, unplayed.map((x, i) => h('li', { key: 'u' + i },
-      cardChip(x.title, x.text, { cls: 'scs-chip unplayed', popKey: `un:${p.id}:${i}`, kicker: `${p.name}’s card · never played` }),
+      cardChip(x.title, x.text, { cls: 'scs-chip unplayed', popKey: `un:${p.id}:${i}`, kicker: tr('pop.neverPlayed', { p: p.name }) }),
       h('span', { class: 'scs-x', text: x.text }))))) : null,
   status ? h('div', { class: 'sc-status' }, status) : null);
 }
@@ -2953,51 +3324,48 @@ function vHand(s, d) {
   // the specials sit below the hand (below the fold on a laptop): the hand's head says they exist and jumps to them
   const spLeft = final ? 0 : (me.specials || []).filter((x) => !x.used).length;
   return h('section', { class: ['panel hand', picking && 'picking'], id: 'sec-hand' },
-    h('div', { class: 'panel-head' }, h('h2', { text: 'My hand' }), h('span', { class: 'meta', text: final ? 'every card is public now' : `${shown}/8 public · only you see the rest` }),
-      spLeft ? h('button', { class: 'hand-sp-link', act: 'jump', 'data-target': 'sec-specials', title: 'Your special cards: one per round, any player can be surprised' }, `+ ${plural(spLeft, 'special')} ↓`) : null),
-    picking && h('div', { class: 'callout hz', text: s.turn.mustReveal
-      ? `Your turn — reveal your ${catLabel(s, s.turn.mustReveal)}: tap Reveal on the glowing card (or use the bar).`
-      : 'Your turn — tap Reveal on one of the glowing cards (or use the bar). Everyone sees it at once.' }),
+    h('div', { class: 'panel-head' }, h('h2', { text: tr('hand.title') }), h('span', { class: 'meta', text: final ? tr('hand.metaFinal') : tr('hand.meta', { n: shown }) }),
+      spLeft ? h('button', { class: 'hand-sp-link', act: 'jump', 'data-target': 'sec-specials', title: tr('hand.spTitle') }, tr('hand.spLink', { n: spLeft })) : null),
+    picking && h('div', { class: 'callout hz', text: s.turn.mustReveal ? tr('hand.revealMust', { cat: catP(s, s.turn.mustReveal) }) : tr('hand.revealAny') }),
     h('ul', { class: 'hand-cards' }, cs.map((c) => {
       const card = me.cards[c.id] || { text: '?', revealed: false };
       const eligible = picking && d.eligible.includes(c.id);
       const fa = freshAt.get(s.you.id + ':' + c.id);
       const fresh = !!fa && Date.now() - fa < 6000;
       return h('li', { key: c.id, class: ['hc', card.revealed ? 'public' : 'secret', eligible && 'eligible', picking && !eligible && 'dim', fresh && 'fresh'] },
-        h('span', { class: 'hc-label', text: c.label }),
+        h('span', { class: 'hc-label', text: catLabel(s, c.id) }),
         h('span', { class: 'hc-text', text: card.text }),
         eligible
-          ? h('button', { class: 'btn xs primary hc-reveal', act: 'reveal', 'data-category': c.id, disabled: !d.canReveal, 'aria-label': `Reveal ${c.label}` }, 'Reveal')
-          : h('span', { class: ['hc-state', card.revealed ? 'pub' : 'sec'], text: card.revealed ? 'Public' : final ? 'Unseen' : 'Secret' }));
+          ? h('button', { class: 'btn xs primary hc-reveal', act: 'reveal', 'data-category': c.id, disabled: !d.canReveal, 'aria-label': tr('hand.revealAria', { cat: catP(s, c.id) }) }, tr('hand.reveal'))
+          : h('span', { class: ['hc-state', card.revealed ? 'pub' : 'sec'], text: card.revealed ? tr('hand.public') : final ? tr('hand.unseen') : tr('hand.secret') }));
     })));
 }
 function vSpecials(s, d) {
   const list = s.me.specials || [];
   const unused = list.filter((x) => !x.used).length;
   return h('section', { class: 'panel specials-panel', id: 'sec-specials' },
-    h('div', { class: 'panel-head' }, h('h2', { text: 'Special cards' }), h('span', { class: 'meta', text: s.phase === 'final' ? (unused ? `${unused} never played` : 'all played') : `${unused} unused · 1 per round` })),
-    !list.length ? h('p', { class: 'fine pad', text: 'No special cards.' }) : null,
+    h('div', { class: 'panel-head' }, h('h2', { text: tr('sp.title') }), h('span', { class: 'meta', text: s.phase === 'final' ? (unused ? tr('sp.metaNever', { n: unused }) : tr('sp.metaAll')) : tr('sp.meta', { n: unused }) })),
+    !list.length ? h('p', { class: 'fine pad', text: tr('sp.none') }) : null,
     list.map((sp) => {
       const st = specialStatus(s, d, sp);
       // SPEC §11 X1.7: an Airlock that would close someone else's open airlock says so, on the card and its button
       const joins = sp.effect === 'airlock' && !sp.used && st.ok ? joinableAirlocks(s, d) : [];
-      const tNames = listText(joins.map((a) => nameOf(s, a.targetId)));
+      const tNames = joins.map((a) => nameOf(s, a.targetId));
       return h('div', { key: sp.uid, class: ['special', sp.used && 'used', st.ok && 'ready', joins.length && 'joins'], tabindex: '-1', 'data-focus-park': '' },
         h('div', { class: 'sp-top' },
-          h('span', { class: 'sp-title' }, cardChip(sp.title, sp.text, { cls: 'cc-lg', popKey: `my:${sp.uid}`, kicker: 'Your special card', meta: specialMeta(s, sp) })),
-          h('span', { class: ['sp-state', sp.used ? 'used' : st.ok ? 'ready' : 'wait'], text: sp.used ? 'Played' : st.ok ? 'Ready' : 'Not now' })),
+          h('span', { class: 'sp-title' }, cardChip(sp.title, sp.text, { cls: 'cc-lg', popKey: `my:${sp.uid}`, kicker: tr('pop.yourCard'), meta: specialMeta(s, sp) })),
+          h('span', { class: ['sp-state', sp.used ? 'used' : st.ok ? 'ready' : 'wait'], text: sp.used ? tr('sp.played') : st.ok ? tr('sp.ready') : tr('sp.notNow') })),
         h('p', { class: 'sp-text', text: sp.text }),
         joins.length ? h('p', { class: 'sp-join', testid: 'airlock-join-hint', 'data-player-id': joins.map((a) => a.targetId).join(' ') },
           icon('door', 'sp-join-ico'),
-          h('span', null, h('b', { text: `Join the airlock on ${tNames}. ` }),
-            joins.length === 1 ? `${airlockStarters(s, joins[0])} started it: play this card on ${tNames} and they are thrown out right now, with no vote.`
-              : 'Someone else started them: play this card on one of them, and that player is thrown out right now, with no vote.')) : null,
+          h('span', null, h('b', { text: tr('sp.joinLead', { list: tNames }) + ' ' }),
+            joins.length === 1 ? tr('sp.joinOne', { by: airlockStarters(s, joins[0]), list: tNames }) : tr('sp.joinMany'))) : null,
         h('p', { class: 'sp-meta', text: specialMeta(s, sp) }),
         h('div', { class: 'sp-actions' },
           h('button', {
             class: ['btn sm', st.ok ? (joins.length ? 'danger-solid' : 'primary') : ''], testid: 'special-btn', act: 'special-open', 'data-uid': sp.uid,
             'data-effect': sp.effect, 'data-target': sp.target, disabled: !st.ok || d.shield,
-          }, sp.used ? 'Played' : joins.length ? 'Join the airlock…' : 'Play…'),
+          }, sp.used ? tr('sp.btnPlayed') : joins.length ? tr('sp.btnJoin') : tr('sp.btnPlay')),
           !st.ok && !sp.used && h('span', { class: 'sp-why', text: st.why })));
     }));
 }
@@ -3005,38 +3373,38 @@ function vSpecials(s, d) {
 function vIntel(s) {
   const notes = s.me.notes || [];
   return h('section', { class: 'panel intel', id: 'sec-intel' },
-    h('div', { class: 'panel-head' }, h('h2', { text: 'Private intel' }), h('span', { class: 'meta', text: 'only you see this' })),
+    h('div', { class: 'panel-head' }, h('h2', { text: tr('intel.title') }), h('span', { class: 'meta', text: tr('intel.meta') })),
     h('ul', { class: 'note-list' }, notes.map((n, i) => h('li', { key: 'n' + i + ':' + n.ts }, h('time', { class: 'mono', text: hhmm(n.ts) }), h('span', { text: n.text })))));
 }
 
 function vWatcher(s, d) {
   const list = s.spectators || [];
   return h('section', { class: 'panel watcher', id: 'sec-watch' },
-    h('div', { class: 'panel-head' }, h('h2', { text: 'Watching' }), h('span', { class: 'meta', text: 'public view' })),
-    h('p', { class: 'watch-text', text: 'You are a spectator: you see exactly what is public at the table — revealed cards, played specials, votes and the log. Hidden cards stay hidden until the final.' }),
-    h('div', { class: 'k sub', text: `Spectators (${list.length})` }),
+    h('div', { class: 'panel-head' }, h('h2', { text: tr('watch.title') }), h('span', { class: 'meta', text: tr('watch.meta') })),
+    h('p', { class: 'watch-text', text: tr('watch.text') }),
+    h('div', { class: 'k sub', text: tr('watch.spectators', { n: list.length }) }),
     h('ul', { class: 'spec-list' }, list.map((x) => h('li', { key: x.id, class: ['sp-row', !x.connected && 'offline'] },
       h('span', { class: ['dot', x.connected ? 'on' : 'off'] }),
       h('span', { class: 'lp-name', text: x.name }),
-      x.id === s.you.id && tag('You', 'you'),
-      d.isHost && x.id !== s.you.id && h('button', { class: 'btn xs danger', testid: 'kick-btn', act: 'kick', 'data-player-id': x.id, disabled: !d.canAdmin }, 'Kick')))));
+      x.id === s.you.id && tag(tr('tag.you'), 'you'),
+      d.isHost && x.id !== s.you.id && h('button', { class: 'btn xs danger', testid: 'kick-btn', act: 'kick', 'data-player-id': x.id, disabled: !d.canAdmin }, tr('host.kick'))))));
 }
 function vLog(s) {
   const log = s.log || [];
   return h('section', { class: 'panel log-panel', id: 'sec-log' },
-    h('div', { class: 'panel-head' }, h('h2', { text: 'Event log' }), h('span', { class: 'meta', text: log.length ? `${log.length} events` : 'empty' })),
-    h('ol', { class: 'log', testid: 'log', role: 'log', 'aria-live': 'polite', tabindex: '0' },
-      log.map((e) => h('li', { key: 'l' + e.id, class: ['le', 'k-' + e.kind, airlockLine(e.text, e.kind) && 'k-airlock'] },
+    h('div', { class: 'panel-head' }, h('h2', { text: tr('log.title') }), h('span', { class: 'meta', text: log.length ? tr('log.count', { n: log.length }) : tr('log.empty') })),
+    h('ol', { class: 'log', testid: 'log', role: 'log', 'aria-live': liveMode(), tabindex: '0' },
+      log.map((e) => h('li', { key: 'l' + e.id, class: ['le', 'k-' + e.kind, airlockOf(e) && 'k-airlock'] },
         h('time', { class: 'mono', text: hhmm(e.ts) }),
         h('span', { class: 'lg mono', 'aria-hidden': 'true', text: LOG_GLYPH[e.kind] || '·' }),
-        // a special card named in the line is a chip with its rules text (SPEC §11 X3)
-        h('span', { class: 'lt' }, richText(e.text, `log:${e.id}`))))));
+        // a special card named in the line is a chip with its rules text (SPEC §11 X3); a keyed line from its parts
+        h('span', { class: 'lt' }, lineNodes(e, `log:${e.id}`))))));
 }
 
 /* ---------- the action bar: what is happening + what I can do, in plain words */
 function nextButton(s, d) {
   const t = s.turn;
-  let main = 'Next';
+  let main = tr('next.next');
   let sub = '';
   // on the host's own turn Next is toned down: it would skip their own choice
   const ownTurn = d.isSpeaker && !!t && (s.phase === 'reveal' || s.phase === 'defense');
@@ -3048,104 +3416,109 @@ function nextButton(s, d) {
   const speakerBusy = !!t && !!sp && sp.status === 'alive' && sp.connected && !!s.timer && s.timer.endsAt > serverNow();
   if (s.phase === 'reveal' && t) {
     const nx = nextInOrder(s);
-    main = nx ? `Next: ${nx.name}'s turn` : 'Next: discussion';
+    main = nx ? tr('next.turnOf', { name: nx.name }) : tr('next.discussion');
     if (sp && sp.status === 'alive' && !t.hasRevealed && speakerHasEligible(s, sp, t)) {
-      sub = ownTurn ? (t.mustReveal ? `skips your turn · reveals your ${catLabel(s, t.mustReveal)}` : 'skips your pick · reveals a random card of yours')
-        : spOffline ? `${sp.name} is offline · reveals a card for them`
-          : t.mustReveal ? `reveals ${sp.name}'s ${catLabel(s, t.mustReveal)} for them` : `takes ${sp.name}'s pick · reveals a random card`;
-    } else sub = ownTurn ? 'ends your turn' : spOffline ? `${sp.name} is offline · moves on` : nx ? 'ends the current turn' : 'ends the reveals';
+      const cat = t.mustReveal ? catP(s, t.mustReveal) : '';
+      sub = ownTurn ? (t.mustReveal ? tr('next.skipsTurn', { cat }) : tr('next.skipsPick'))
+        : spOffline ? tr('next.offlineReveals', { p: sp.name })
+          : t.mustReveal ? tr('next.revealsFor', { p: sp.name, cat }) : tr('next.takesPick', { p: sp.name });
+    } else sub = ownTurn ? tr('next.endsYourTurn') : spOffline ? tr('next.offlineMoves', { p: sp.name }) : nx ? tr('next.endsTurn') : tr('next.endsReveals');
   } else if (s.phase === 'defense' && t) {
     const nx = nextInOrder(s);
-    main = nx ? `Next: ${nx.name} defends` : 'Next: start the revote';
-    sub = spOffline ? `${sp.name} is offline · moves on` : nx ? 'ends this defense speech' : 'between the tied players';
+    main = nx ? tr('next.defends', { name: nx.name }) : tr('next.revote');
+    sub = spOffline ? tr('next.offlineMoves', { p: sp.name }) : nx ? tr('next.endsDefense') : tr('next.betweenTied');
   } else if (s.phase === 'discussion') {
     const k = (s.schedule && s.schedule.kicksThisStep) || 0;
-    if (k > 0 && s.voteMods.cancelNext) { main = 'Next: skip the vote'; sub = 'it was cancelled by a special'; }
-    else if (k > 0) { main = 'Next: start the vote'; sub = `${plural(k, 'player')} will be voted out`; }
-    else if (s.round < s.maxRounds && !s.overtime) { main = `Next: round ${s.round + 1}`; sub = 'no vote this round'; }
-    else { main = 'Next: final'; sub = 'close the bunker doors'; }
+    if (k > 0 && s.voteMods.cancelNext) { main = tr('next.skipVote'); sub = tr('next.skipVoteSub'); }
+    else if (k > 0) { main = tr('next.startVote'); sub = tr('next.willBeOut', { k }); }
+    else if (s.round < s.maxRounds && !s.overtime) { main = tr('next.round', { r: s.round + 1 }); sub = tr('next.noVote'); }
+    else { main = tr('next.final'); sub = tr('next.finalSub'); }
   } else if (s.phase === 'vote') {
     // the same move as Close vote, right next to it: kept (§10's hook), but small
-    main = 'Next'; sub = '= Close vote';
+    main = tr('next.next'); sub = tr('next.closeVoteSub');
   }
   const quiet = s.phase === 'vote' || ownTurn || ((s.phase === 'reveal' || s.phase === 'defense') && speakerBusy);
-  return h('button', { class: ['btn host-btn next-btn', quiet ? 'ghost' : 'primary', ownTurn && 'own-turn', s.phase === 'vote' && 'vote-dup', d.cooling && !ui.inflight && 'cooling'], testid: 'next-btn', act: 'next', disabled: !d.canNext, title: s.phase === 'vote' ? 'Next closes the vote and counts it, the same as Close vote' : null },
+  return h('button', { class: ['btn host-btn next-btn', quiet ? 'ghost' : 'primary', ownTurn && 'own-turn', s.phase === 'vote' && 'vote-dup', d.cooling && !ui.inflight && 'cooling'], testid: 'next-btn', act: 'next', disabled: !d.canNext, title: s.phase === 'vote' ? tr('next.voteTitle') : null },
     h('span', { class: 'b-main', text: main }), sub ? h('span', { class: 'b-sub', text: sub }) : null);
 }
 // SPEC §11 X6: "End game → back to the lobby". It ends the game for everyone, so it takes two taps like Leave and Kick
 // (ARM_MS / ARM_MIN_MS: the second click of a double click never confirms), and it sits apart from Next, small.
-const END_GAME_TEXT = 'Ends the game for everyone and returns to the lobby — late arrivals can then take a seat.';
 function endGameButton(s, d) {
   const armed = isArmed('end-game');
   const settling = armed && !armReady('end-game');
   return h('button', {
     class: ['btn sm end-game', armed ? 'danger-solid armed' : 'ghost danger', settling && 'settling'], testid: 'end-game-btn', act: 'end-game',
     disabled: !d.online || !!ui.inflight || d.shield || settling,
-    title: armed ? 'Tap again to end the game for everyone' : `End game → back to the lobby. ${END_GAME_TEXT} (tap twice)`,
-    'aria-label': armed ? 'Tap again to end the game for everyone' : 'End the game and go back to the lobby (tap twice)',
-  }, armed ? 'Tap again to end' : 'End game');
+    title: armed ? tr('host.endArmedTitle') : tr('host.endTitle'),
+    'aria-label': armed ? tr('host.endArmedTitle') : tr('host.endAria'),
+  }, armed ? tr('host.endArmed') : tr('host.end'));
 }
 function barModel(s, d) {
   const m = { tone: 'wait', eyebrow: '', title: '', detail: '', choices: null, choiceKind: '', buttons: [], host: [] };
   const t = s.turn;
-  const hostWho = d.isHost ? 'you' : d.hostName || 'the host';
+  // (in a sentence that starts with it: "the host moves on with Next.", as it always read)
+  const hostWho = d.isHost ? tr('air.you') : d.hostName || tr('common.theHost');
   // The host dropped (a closed tab, a locked phone): nobody should be told to wait for their Next. The role passes on
   // by itself after a grace time (SPEC §6; the time is not in the state, so no number of seconds is promised).
   const hostP = s.hostId ? byId(s, s.hostId) : null;
   const hostOff = !d.isHost && !!hostP && !hostP.connected;
-  const hostAway = hostOff ? `The host, ${hostP.name}, is offline: if they are not back soon, the host role passes to a player who is online.` : '';
+  const hostAway = hostOff ? tr('bar.hostAway', { host: hostP.name }) : '';
+  // sentences of a detail line are joined with a space (each is a whole sentence in every language)
+  const join = (...xs) => xs.filter(Boolean).join(' ');
   switch (s.phase) {
     case 'lobby': {
       const n = s.players.length;
-      m.eyebrow = `Lobby · room ${s.room}${endedByHost(s) ? ' · the host ended the last game' : ''}`;
+      m.eyebrow = endedByHost(s) ? tr('lobby.ended', { code: s.room }) : tr('bar.lobby', { code: s.room });
       // X4: the estimate also rides in the bar for every viewer, which a phone keeps on screen (the lobby panel is far
       // down there); below the minimum it is the minimum table's, and says so
       const mins = estimateGame(Math.max(2, Math.min(16, Math.max(n, s.minPlayers))), draftOptions(s)).mid;
       const few = n < s.minPlayers;
-      const est = few ? `with ${s.minPlayers} players (the minimum), a game of about ${mins} min` : `a game of about ${mins} min`;
       if (d.isSpectator) {
-        m.title = 'You are watching this lobby';
-        const lead = few ? `With ${s.minPlayers} players (the minimum), a game of about ${mins} min` : `Started now, it is a game of about ${mins} min`;
-        m.detail = `${n < s.maxPlayers ? `Want to play? Take a seat (${n}/${s.maxPlayers} taken).` : 'All 16 seats are taken — you will watch the game.'} ${lead}.`;
-        m.buttons.push(h('button', { class: 'btn primary', testid: 'take-seat-btn', act: 'take-seat', disabled: !d.online || n >= s.maxPlayers || d.shield }, 'Take a seat'));
+        m.title = tr('bar.watchingLobby');
+        m.detail = join(n < s.maxPlayers ? tr('bar.specSeat', { n, max: s.maxPlayers }) : tr('bar.specFull'),
+          few ? tr('bar.specLeadFew', { m: s.minPlayers, mins }) : tr('bar.specLead', { mins }));
+        m.buttons.push(h('button', { class: 'btn primary', testid: 'take-seat-btn', act: 'take-seat', disabled: !d.online || n >= s.maxPlayers || d.shield }, tr('bar.takeSeat')));
         m.tone = 'info';
       } else if (d.isHost) {
         const ready = n >= s.minPlayers;
         m.tone = ready ? 'mine' : 'wait';
-        m.title = ready ? 'Ready when you are' : 'Waiting for players';
+        m.title = ready ? tr('bar.ready') : tr('bar.waitingPlayers');
+        // (not ready is always below the minimum: its estimate is the minimum table's)
         m.detail = ready
-          ? `${n} players → ${Math.floor(n / 2)} beds, a game of about ${mins} min. Start when everyone is on the voice call.`
-          : `${n} of at least ${s.minPlayers} players are here; ${est}. Share the link or the code ${s.room}.`;
+          ? tr('bar.readyDetail', { n, beds: Math.floor(n / 2), mins })
+          : tr('bar.waitingDetail', { n, m: s.minPlayers, mins, code: s.room });
         m.host.push(h('button', { class: 'btn primary host-btn', testid: 'start-btn', act: 'start', disabled: !ready || !d.online || !!ui.inflight || d.shield },
-          h('span', { class: 'b-main', text: 'Start the game' }), h('span', { class: 'b-sub', text: ready ? `deal cards to ${n} players` : `need ${s.minPlayers - n} more` })));
+          h('span', { class: 'b-main', text: tr('bar.start') }), h('span', { class: 'b-sub', text: ready ? tr('bar.startDeal', { n }) : tr('bar.startNeed', { n: s.minPlayers - n }) })));
       } else {
-        m.title = s.hostId ? `Waiting for ${d.hostName} to start` : 'Waiting for a host';
-        m.detail = s.hostId ? `${n} seated (minimum ${s.minPlayers}); ${est}. ${hostOff ? hostAway : 'Join the voice call meanwhile.'}` : 'The next player to take a seat becomes the host.';
+        m.title = s.hostId ? tr('bar.waitingHost', { host: d.hostName }) : tr('bar.waitingNoHost');
+        m.detail = s.hostId
+          ? join(few ? tr('bar.guestDetailFew', { n, m: s.minPlayers, mins }) : tr('bar.guestDetail', { n, m: s.minPlayers, mins }), hostOff ? hostAway : tr('bar.joinVoice'))
+          : tr('bar.nextSeatHost');
       }
       break;
     }
     case 'reveal': {
       const sp = d.speaker;
-      m.eyebrow = `Round ${s.round} · reveals${t ? ` · speaker ${t.index + 1} of ${t.order.length}` : ''}`;
+      m.eyebrow = t ? tr('bar.revealEyebrow', { r: s.round, i: t.index + 1, n: t.order.length }) : tr('bar.revealEyebrowNoTurn', { r: s.round });
       if (d.isSpeaker) {
         m.tone = 'mine';
         if (d.canReveal || (!t.hasRevealed && d.eligible.length > 0)) {
-          m.eyebrow = `Your turn · round ${s.round}`;
-          m.title = t.mustReveal ? `Reveal your ${catLabel(s, t.mustReveal)}` : 'Reveal one of your hidden cards';
-          m.detail = t.mustReveal ? 'Round 1: everyone starts with their profession. Then make your case on voice.' : 'Everyone sees it at once. Then make your case on voice.';
+          m.eyebrow = tr('bar.yourTurnEyebrow', { r: s.round });
+          m.title = t.mustReveal ? tr('bar.revealYour', { cat: catP(s, t.mustReveal) }) : tr('bar.revealOne');
+          m.detail = t.mustReveal ? tr('bar.revealMustDetail') : tr('bar.revealDetail');
           m.choiceKind = 'reveal';
           m.choices = d.eligible.map((c) => h('button', { class: 'choice reveal-choice', key: c, testid: 'reveal-btn', act: 'reveal', 'data-category': c, disabled: !d.canReveal },
-            h('span', { class: 'ch-k', text: `Reveal ${catLabel(s, c)}` }), h('span', { class: 'ch-v', text: s.me.cards[c].text })));
+            h('span', { class: 'ch-k', text: tr('bar.revealChoice', { cat: catP(s, c) }) }), h('span', { class: 'ch-v', text: s.me.cards[c].text })));
         } else if (t.hasRevealed) {
-          m.eyebrow = `Your turn · round ${s.round}`;
-          m.title = 'Make your case, then end your turn';
-          m.detail = 'Your card is on the table. Explain why the bunker needs you.';
-          m.buttons.push(h('button', { class: 'btn primary', testid: 'end-turn-btn', act: 'end-turn', disabled: !d.canEndTurn }, 'End my turn'));
+          m.eyebrow = tr('bar.yourTurnEyebrow', { r: s.round });
+          m.title = tr('bar.makeCase');
+          m.detail = tr('bar.makeCaseDetail');
+          m.buttons.push(h('button', { class: 'btn primary', testid: 'end-turn-btn', act: 'end-turn', disabled: !d.canEndTurn }, tr('bar.endTurn')));
         } else {
-          m.eyebrow = `Your turn · round ${s.round}`;
-          m.title = 'Nothing left to reveal — just speak';
-          m.detail = 'Special cards already revealed what you would have shown. End your turn when you are done.';
-          m.buttons.push(h('button', { class: 'btn primary', testid: 'end-turn-btn', act: 'end-turn', disabled: !d.canEndTurn }, 'End my turn'));
+          m.eyebrow = tr('bar.yourTurnEyebrow', { r: s.round });
+          m.title = tr('bar.nothingLeft');
+          m.detail = tr('bar.nothingLeftDetail');
+          m.buttons.push(h('button', { class: 'btn primary', testid: 'end-turn-btn', act: 'end-turn', disabled: !d.canEndTurn }, tr('bar.endTurn')));
         }
       } else if (sp) {
         const pos = orderPosition(s, d);
@@ -3156,51 +3529,52 @@ function barModel(s, d) {
           // full on hover or tap (SPEC §11 X3)
           const rv = turnReveal(s, sp);
           const short = rv ? clip(rv.text, isNarrow() ? 70 : 140) : '';
-          what = rv ? `Revealed ${rv.label}: “${short}”.` : 'Card revealed — listening to the pitch.';
+          const cat = rv ? catP(s, rv.cat) : '';
+          what = rv ? tr('bar.revealed', { cat, text: short }) : tr('bar.cardRevealed');
           if (rv && short !== rv.text) {
-            whatNodes = [`Revealed ${rv.label}: “`, h('span', {
-              class: 'clip-pop', 'data-pop': 'clamp', 'data-pop-cut': '', 'data-pop-title': `${sp.name} · ${rv.label}`, 'data-pop-text': rv.text,
-              'data-pop-key': 'bar-reveal', tabindex: '0', role: 'button', 'aria-label': `${rv.label}: ${rv.text}`,
-            }, short), '”.'];
+            whatNodes = trn('bar.revealed', { cat, text: h('span', {
+              class: 'clip-pop', 'data-pop': 'clamp', 'data-pop-cut': '', 'data-pop-title': tr('pop.cell', { p: sp.name, cat }), 'data-pop-text': rv.text,
+              'data-pop-key': 'bar-reveal', tabindex: '0', role: 'button', 'aria-label': tr('board.cellAria', { cat, text: rv.text }),
+            }, short) });
           }
-        } else what = `Choosing a card to reveal${t.mustReveal ? ` (${catLabel(s, t.mustReveal)})` : ''}.`;
+        } else what = t.mustReveal ? tr('bar.choosingMust', { cat: catP(s, t.mustReveal) }) : tr('bar.choosing');
         if (!sp.connected) {
           // nobody should wait for someone who is gone without knowing it
-          m.title = `${sp.name}'s turn — ${sp.name} is offline`;
-          what = t.hasRevealed ? what : 'Nobody is choosing a card right now.';
-          what += d.isHost ? ' Press Next to reveal a card for them and move on.' : hostOff ? ` ${hostAway}` : ` ${d.hostName || 'The host'} can move on with Next.`;
+          m.title = tr('bar.offlineTurn', { p: sp.name });
+          what = join(t.hasRevealed ? what : tr('bar.nobodyChoosing'),
+            d.isHost ? tr('bar.pressNextReveal') : hostOff ? hostAway : tr('bar.hostCanMoveOn', { host: d.hostName || tr('common.TheHost') }));
           whatNodes = null;
-        } else m.title = `${sp.name} is speaking`;
-        const rest = [pos, d.isPlayer && !d.alive ? 'You are out, watching.' : ''].filter(Boolean);
+        } else m.title = tr('bar.speaking', { p: sp.name });
+        const rest = [pos, d.isPlayer && !d.alive ? tr('bar.outWatching') : ''].filter(Boolean);
         m.detail = [what, ...rest].join(' ');
         if (whatNodes) m.detailNodes = [...whatNodes, rest.length ? ' ' + rest.join(' ') : null];
       }
       break;
     }
     case 'discussion': {
-      m.eyebrow = s.overtime ? 'Overtime · discussion' : `Round ${s.round} · discussion`;
-      m.title = 'Open discussion on voice';
+      m.eyebrow = s.overtime ? tr('bar.otDiscussion') : tr('bar.discussion', { r: s.round });
+      m.title = tr('bar.openDiscussion');
       const k = (s.schedule && s.schedule.kicksThisStep) || 0;
       let after;
-      if (k > 0 && s.voteMods.cancelNext) after = 'The vote after it was cancelled by a special card.';
-      else if (k > 0) after = `Then a vote: ${plural(k, 'player')} will stay outside.`;
-      else if (s.schedule && s.schedule.nextVoteRound) after = `No vote this round (the next one is after round ${s.schedule.nextVoteRound}).`;
-      else after = 'No vote this round.';
-      m.detail = `${after} ${d.isHost ? 'Press Next when the talk is done.' : hostOff ? hostAway : `${hostWho} moves on with Next.`}`;
-      if (d.isPlayer && !d.alive) m.detail += ' You are out, watching.';
+      if (k > 0 && s.voteMods.cancelNext) after = tr('bar.voteCancelled');
+      else if (k > 0) after = tr('bar.thenVote', { k });
+      else if (s.schedule && s.schedule.nextVoteRound) after = tr('bar.noVoteNext', { r: s.schedule.nextVoteRound });
+      else after = tr('bar.noVote');
+      m.detail = `${after} ${d.isHost ? tr('bar.pressNextTalk') : hostOff ? hostAway : tr('bar.hostMovesOn', { host: hostWho })}`;
+      if (d.isPlayer && !d.alive) m.detail += ' ' + tr('bar.outWatching');
       break;
     }
     case 'vote': {
       const v = s.vote;
       if (!v) break;
       const revote = v.stage === 'revote';
-      m.eyebrow = `${revote ? 'Revote' : 'Vote'} ${v.ballot} of ${ballotsOf(s)} · ${v.voted.length}/${v.voters.length} voted`;
+      m.eyebrow = tr(revote ? 'bar.revoteEyebrow' : 'bar.voteEyebrow', { ballot: v.ballot, ballots: ballotsOf(s), n: v.voted.length, total: v.voters.length });
       if (d.amVoter) {
         m.tone = d.myVote ? 'done' : 'mine';
-        m.title = d.myVote ? `You voted: ${nameOf(s, d.myVote)} stays outside` : revote ? `Revote: who stays outside — ${listText(namesOf(s, v.candidates))}?` : 'Vote: who stays outside?';
-        m.detail = d.myVote ? 'You can change it until the vote closes. Everyone sees who voted for whom afterwards.' : 'Tap a name. Nobody sees your choice until the vote closes.';
+        m.title = d.myVote ? tr('bar.youVoted', { p: nameOf(s, d.myVote) }) : revote ? tr('bar.revoteWho', { list: namesOf(s, v.candidates) }) : tr('bar.voteWho');
+        m.detail = d.myVote ? tr('bar.canChange') : tr('bar.tapName');
         // the player this viewer voted for left mid-ballot, so the vote was wiped (§3): say why they are asked again
-        if (!d.myVote && ui.voteWiped && ui.voteWiped.key === ballotKey(s)) m.detail = `${ui.voteWiped.text} ${m.detail}`;
+        if (!d.myVote && ui.voteWiped && ui.voteWiped.key === ballotKey(s)) m.detail = `${msgText(wipedMsg(ui.voteWiped, false))} ${m.detail}`;
         m.choiceKind = 'vote';
         m.choices = v.candidates.filter((id) => id !== d.meId).map((id) => {
           const p = byId(s, id);
@@ -3209,11 +3583,11 @@ function barModel(s, d) {
         });
       } else {
         const mods = s.voteMods || { blocked: [] };
-        if (d.isSpectator) m.title = 'The players are voting';
-        else if (d.isPlayer && !d.alive) m.title = 'You are out — watching the vote';
-        else if (mods.blocked.includes(d.meId)) m.title = 'You are blocked from this vote';
-        else m.title = 'You have no vote in this ballot';
-        m.detail = `Deciding between ${listText(namesOf(s, v.candidates))}.`;
+        if (d.isSpectator) m.title = tr('bar.playersVoting');
+        else if (d.isPlayer && !d.alive) m.title = tr('bar.outWatchingVote');
+        else if (mods.blocked.includes(d.meId)) m.title = tr('bar.blockedVote');
+        else m.title = tr('bar.noVoteBallot');
+        m.detail = tr('bar.deciding', { list: namesOf(s, v.candidates) });
       }
       // the vote closes by itself once every voter has voted; only the host can close it before that
       if (hostOff) m.detail = `${m.detail} ${hostAway}`;
@@ -3222,10 +3596,9 @@ function barModel(s, d) {
         // it would cut the vote short, and at 0 votes fate would pick at random
         const missing = v.voters.filter((id) => !v.voted.includes(id));
         const onlyOffline = missing.length > 0 && missing.every((id) => { const p = byId(s, id); return !p || !p.connected; });
-        const sub = v.voted.length === 0 ? 'nobody has voted yet: fate picks at random'
-          : `${plural(missing.length, onlyOffline ? 'offline voter' : 'missing voter')} ${missing.length === 1 ? 'abstains' : 'abstain'}`;
+        const sub = v.voted.length === 0 ? tr('bar.closeNobody') : tr(onlyOffline ? 'bar.closeOffline' : 'bar.closeMissing', { n: missing.length });
         m.host.push(h('button', { class: ['btn host-btn', onlyOffline ? 'primary' : 'ghost'], testid: 'close-vote-btn', act: 'close-vote', disabled: !d.canClose },
-          h('span', { class: 'b-main', text: 'Close vote' }),
+          h('span', { class: 'b-main', text: tr('bar.closeVote') }),
           h('span', { class: 'b-sub', text: sub })));
       }
       break;
@@ -3233,42 +3606,44 @@ function barModel(s, d) {
     case 'defense': {
       const sp = d.speaker;
       const tied = t ? namesOf(s, t.order) : [];
-      m.eyebrow = `Defense ${t ? t.index + 1 : 1} of ${t ? t.order.length : 1} · tie-break`;
+      m.eyebrow = tr('bar.defenseEyebrow', { i: t ? t.index + 1 : 1, n: t ? t.order.length : 1 });
       if (d.isSpeaker) {
         m.tone = 'mine';
-        m.title = 'Your defense — convince them';
-        m.detail = `You tied with ${listText(tied.filter((x) => x !== s.you.name))}. A revote between you follows.`;
-        m.buttons.push(h('button', { class: 'btn primary', testid: 'end-turn-btn', act: 'end-turn', disabled: !d.canEndTurn }, 'End my defense'));
+        m.title = tr('bar.yourDefense');
+        m.detail = tr('bar.youTied', { list: tied.filter((x) => x !== s.you.name) });
+        m.buttons.push(h('button', { class: 'btn primary', testid: 'end-turn-btn', act: 'end-turn', disabled: !d.canEndTurn }, tr('bar.endDefense')));
       } else {
         const off = !!sp && !sp.connected;
-        m.title = sp ? `${sp.name} is defending${off ? ' — offline' : ''}` : 'Defense speeches';
-        m.detail = `Tie between ${listText(tied)}. Then a revote between them. ${off ? (d.isHost ? 'They are offline: press Next to move on. ' : hostOff ? `They are offline. ${hostAway} ` : 'They are offline: the host can move on with Next. ') : ''}${orderPosition(s, d)}`.trim();
+        m.title = sp ? tr(off ? 'bar.defendingOff' : 'bar.defending', { p: sp.name }) : tr('bar.defenseSpeeches');
+        m.detail = join(tr('bar.tieBetween', { list: tied }),
+          off ? (d.isHost ? tr('bar.offNext') : hostOff ? join(tr('bar.offHostAway'), hostAway) : tr('bar.offHost')) : '',
+          orderPosition(s, d));
       }
       break;
     }
     case 'final': {
       const f = s.final || { survivors: [] };
       m.tone = 'final';
-      m.eyebrow = 'Game over';
-      m.title = `${plural(f.survivors.length, 'player')} made it into the bunker`;
-      const mine = d.isPlayer ? (f.survivors.includes(d.meId) ? 'You are inside.' : 'You stayed in the forest.') : '';
-      m.detail = `${mine} ${d.isHost ? 'Play again returns everyone to the lobby with the same seats.' : hostOff ? hostAway : `${d.hostName || 'The host'} can start a new game with the same players.`}`.trim();
+      m.eyebrow = tr('bar.gameOver');
+      m.title = tr('bar.madeIt', { n: f.survivors.length });
+      const mine = d.isPlayer ? (f.survivors.includes(d.meId) ? tr('bar.youInside') : tr('bar.youStayed')) : '';
+      m.detail = join(mine, d.isHost ? tr('bar.playAgainInfo') : hostOff ? hostAway : tr('bar.hostCanRestart', { host: d.hostName || tr('common.TheHost') }));
       if (d.isHost) {
         m.host.push(h('button', { class: 'btn primary host-btn', testid: 'play-again-btn', act: 'play-again', disabled: !d.online || !!ui.inflight || d.shield },
-          h('span', { class: 'b-main', text: 'Play again' }), h('span', { class: 'b-sub', text: 'back to the lobby' })));
+          h('span', { class: 'b-main', text: tr('bar.playAgain') }), h('span', { class: 'b-sub', text: tr('bar.playAgainSub') })));
       }
       break;
     }
     default: break;
   }
-  if (d.isPlayer && d.meP.status === 'ejected' && d.inGame) m.eyebrow = `You are out · ${m.eyebrow}`;
+  if (d.isPlayer && d.meP.status === 'ejected' && d.inGame) m.eyebrow = tr('bar.outEyebrow', { text: m.eyebrow });
   if (d.isHost && d.inGame) m.host.push(nextButton(s, d));
   // SPEC §11 X6: the host can end a running game (the final has Play again): in the host tools, away from Next
   m.endGame = d.isHost && d.inGame;
   if (m.endGame && isArmed('end-game')) m.endNote = true;
-  if (d.inGame && !s.hostId) m.detail = `${m.detail} Nobody is host right now.`.trim();
-  if (!d.online && !MOCK) { m.tone = 'offline'; m.eyebrow = 'Offline · reconnecting'; }
-  if (MOCK && ui.mockConn) { m.tone = 'offline'; m.eyebrow = 'Offline · reconnecting'; }
+  if (d.inGame && !s.hostId) m.detail = join(m.detail, tr('bar.noHostNow'));
+  if (!d.online && !MOCK) { m.tone = 'offline'; m.eyebrow = tr('bar.offline'); }
+  if (MOCK && ui.mockConn) { m.tone = 'offline'; m.eyebrow = tr('bar.offline'); }
   return m;
 }
 // The bar names every open airlock too (SPEC §11 X1.7): on a phone it stays on screen while the table scrolls away.
@@ -3280,32 +3655,32 @@ function vBarAirlocks(s, d) {
   const onMe = list.some((a) => a.targetId === s.you.id);
   const many = list.length > 1;
   const spent = airlocksLeft(s) === 0;
-  const end = airEnd(s);
-  const tail = spent ? `every Airlock in this game has been played, so ${many ? 'each' : 'it'} jams when ${end}`
-    : join.length ? `you hold an Airlock: yours would close ${many ? 'one' : 'it'}` : onMe ? `one more Airlock on you before ${end} and you are out`
-      : many ? `a second Airlock on the same player before ${end} closes each` : `one more Airlock before ${end} closes it`;
+  const ot = airEnd(s);
+  const tail = spent ? tr('air.whenSpent', { n: list.length, ot })
+    : join.length ? tr('air.barJoin', { n: list.length }) : onMe ? tr('air.barOnMe', { ot })
+      : many ? tr('air.barMany', { ot }) : tr('air.barOne', { ot });
   return h('div', { class: ['bar-airlock', join.length && 'joinable', onMe && !spent && 'on-me', spent && 'spent'] },
     icon('door', 'ba-ico'),
-    h('span', { class: 'ba-k', text: 'Airlock' }),
-    h('span', { class: 'ba-t' }, list.map((a, i) => [i ? ' · ' : '', h('b', { text: a.targetId === s.you.id ? (i ? 'you' : 'You') : nameOf(s, a.targetId) }),
-      ` ${airlockCount(a)}, by ${airlockStarters(s, a)}`]), ` — ${tail}`));
+    h('span', { class: 'ba-k', text: tr('air.bar') }),
+    h('span', { class: 'ba-t' }, list.map((a, i) => [i ? ' · ' : '', h('b', { text: a.targetId === s.you.id ? (i ? tr('air.you') : tr('air.youFirst')) : nameOf(s, a.targetId) }),
+      ' ' + tr('air.barBy', { n: airlockN(a), by: airlockStarters(s, a) })]), ` — ${tail}`));
 }
 function vBar(s, d) {
   const m = barModel(s, d);
-  return h('footer', { class: ['bar', 'tone-' + m.tone], role: 'region', 'aria-label': 'What happens now' },
+  return h('footer', { class: ['bar', 'tone-' + m.tone], role: 'region', 'aria-label': tr('bar.aria') },
     h('div', { class: 'bar-stripe', 'aria-hidden': 'true' }),
     h('div', { class: 'bar-inner' },
       h('div', { class: 'bar-main' },
-        h('div', { class: 'bar-status', 'aria-live': 'polite', testid: 'action-bar' },
+        h('div', { class: 'bar-status', 'aria-live': liveMode(), testid: 'action-bar' },
           h('div', { class: 'bar-eyebrow', text: m.eyebrow }),
           h('div', { class: 'bar-title', text: m.title }),
           m.detail ? h('div', { class: 'bar-detail' }, m.detailNodes || m.detail) : null,
           vBarAirlocks(s, d),
           m.endNote ? h('div', { class: 'bar-endnote', role: 'alert' },
-            h('b', { text: 'End the game now? ' }), END_GAME_TEXT, ' Hidden cards stay hidden. Tap again to confirm.') : null),
+            h('b', { text: tr('host.endNoteQ') + ' ' }), tr('host.endNote')) : null),
         m.buttons.length ? h('div', { class: 'bar-buttons' }, m.buttons) : null,
         m.host.length ? h('div', { class: ['bar-host', m.endGame && 'with-end'] },
-          h('div', { class: 'bar-host-head' }, h('span', { class: 'bar-host-k', text: 'Host' }), m.endGame ? endGameButton(s, d) : null),
+          h('div', { class: 'bar-host-head' }, h('span', { class: 'bar-host-k', text: tr('bar.host') }), m.endGame ? endGameButton(s, d) : null),
           m.host) : null),
       m.choices && m.choices.length ? h('div', { class: ['bar-choices', 'ch-' + m.choiceKind, `n${m.choices.length}`] }, m.choices) : null));
 }
@@ -3319,61 +3694,43 @@ function vToasts() {
     key: 't' + t.id, class: ['toast', 'toast-' + t.kind], role: t.kind === 'error' ? 'alert' : 'status',
     testid: t.kind === 'error' ? 'error-toast' : 'info-toast', 'data-code': t.code,
   },
-  h('span', { class: 'toast-k mono', text: t.kind === 'error' ? 'Error' : t.air ? 'Airlock' : t.code === 'eject' ? 'Out' : t.code === 'special' ? 'Special' : t.code === 'leave' ? 'Left' : t.code === 'vote' ? 'Vote' : 'Note' }),
-  h('span', { class: 'toast-msg', text: t.message }),
-  h('button', { class: 'toast-x', act: 'toast-close', 'data-id': String(t.id), 'aria-label': 'Dismiss' }, '×'))));
+  h('span', { class: 'toast-k mono', text: tr(t.kind === 'error' ? 'toast.k.error' : t.air ? 'toast.k.airlock' : t.code === 'eject' ? 'toast.k.out' : t.code === 'special' ? 'toast.k.special' : t.code === 'leave' ? 'toast.k.left' : t.code === 'vote' ? 'toast.k.vote' : 'toast.k.note') }),
+  h('span', { class: 'toast-msg', text: msgText(t.message) }),
+  h('button', { class: 'toast-x', act: 'toast-close', 'data-id': String(t.id), 'aria-label': tr('toast.dismiss') }, '×'))));
 }
 // SPEC §11 X1.3 in words: how many Airlocks and revives this table deals.
 function airlockDealText(s) {
   const n = s && s.players ? s.players.length : 0;
-  const general = 'Every game of 4 or more players deals Airlocks to different players (2 with 4–7 players, 3 with 8–11, 4 with 12–16) and a Back from the Forest (2 with 12–16) to players without an Airlock, so a way back always exists.';
+  const general = tr('rules.dealGeneral');
   if (!s || n < 2) return general;
   const { airlocks, revives } = airlockDeal(n);
-  const where = s.phase === 'lobby' ? `If you start with ${n} players, the game deals` : `This game (${n} players) dealt`;
-  if (!airlocks) return `${general} ${s.phase === 'lobby' ? `With ${n} players` : 'This game has fewer than 4 players, so'} no Airlocks and no Back from the Forest${s.phase === 'lobby' ? ' would be dealt' : ' were dealt'}.`;
-  return `${where} ${plural(airlocks, 'Airlock')}, each to a different player, and ${revives === 1 ? 'one Back from the Forest' : `${revives} Back from the Forest cards`} to ${revives === 1 ? 'a player' : 'players'} without an Airlock: a way back always exists.`;
+  const lobby = s.phase === 'lobby';
+  if (!airlocks) return `${general} ${lobby ? tr('rules.dealNoneLobby', { n }) : tr('rules.dealNone')}`;
+  return tr(lobby ? (revives === 1 ? 'rules.dealLobby1' : 'rules.dealLobbyN') : (revives === 1 ? 'rules.dealGame1' : 'rules.dealGameN'), { n, k: airlocks, count: revives });
 }
 // "How to play", from the header in every phase: the goal, a round, the vote, the specials and the end.
 function vRulesModal() {
   const s = state;
-  const beds = s && s.capacity ? `${s.capacity} beds` : 'beds for half of the players';
+
   const sec = (title, ...items) => h('section', { class: 'rs' }, h('h3', { class: 'rs-t', text: title }), h('ul', { class: 'rs-list' }, items.map((x, i) => h('li', { key: String(i) }, x))));
   return h('div', { class: 'modal-wrap', key: 'rules' },
     h('div', { class: 'modal-back', act: 'rules-close' }),
     h('div', { class: 'modal rules-modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'rules-title', testid: 'rules-sheet' },
       h('div', { class: 'modal-head' },
-        h('div', null, h('div', { class: 'k', text: 'Bunker · the rules' }), h('h2', { id: 'rules-title', class: 'modal-title', text: 'How to play' })),
-        h('button', { class: 'toast-x', act: 'rules-close', 'aria-label': 'Close' }, '×')),
+        h('div', null, h('div', { class: 'k', text: tr('rules.k') }), h('h2', { id: 'rules-title', class: 'modal-title', text: tr('rules.title') })),
+        h('button', { class: 'toast-x', act: 'rules-close', 'aria-label': tr('common.close') }, '×')),
       h('div', { class: 'rules-body' },
-        sec('The goal',
-          `A catastrophe has happened. The bunker has ${beds}; everyone else stays in the forest.`,
-          'Argue that the bunker needs you, and vote out the players the group can do without. The players still in the game when they fit in the beds are the bunker.'),
-        sec('A round (7 in all)',
-          'Reveals: in seat order (up the seats in odd rounds, down in even ones) each player reveals one hidden card, then makes their case. Round 1 is always the Profession. Press End turn when done.',
-          'Discussion: everyone argues on the voice call.',
-          'Vote: after the rounds marked ✖ on the round track, which shows how many players go in each. Leaves and special cards move the votes; the track always shows the plan as it is now.',
-          'Timers are only a guide: nothing happens when one runs out. The host moves the game on with Next.'),
-        sec('The vote',
-          'You cannot vote for yourself. Votes are secret until the vote closes, and you can change yours until then. Then everyone sees who voted for whom.',
-          'Whoever gets the most votes is out. A tie: the tied players get a defense speech each, then a revote between them only. Still tied, or nobody voted: fate decides at random.',
-          'The host can close the vote early; whoever has not voted abstains.'),
-        sec('Special cards',
-          'You hold 2 secret special cards and may play one per round. The server carries out the effect, and everyone sees the card and what it did (a peek only shows you the card).',
-          'Hover or tap a card’s name anywhere (on the table, in the log, at the end) to read what it does.',
-          '“Before the vote” cards can be played during the reveals or the discussion; “Any time in play” cards also during a vote or a defense.',
-          'Immunity, protection, a vote block or a ×2 vote lasts until the next vote step ends — a vote cancelled by a special uses it up too.'),
-        sec('Airlock and Back from the Forest',
-          'An Airlock needs a partner. Played on a player (from round 2, during the reveals or the discussion), it starts cycling the airlock on them, and everyone sees “Airlock 1/2” on their panel.',
-          'If a different player plays another Airlock on the same player in the same round, before its discussion ends, that player is thrown out at once, with no vote (it is not a vote, so immunity does not stop it). Airlocks on different players never add up.',
-          'Nobody joins in time: the airlock jams when that round’s discussion ends, whether a vote follows or not (or when its target is out anyway). An Airlock played in a later round starts a new one. The card that opened it is spent.',
-          airlockDealText(s),
-          'Back from the Forest brings back anyone who was ejected, whether by a vote or through the airlock.'),
-        sec('The end',
-          'As soon as the players still in the game fit in the beds, the door closes. Every card is turned face up — was it the right crew?',
-          'Leaving a game is for good: you cannot come back into it.'),
+        sec(tr('rules.goal'),
+          s && s.capacity ? tr('rules.goal1', { beds: s.capacity }) : tr('rules.goal1Half'),
+          tr('rules.goal2')),
+        sec(tr('rules.round'), tr('rules.round1'), tr('rules.round2'), tr('rules.round3'), tr('rules.round4')),
+        sec(tr('rules.vote'), tr('rules.vote1'), tr('rules.vote2'), tr('rules.vote3')),
+        sec(tr('rules.specials'), tr('rules.sp1'), tr('rules.sp2'), tr('rules.sp3'), tr('rules.sp4')),
+        sec(tr('rules.airlock'), tr('rules.air1'), tr('rules.air2'), tr('rules.air3'), airlockDealText(s), tr('rules.air4')),
+        sec(tr('rules.end'), tr('rules.end1'), tr('rules.end2')),
         // SPEC §11 X10: the links and the version, quietly, at the foot of the sheet
-        h('p', { class: 'rs-feedback' }, h('span', { class: 'rs-fb-lead', text: STR.feedbackLead }), ' ', feedbackLinks('rules', s ? s.room : ''), ' ', versionTag('rules'))),
-      h('div', { class: 'modal-actions' }, h('span', { class: 'grow' }), h('button', { class: 'btn primary', act: 'rules-close' }, 'Got it'))));
+        h('p', { class: 'rs-feedback' }, h('span', { class: 'rs-fb-lead', text: tr('fb.lead') }), ' ', feedbackLinks('rules', s ? s.room : ''), ' ', versionTag('rules'))),
+      h('div', { class: 'modal-actions' }, h('span', { class: 'grow' }), h('button', { class: 'btn primary', act: 'rules-close' }, tr('rules.gotIt')))));
 }
 function vModal() {
   if (ui.rulesOpen) return vRulesModal();
@@ -3386,7 +3743,7 @@ function vModal() {
   const steps = pickerSteps(sp);
   const step = pickerStep(sp, p);
   const target = p.targetId ? byId(s, p.targetId) : null;
-  const stepLabel = { target: 'Target', category: 'Category', confirm: 'Confirm' };
+  const stepLabel = { target: tr('picker.stepTarget'), category: tr('picker.stepCategory'), confirm: tr('picker.stepConfirm') };
   const stepValue = { target: target ? target.name : '', category: p.category ? catLabel(s, p.category) : '', confirm: '' };
   // just opened or just changed step: a double click's 2nd click must not pick or play (SPEC §11 K6)
   const settling = pickerSettling();
@@ -3395,20 +3752,20 @@ function vModal() {
   if (step === 'target') {
     // an Airlock: the players whose open airlock this card would close come first, marked (SPEC §11 X1.7)
     const { list, joinIds } = pickerTargets(s, sp);
-    const q = sp.target === 'ejected' ? 'Who comes back from the forest?' : sp.effect === 'peek' || sp.effect === 'force_reveal' ? 'Whose hidden card?'
-      : isAir ? (joinIds.length ? 'Join the open airlock, or start a new one' : 'Start cycling the airlock on…') : 'Choose a player';
+    const q = sp.target === 'ejected' ? tr('picker.qRevive') : sp.effect === 'peek' || sp.effect === 'force_reveal' ? tr('picker.qWhose')
+      : isAir ? (joinIds.length ? tr('picker.qAirJoin') : tr('picker.qAirStart')) : tr('picker.qPlayer');
     body = h('div', { class: 'pick' },
       h('p', { class: 'pick-q', text: q }),
       joinIds.length ? h('p', { class: 'callout airlock-callout' }, icon('door', 'ac-ico'),
-        h('span', null, h('b', { text: `Join the airlock on ${listText(joinIds.map((id) => nameOf(s, id)))}: ` }),
-          joinIds.length === 1 ? `pick ${nameOf(s, joinIds[0])} and they are thrown out right now, with no vote.` : 'pick one of them, and that player is thrown out right now, with no vote.')) : null,
+        h('span', null, h('b', { text: tr('picker.joinLead', { list: joinIds.map((id) => nameOf(s, id)) }) + ' ' }),
+          joinIds.length === 1 ? tr('picker.joinOne', { p: nameOf(s, joinIds[0]) }) : tr('picker.joinMany'))) : null,
       isAir && !joinIds.length ? h('p', { class: 'pick-note', text: airlockPickNote(s) }) : null,
       h('div', { class: 'opt-grid' }, list.map((t) => {
         const hid = hiddenCatsOf(s, t).length;
         const a = isAir ? airlockOn(s, t.id) : null;
         const join = joinIds.includes(t.id);
-        const sub = t.status === 'ejected' ? 'ejected' : !isAir ? `${plural(hid, 'hidden card')}`
-          : join ? `Airlock ${airlockCount(a)} by ${airlockStarters(s, a)}: join, and ${t.name} is out` : 'starts an airlock (1/2)';
+        const sub = t.status === 'ejected' ? tr('picker.ejected') : !isAir ? tr('picker.hiddenCards', { n: hid })
+          : join ? tr('picker.airJoinSub', { n: airlockN(a), by: airlockStarters(s, a), t: t.name }) : tr('picker.airStartSub');
         return h('button', { class: ['opt', join && 'join'], key: t.id, testid: 'target-option', 'data-player-id': t.id, 'data-airlock': join ? 'join' : null, act: 'pick-target', disabled: settling },
           h('span', { class: 'opt-seat mono', text: pad2(t.seat + 1) }),
           h('span', { class: 'opt-name', text: t.name }),
@@ -3417,15 +3774,16 @@ function vModal() {
   } else if (step === 'category') {
     const list = allowedCats(s, sp, p.targetId);
     body = h('div', { class: 'pick' },
-      h('p', { class: 'pick-q', text: sp.effect === 'force_reveal' || sp.effect === 'peek' ? `Which of ${target ? target.name + "'s" : 'their'} hidden cards?` : 'Which category?' }),
+      h('p', { class: 'pick-q', text: sp.effect === 'force_reveal' || sp.effect === 'peek' ? (target ? tr('picker.qWhichOf', { p: target.name }) : tr('picker.qWhichOfTheir')) : tr('picker.qCategory') }),
       h('div', { class: 'opt-grid cats' }, list.map((c) => {
         let sub = '';
-        if (sp.effect === 'swap_card' && target) sub = `yours: ${s.me.cards[c].text} ⇄ theirs: ${target.cards[c] == null ? 'hidden' : target.cards[c]}`;
-        else if (sp.effect === 'reroll_card') sub = sp.target === 'self' ? `yours: ${s.me.cards[c].text}` : target ? `now: ${target.cards[c] == null ? 'hidden' : target.cards[c]}` : '';
+        const theirs = () => (target.cards[c] == null ? tr('picker.hidden') : target.cards[c]);
+        if (sp.effect === 'swap_card' && target) sub = tr('picker.swapSub', { ca: s.me.cards[c].text, cb: theirs() });
+        else if (sp.effect === 'reroll_card') sub = sp.target === 'self' ? tr('picker.yoursSub', { text: s.me.cards[c].text }) : target ? tr('picker.nowSub', { text: theirs() }) : '';
         else if (sp.effect === 'mass_reveal' || sp.effect === 'shuffle_category') {
           const hiddenN = d.aliveList.filter((x) => x.cards[c] == null).length;
-          sub = `${hiddenN} of ${d.aliveList.length} still hidden`;
-        } else sub = 'hidden';
+          sub = tr('picker.stillHidden', { n: hiddenN, total: d.aliveList.length });
+        } else sub = tr('picker.hidden');
         return h('button', { class: 'opt', key: c, testid: 'category-option', 'data-category': c, act: 'pick-cat', disabled: settling },
           h('span', { class: 'opt-name', text: catLabel(s, c) }), h('span', { class: 'opt-sub', text: sub }));
       })));
@@ -3434,32 +3792,30 @@ function vModal() {
   if (step === 'confirm') {
     body = h('div', { class: ['confirm', joinNow && 'join'] },
       h('p', { class: 'confirm-what', text: describePlay(s, sp, target, p.category) }),
-      h('p', { class: 'confirm-warn', text: sp.effect === 'peek'
-        ? 'Everyone sees that you played this card and on whom — but not what you saw.'
-        : 'Everyone sees this card, its text and the result as soon as you play it.' }));
+      h('p', { class: 'confirm-warn', text: sp.effect === 'peek' ? tr('picker.warnPeek') : tr('picker.warn') }));
   }
   return h('div', { class: 'modal-wrap', key: 'picker' },
     h('div', { class: 'modal-back', act: 'picker-cancel' }),
     h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'picker-title', testid: 'special-picker' },
       h('div', { class: 'modal-head' },
-        h('div', null, h('div', { class: 'k', text: 'Play a special card' }),
+        h('div', null, h('div', { class: 'k', text: tr('picker.k') }),
           // the chip look, but no popover: the full text is printed right under it, and a hover popover here opened
           // under a resting pointer and covered the targets (the click that followed only closed it)
           h('h2', { id: 'picker-title', class: 'modal-title' }, h('span', { class: 'card-chip cc-xl cc-static' }, icon('spark', 'cc-ico'), h('span', { class: 'cc-t', text: sp.title })))),
-        h('button', { class: 'toast-x', act: 'picker-cancel', 'aria-label': 'Cancel' }, '×')),
+        h('button', { class: 'toast-x', act: 'picker-cancel', 'aria-label': tr('picker.cancel') }, '×')),
       h('p', { class: 'modal-card-text', text: sp.text }),
       h('p', { class: 'modal-card-meta', text: specialMeta(s, sp) }),
       h('ol', { class: 'steps' }, steps.map((x, i) => h('li', { key: x, class: ['step', x === step && 'now', steps.indexOf(step) > i && 'done'] },
         h('span', { class: 'step-n mono', text: String(i + 1) }), h('span', { class: 'step-l', text: stepLabel[x] }),
         stepValue[x] ? h('span', { class: 'step-v', text: stepValue[x] }) : null))),
-      p.note && h('p', { class: 'callout warn', text: p.note }),
+      p.note && h('p', { class: 'callout warn', text: msgText(p.note) }),
       body,
       h('div', { class: 'modal-actions' },
-        step !== steps[0] && h('button', { class: 'btn ghost', act: 'picker-back' }, '‹ Back'),
+        step !== steps[0] && h('button', { class: 'btn ghost', act: 'picker-back' }, tr('picker.back')),
         h('span', { class: 'grow' }),
-        h('button', { class: 'btn ghost', act: 'picker-cancel' }, 'Cancel'),
+        h('button', { class: 'btn ghost', act: 'picker-cancel' }, tr('picker.cancel')),
         step === 'confirm' && h('button', { class: ['btn primary', joinNow && 'join', settling && 'settling'], testid: 'special-confirm-btn', act: 'picker-confirm', disabled: !d.online || settling },
-          joinNow ? `Play ${sp.title}: ${target.name} is out` : `Play ${sp.title}`))));
+          joinNow ? tr('picker.playJoin', { title: sp.title, t: target.name }) : tr('picker.play', { title: sp.title })))));
 }
 function vMockIndex() {
   const list = ui.mockScenarios || [];
@@ -3531,7 +3887,7 @@ const ACTIONS = {
     if (MOCK) { mockSend({ t: 'leave' }); return; }
     // offline, the leave would never reach the server and the seat would stay in the game: keep it (SPEC §10)
     if (!(ws && ws.readyState === 1 && joinedOnSocket)) {
-      toast('error', 'offline', 'Not connected, so you have not left. Leave again once the connection is back.');
+      toast('error', 'offline', { key: 'toast.notLeft' });
       return;
     }
     ws.send(JSON.stringify({ t: 'leave' }));
@@ -3539,7 +3895,7 @@ const ACTIONS = {
     dropSocket();
     clearTimeout(conn.timer);
     conn.status = 'idle'; conn.attempt = 0;
-    resetToLanding({ kind: 'info', text: `You left room ${room}.` });
+    resetToLanding({ kind: 'info', key: 'landing.left', params: { code: room } });
     ui.landing.room = '';
     setUrlRoom(null);
   },
@@ -3559,6 +3915,8 @@ const ACTIONS = {
   },
   rules(el) { ui.rulesOpen = true; ui.rulesOpener = openerOf(el); ui.picker = null; ui.menuOpen = false; ui.overlayOpenedAt = Date.now(); },
   'hdr-menu'() { ui.menuOpen = !ui.menuOpen; },
+  // SPEC §11 X5.7: never disabled, never held by a shield (it sends no game action)
+  lang() { switchLang(wantLang() === 'ru' ? 'en' : 'ru'); },
   'rules-close'() { closeOverlay(); },
   'briefing-close'(el) {
     const key = el.getAttribute('data-key') || '';
@@ -3715,7 +4073,8 @@ document.addEventListener('click', (e) => {
   const now = Date.now();
   // SPEC §11 K6: the second click of a double click whose first click closed an overlay or collapsed a panel lands on
   // whatever slid under the pointer; nothing outside an open overlay acts until the shield is down
-  if (now < ui.shieldUntil && !el.closest('.modal-wrap')) return;
+  // (the language switch sends no game action: never held)
+  if (now < ui.shieldUntil && !el.closest('.modal-wrap') && act !== 'lang') return;
   // …and the backdrop right after a sheet opened or changed step is the second click of the click that did it
   if (el.classList.contains('modal-back') && (pickerSettling() || now - ui.overlayOpenedAt < PICK_GUARD_MS)) return;
   fn(el, e);
@@ -3775,7 +4134,7 @@ document.addEventListener('change', (e) => {
   const n = Number(el.value);
   const cur = state.options ? state.options[key] : undefined;
   if (!Number.isInteger(n) || n < 5 || n > 600) {
-    toast('error', 'bad_request', 'Timers must be whole seconds from 5 to 600.');
+    toast('error', 'bad_request', { key: 'toast.timersRange' });
     if (cur !== undefined) el.value = String(cur);
     delete ui.optDraft[key];
     scheduleRender();
@@ -3816,7 +4175,7 @@ function wake() {
   else if (conn.status === 'connecting' && Date.now() - conn.openedAt > 1500) reconnectNow();
   // open but not joined, and no hello waiting for its answer: that socket will never carry the game again
   else if (conn.status === 'open' && !joinedOnSocket && conn.probeWhy !== 'hello') reconnectNow();
-  else if (conn.status === 'open') probe(WAKE_WAIT_MS, 'wake');
+  else if (conn.status === 'open') probe(waitMs(WAKE_WAIT_MS), 'wake');
 }
 window.addEventListener('online', wake);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
@@ -3827,7 +4186,7 @@ setInterval(() => {
   // a seat's socket that is open but not joined, with no hello in flight (an answer the code above did not expect):
   // give it up and reconnect with backoff rather than keep it alive with pings
   if (identity && !joinedOnSocket && !stopped && !ui.pending && Date.now() - conn.openedAt > CONNECT_MS) { dropSocket(); onSocketGone(); return; }
-  if (Date.now() - conn.lastMsgAt >= PING_EVERY_MS - 500) probe(PING_WAIT_MS, 'keepalive');
+  if (Date.now() - conn.lastMsgAt >= PING_EVERY_MS - 500) probe(waitMs(PING_WAIT_MS), 'keepalive');
 }, PING_EVERY_MS);
 
 /* ------------------------------------------------------------------ dev mode (SPEC §11 X9: BUNKER_DEV=1 servers only)
@@ -4026,6 +4385,17 @@ async function bootMock() {
 /* ------------------------------------------------------------------ boot */
 function boot() {
   window.__bunkerState = null;
+  // SPEC §11 X5.7: ?lang= > the stored choice > navigator.language (mock pages keep the choice in memory)
+  initLang({ memory: !!MOCK, storageKey: pkey('bunker.lang') });
+  onLang(() => scheduleRender());
+  // another tab of this browser (and profile) switched the language: follow it (design §9.3)
+  if (!MOCK) {
+    window.addEventListener('storage', (e) => {
+      const k = langStorageKey();
+      const l = k && e.key === k ? normLang(e.newValue) : null;
+      if (l && l !== wantLang()) { switchLang(l, { store: false }); scheduleRender(); }
+    });
+  }
   // test aid: simulate a network drop (the client must reconnect and resume by itself)
   window.__bunkerDebug = {
     drop() { if (ws) ws.close(); },

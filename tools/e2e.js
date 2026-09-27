@@ -6,14 +6,15 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import puppeteer from 'puppeteer-core';
 import {
   AIRLOCK_SEALED_RE, BOT_NAMES, Bot, Coordinator, airlockVictims, allowedCategories, describeState, eligibleReveal, makeRng, pick, playableSpecials,
   playerById, stepRefOf, validTargets,
 } from './botlib.js';
 import { estimateGame } from '../public/kicks.js';
-import { airlockLine, finalCause } from '../public/loglines.js';
+import { configFromEnv } from '../server/index.js';
+import { airlockOf, finalCause } from '../public/loglines.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const CHROME = process.env.CHROME_PATH || '/usr/bin/google-chrome-stable';
@@ -26,6 +27,8 @@ const HELP = `Bunker Online browser e2e (puppeteer-core + ${CHROME}).
   node tools/e2e.js                                   spawn the server (./public) on a free port and run
   node tools/e2e.js --public-dir clients/a            spawn the server with BUNKER_PUBLIC_DIR=clients/a
   node tools/e2e.js --url http://127.0.0.1:8080       run against a running server
+  BUNKER_WS_DEFLATE=1 node tools/e2e.js               the spawned server offers permessage-deflate (SPEC §11 X5.15);
+                                                      every page's WebSockets must have taken it (without it: none)
 
 Options:
   --url URL          use a running server instead of spawning one
@@ -68,13 +71,42 @@ Narrator (public/narrator.js): the phone player turns it on in the lobby; at the
 that page by itself (Chrome keeps its real autoplay policy, only muted: the clicks in the lobby are the gesture), the
 host and the spectator (switch off) stay silent, every page shows ▶ Listen, and the reload mid-game does not replay it.
 The clip is served in byte ranges (Range: bytes=0-1 -> 206, Accept-Ranges: bytes) and is seekable to its end: without
-that, Safari and every iOS browser do not play it.
+that, Safari and every iOS browser do not play it. The clip is the one in the page's language (SPEC §11 X5.16): the
+English start plays audio/catastrophes/…; after bob's switch to Russian, ▶ Listen (Stop, then ▶) plays
+audio/catastrophes-ru/…; a switch starts nothing by itself; Dana (Russian) turns the narrator on in the lobby after End
+game, and at game 3's start her page plays her catastrophe's Russian clip by itself, and its words say nothing of
+English.
 Profiles and report links (SPEC §11 X9.1, X10): two tabs of ONE browser context with ?profile=alpha / ?profile=beta join
 one room as two players, each resumes its own seat after a reload, the invite link has no profile, a tab without one
 sees neither seat, and the narrator setting stays per profile. "Report an issue" / "Suggest an idea" are checked on the
 landing footer, the header menu (lobby, in play, final), the rules sheet and the final screen: prefilled GitHub URLs
 (template, version, a short browser summary, lang, room only in a room; URL-encoded; a new tab), and app-version reads
 v<version.json's version> or vdev.
+Languages (SPEC §11 X5.7/X5.8): every page reads English whatever the machine's locale (navigator.language is en-US
+and bunker.lang is set to en when absent). On the landing page the host's EN | RU switch turns the page Russian at once
+(on screen at 360 × 640, above the form), the choice is stored, a room code typed as «КМТХ» reads KMTX, and the switch
+back restores English; the create hello says lang en. Bob (the phone) first taps the switch there and back (EN → RU
+→ EN in 120 ms): no setLang goes out and his page never shows Russian; then again 650 ms apart over a throttled link
+(both setLang go out, and the late answer in Russian is skipped: his page never shows it). Then he plays in Russian from
+the start of game 1
+through his first vote: the switch is sampled every 25 ms and after every render (the page's language, the log and his
+hand never disagree; with a COMPLETE ru.js the action bar too), completes within 2 s, marks no card new, keeps his
+narrator clip playing, changes nothing on the host's or the spectator's page, keeps the log and the bar status out of
+aria-live for the render that changes the language, and while it waits the switch is named in the chosen language
+(aria-busy, lang); a chip shows his card's Russian title and so does its popover. Around a reconnect over a throttled
+link he switches to English while the page waits to reconnect, and back to Russian while the resume's hello is on its
+way: no sample mixes two languages without the connection banner, and the second switch flips the page once; the
+airlock checks compare with the words of his language; after the reload he is still Russian and the resume carried the
+language; then he switches back over a throttled link (the answer takes about 3 s): the page stays wholly Russian until
+it lands, then changes in one render. On both phones in play the header's timer label keeps ≥ 59 px. Dana (the late
+arrival) has a Russian browser and a 360 × 640 phone: her first visit is Russian, her join carries lang ru, and at four
+points (watching game 2, the lobby after End game, seated, game 3) her page has no Latin letter beyond names, the room
+code, EN/RU and °C/3D/USB (text nodes and the text CSS writes: ::before/::after), no horizontal scroll and the bar
+flush. Checks that need Russian client words are warnings until public/i18n/ru.js
+says COMPLETE.
+Slow link (SPEC §11 X5.2): once, from round 2, the host's Next at the end of a discussion goes out over a link throttled
+so that its answer takes about 2 × ANSWER_MS: no "No answer from the server" toast, no new socket, no banner, and the
+answer shows when it lands.
 Exit code 0 = pass, 1 = failure (message, screenshots FAIL-*.png and state dumps in the screens directory).`;
 
 function parseArgs(argv) {
@@ -120,10 +152,44 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const run = {
   server: null, browser: null, bots: [], pages: [], shots: 0, failures: [], warnings: [], consoleErrors: [],
   stats: { hookRereads: 0, hostTurns: 0, bobTurns: 0, hostVotes: 0, bobVotes: 0, defenseTurns: 0, nextClicks: 0, closeVoteClicks: 0, special: null, reload: null, errorToasts: [], sentSteps: {}, twoTap: null, clickThrough: null,
-    estimate: null, popover: null, airlock: null, airlockBadgeChecks: 0, narrator: null, endGame: null, barFlush: 0 },
+    estimate: null, popover: null, airlock: null, airlockBadgeChecks: 0, narrator: null, endGame: null, barFlush: 0, ws: {} },
 };
 
 class StuckError extends Error {}
+
+// ---------------------------------------------------------------------------------------------------------------
+// languages (SPEC §11 X5.7/X5.8; reports/i18n-design.md §9.7). The client's own dictionaries (of the client under test)
+// render what a page in either language must say, so a check on a Russian page compares with the Russian words.
+
+const I18N = { t: null, setLang: null, lang: null, ruComplete: false, loaded: false };
+async function loadI18n() {
+  const base = opts.publicDir || path.join(ROOT, 'public');
+  try {
+    const m = await import(pathToFileURL(path.join(base, 'i18n', 'index.js')).href);
+    const ru = await import(pathToFileURL(path.join(base, 'i18n', 'ru.js')).href);
+    Object.assign(I18N, { t: m.t, setLang: m.setLang, lang: m.lang, ruComplete: ru.COMPLETE === true, loaded: true });
+  } catch (e) {
+    run.warnings.push(`no client dictionaries at ${base}/i18n (${e.message}): the language checks are skipped`);
+  }
+}
+/** `key` rendered in `lang` by the client's own dictionary (the module's language is put back). */
+function L(lang, key, params) {
+  if (!I18N.loaded) return null;
+  const was = I18N.lang();
+  I18N.setLang(lang, { store: false });
+  try { return I18N.t(key, params); } finally { I18N.setLang(was, { store: false }); }
+}
+/** The language a page shows (its <html lang>, which the client sets with the dictionary). */
+async function pageLang(P) { return P.page.evaluate(() => document.documentElement.lang).catch(() => 'en'); }
+const CYR = /[А-Яа-яЁё]/;
+/** A check that needs Russian client words: a failure once ru.js is COMPLETE, a warning while it is being written. */
+function checkRu(cond, msg) {
+  if (cond) return true;
+  if (I18N.ruComplete) return check(false, msg);
+  const w = `${msg} (public/i18n/ru.js is not COMPLETE yet: a warning until it is)`;
+  if (!run.warnings.includes(w)) run.warnings.push(w);
+  return false;
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // server
@@ -153,9 +219,25 @@ async function spawnServer() {
 
 const sel = (id, extra = '') => `[data-testid="${id}"]${extra}`;
 
-async function newPage(context, name, viewport) {
+async function newPage(context, name, viewport, o = {}) {
   const page = await context.newPage();
   await page.setViewport(viewport);
+  // SPEC §11 X5.7/X5.8 (reports/i18n-design.md §9.7): the pages read English, whatever the runner's locale. A page's
+  // first visit follows navigator.language (overridden here; --lang is not reliable in headless Chrome), and the stored
+  // choice (bunker.lang) is set only when absent, so a page's own switch survives its reload. o.lang: another language.
+  await page.evaluateOnNewDocument((lang) => {
+    const tag = lang === 'ru' ? 'ru-RU' : 'en-US';
+    try {
+      Object.defineProperty(Navigator.prototype, 'language', { get: () => tag, configurable: true });
+      Object.defineProperty(Navigator.prototype, 'languages', { get: () => [tag, tag.slice(0, 2)], configurable: true });
+    } catch { /* keep the browser's own */ }
+    try {
+      // (the key as public/profile.js pkey() names it: a ?profile= tab keeps its own, SPEC §11 X9.1)
+      const prof = new URLSearchParams(location.search).get('profile');
+      const key = prof && /^[a-z0-9_-]{1,16}$/.test(prof) ? `bunker.lang@${prof}` : 'bunker.lang';
+      if (lang !== 'ru' && localStorage.getItem(key) === null) localStorage.setItem(key, 'en');
+    } catch { /* no storage */ }
+  }, o.lang || 'en');
   // visible = rendered with a box and not visibility:hidden (offsetParent is null for position:fixed elements)
   await page.evaluateOnNewDocument(() => {
     window.__e2eVisible = (e) => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length) && getComputedStyle(e).visibility !== 'hidden';
@@ -168,6 +250,9 @@ async function newPage(context, name, viewport) {
       try {
         const m = JSON.parse(d);
         if (m.t === 'resume') window.__e2eResumes++;
+        // SPEC §11 X5.1: the language each hello carries, and how many setLang this page sent
+        if (['create', 'join', 'resume'].includes(m.t)) (window.__e2eHellos = window.__e2eHellos || []).push({ t: m.t, lang: m.lang ?? null });
+        if (m.t === 'setLang') window.__e2eSetLang = (window.__e2eSetLang || 0) + 1;
         // busyResumeTest: the next resume is answered as a network over its V2 budget is (SPEC §11 V2), not sent
         if (m.t === 'resume' && window.__e2eFakeBusy > 0) {
           window.__e2eFakeBusy--;
@@ -185,6 +270,13 @@ async function newPage(context, name, viewport) {
     };
   });
   const P = { name, page, viewport, vpName: viewport.width < 600 ? 'mobile' : 'desktop', id: null };
+  // SPEC §11 X5.15: the Sec-WebSocket-Extensions every WebSocket of the page agreed on ('' for none; see wsDeflateCheck)
+  const cdp = await page.createCDPSession();
+  cdp.on('Network.webSocketHandshakeResponseReceived', (e) => {
+    const h = Object.entries((e.response && e.response.headers) || {}).find(([k]) => k.toLowerCase() === 'sec-websocket-extensions');
+    (run.stats.ws[name] ||= []).push(h ? h[1] : '');
+  });
+  await cdp.send('Network.enable');
   page.on('console', (msg) => {
     if (msg.type() !== 'error') return;
     const loc = msg.location() || {};
@@ -813,8 +905,9 @@ async function airlockTest(host, bob, spec) {
         check(r.ok, `${P.name}: Airlock target-option ids ${JSON.stringify(r.shown)} != valid targets ${JSON.stringify(r.expected)}`);
         await click(P, 'target-option', `[data-player-id="${T}"]`);
         const conf = await waitHook(P, 'special-confirm-btn', '', 'the Airlock confirm button');
-        const label = await conf.evaluate((e) => e.textContent);
-        check(!/is out/i.test(label), `${P.name}: the confirm button for opening an airlock on ${target.name} reads "${label}", as if it closed one`);
+        const label = (await conf.evaluate((e) => e.textContent)).trim();
+        const want = playLabel(await pageLang(P), hh.card.title);
+        check(label === want, `${P.name}: the confirm button for opening an airlock on ${target.name} reads "${label}", expected "${want}" (not "… is out": it only opens one)`);
         await shot('airlock-open-confirm', [P]);
         await click(P, 'special-confirm-btn');
       }
@@ -831,8 +924,10 @@ async function airlockTest(host, bob, spec) {
     for (const P of [host, bob, spec]) {
       const el = await P.page.waitForSelector(`${sel('airlock-badge')}[data-player-id="${T}"]`, { timeout: 4000 }).catch(() => null);
       const txt = el ? await el.evaluate((e) => e.textContent.replace(/\s+/g, ' ')) : '';
-      const by = P.id === openerId ? 'you' : oName;
-      check(!!el && /AIRLOCK 1\/2/.test(txt) && txt.includes(by), `${P.name}: airlock-badge for ${tName} ${el ? `reads "${txt}"` : 'missing'}; expected "AIRLOCK 1/2 · started by ${by}" (SPEC §11 X1.7)`);
+      const pl = await pageLang(P);
+      const by = P.id === openerId ? (L(pl, 'air.you') ?? 'you') : oName;
+      const badge = L(pl, 'air.badge', { n: 1 }) ?? 'AIRLOCK 1/2';
+      check(!!el && txt.includes(badge) && txt.includes(by), `${P.name}: airlock-badge for ${tName} ${el ? `reads "${txt}"` : 'missing'}; expected "${badge} · … ${by}" (SPEC §11 X1.7)`);
       const alert = await P.page.$eval('#sec-airlock', (e) => e.innerText).catch(() => '');
       const bar = await P.page.$eval('.bar-airlock', (e) => e.innerText).catch(() => '');
       check(alert.includes(tName) && bar.includes(tName), `${P.name}: the open airlock on ${tName} is missing from the ${alert.includes(tName) ? 'action bar' : 'airlock alert'} (SPEC §11 X1.7)`);
@@ -850,8 +945,10 @@ async function airlockTest(host, bob, spec) {
       const mine = hh.card;
       const hint = await P.page.waitForSelector(sel('airlock-join-hint'), { timeout: 3000 }).catch(() => null);
       const hintIds = hint ? (await hint.evaluate((e) => e.getAttribute('data-player-id') || '')).split(' ') : [];
-      const btn = await P.page.$eval(`${sel('special-btn')}[data-uid="${mine.uid}"]`, (e) => e.textContent).catch(() => '');
-      check(hintIds.includes(T) && /join/i.test(btn), `${P.name}: holds a playable Airlock while ${oName}'s airlock on ${tName} is open, but the card shows no "join" hint (hint ${JSON.stringify(hintIds)}, button "${btn}"; SPEC §11 X1.7)`);
+      const btn = (await P.page.$eval(`${sel('special-btn')}[data-uid="${mine.uid}"]`, (e) => e.textContent).catch(() => '')).trim();
+      const pl = await pageLang(P);
+      const joinBtn = L(pl, 'sp.btnJoin') ?? 'Join the airlock…';
+      check(hintIds.includes(T) && btn === joinBtn, `${P.name}: holds a playable Airlock while ${oName}'s airlock on ${tName} is open, but the card shows no "join" hint (hint ${JSON.stringify(hintIds)}, button "${btn}", expected "${joinBtn}"; SPEC §11 X1.7)`);
       await click(P, 'special-btn', `[data-uid="${mine.uid}"]`);
       await waitHook(P, 'target-option', '', 'the Airlock targets');
       const optsList = await P.page.$$eval(sel('target-option'), (els) => els.map((e) => ({ id: e.getAttribute('data-player-id'), join: e.getAttribute('data-airlock') })));
@@ -871,8 +968,9 @@ async function airlockTest(host, bob, spec) {
         check(step.confirm && step.targets === 0, `${P.name}: "Join: throw ${tName} out" did not open the Airlock on its Confirm step for ${tName} (${JSON.stringify(step)}; SPEC §11 FX2)`);
         if (!step.confirm && step.targets) await click(P, 'target-option', `[data-player-id="${T}"]`);   // (to go on after that failure)
         const conf = await waitHook(P, 'special-confirm-btn', '', 'the Airlock confirm button');
-        const label = await conf.evaluate((e) => e.textContent);
-        check(/is out/i.test(label) && label.includes(tName), `${P.name}: the confirm button for closing ${tName}'s airlock reads "${label}"`);
+        const label = (await conf.evaluate((e) => e.textContent)).trim();
+        const want = joinLabel(pl, mine.title, tName);
+        check(label === want, `${P.name}: the confirm button for closing ${tName}'s airlock reads "${label}", expected "${want}"`);
         await click(P, 'special-confirm-btn');
         sealer = P.name;
         st.joinButton = true;
@@ -904,6 +1002,11 @@ async function airlockTest(host, bob, spec) {
   }
 }
 
+// The Airlock picker's Play button as the page's language words it: "Play {title}" (it opens an airlock) or "Play
+// {title}: {t} is out" (it closes one). (bob may be playing in Russian then: SPEC §11 X5.8.)
+function playLabel(lang, title) { return L(lang, 'picker.play', { title }) ?? `Play ${title}`; }
+function joinLabel(lang, title, tName) { return L(lang, 'picker.playJoin', { title, t: tName }) ?? `Play ${title}: ${tName} is out`; }
+
 // SPEC §11 FC1/FX2, part 1: a human holding a playable Airlock aims it at T (Confirm, "start cycling the airlock"),
 // before anyone opened an airlock on T. Returns what the page needs to watch for, or null when no human can.
 async function aimAirlock(humansP, T, tName) {
@@ -916,8 +1019,9 @@ async function aimAirlock(humansP, T, tName) {
     await waitHook(P, 'target-option', '', 'the Airlock targets');
     await click(P, 'target-option', `[data-player-id="${T}"]`);
     const conf = await waitHook(P, 'special-confirm-btn', '', 'the Airlock confirm button');
-    const label = await conf.evaluate((e) => e.textContent);
-    check(!/is out/i.test(label), `${P.name}: aiming an Airlock at ${tName} with no airlock open, the confirm button reads "${label}"`);
+    const label = (await conf.evaluate((e) => e.textContent)).trim();
+    const lang = await pageLang(P);
+    check(label === playLabel(lang, mine.title), `${P.name}: aiming an Airlock at ${tName} with no airlock open, the confirm button reads "${label}", expected "${playLabel(lang, mine.title)}"`);
     // record the first rendered view that has the airlock on T (the state and its render arrive together)
     await P.page.evaluate((t) => {
       window.__e2eAir = null;
@@ -934,7 +1038,7 @@ async function aimAirlock(humansP, T, tName) {
       const iv = setInterval(() => { look(); if (window.__e2eAir) { clearInterval(iv); mo.disconnect(); } }, 5);
     }, T);
     log(`${P.name} aims an Airlock at ${tName} (on Confirm) before the airlock opens`);
-    return { P, uid: mine.uid };
+    return { P, uid: mine.uid, title: mine.title, lang };
   }
   return null;
 }
@@ -944,11 +1048,13 @@ async function aimedAirlockOpened(aim, T, tName) {
   const { P } = aim;
   await P.page.waitForFunction(() => window.__e2eAir, { timeout: 6000, polling: 20 }).catch(() => null);
   const first = await P.page.evaluate(() => window.__e2eAir);
-  check(!!first && first.disabled && /just started/i.test(first.note) && /is out/i.test(first.label || ''),
-    `${P.name}: when the airlock opened on ${tName} under an aimed Airlock, the first view was ${JSON.stringify(first)}; expected the note, a held (disabled) Play reading "… is out" (SPEC §11 FC1/FX2)`);
+  const note = L(aim.lang, 'picker.airJustStarted', { t: tName }) ?? 'just started';
+  const out = joinLabel(aim.lang, aim.title, tName);
+  check(!!first && first.disabled && (first.note || '').includes(note) && (first.label || '').trim() === out,
+    `${P.name}: when the airlock opened on ${tName} under an aimed Airlock, the first view was ${JSON.stringify(first)}; expected the note "${note}", a held (disabled) Play reading "${out}" (SPEC §11 FC1/FX2)`);
   const conf = await waitHook(P, 'special-confirm-btn', '', 'the Airlock confirm button after the hold', 3000);
-  const label = await conf.evaluate((e) => e.textContent);
-  check(/is out/i.test(label), `${P.name}: after the hold, the confirm button reads "${label}"; expected "… is out"`);
+  const label = (await conf.evaluate((e) => e.textContent)).trim();
+  check(label === out, `${P.name}: after the hold, the confirm button reads "${label}"; expected "${out}"`);
   run.stats.airlockAim = { who: P.name, first };
   log(`airlock aimed and opened: ${JSON.stringify(first)}`);
   await shot('airlock-aimed-opened', [P]);
@@ -1008,7 +1114,10 @@ async function reviveTest(host, bob) {
     await click(P, 'special-confirm-btn');
     const s2 = await waitState(host, (x) => alive(x, V) || !x.players.some((p) => p.id === V), `${vName} to be back in the game`, 6000).catch(() => null);
     check(!!s2 && alive(s2, V), `host: ${vName} is not alive after ${P.name} played "${rev.special.title}" on them`);
-    const line = s2 ? s2.log.slice(-8).find((l) => l.kind === 'special' && l.text.includes(rev.special.title) && l.text.includes(vName)) : null;
+    // (by key: the host's own line for this card with a revive result on V; without keys, the English text)
+    const line = s2 ? s2.log.slice(-8).find((l) => l.kind === 'special' && (l.key
+      ? l.params.result && l.params.result.key === 'res.revive' && l.params.result.params.t === V
+      : l.text.includes(rev.special.title) && l.text.includes(vName))) : null;
     check(!!line, `host: no special log line for ${P.name}'s "${rev.special.title}" on ${vName}`);
     await sleep(PAUSE);
     await shot('revived', [host, bob]);
@@ -1187,9 +1296,493 @@ async function profileTest() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// SPEC §11 X5.7/X5.8 (reports/i18n-design.md §9.7): the language switch, a mid-game switch, a Russian first visit
+
+const PHONE_360 = { width: 360, height: 640, deviceScaleFactor: 2, isMobile: true, hasTouch: true };
+const langShown = (P) => P.page.evaluate(() => {
+  const b = document.querySelector('[data-testid="lang-switch"]');
+  const s = window.__bunkerState;
+  return { html: document.documentElement.lang, sw: b ? b.getAttribute('data-lang') : null, you: s && s.you && typeof s.you.lang === 'string' ? s.you.lang : null };
+}).catch(() => null);
+
+// The landing page (the host, before Create): the switch turns the page Russian at once, on screen at 360 × 640 above
+// the form, and the choice is stored; a room code typed with the Russian look-alikes (КМТХ) reads as its Latin letters
+// (KMTX); the switch back restores English (the rest of the run reads the host's page in English).
+async function landingLangTest(P) {
+  if (!I18N.loaded) return;
+  const btn = await P.page.waitForSelector(`${sel('lang-switch')}[data-lang="en"]`, { visible: true, timeout: 4000 }).catch(() => null);
+  if (!check(!!btn, `${P.name}: no language switch (${sel('lang-switch')}[data-lang="en"]) on the landing page (SPEC §11 X5.7)`)) return;
+  const out = {};
+  await P.page.setViewport({ width: 360, height: 640, deviceScaleFactor: 1 });
+  await sleep(250);
+  const place = await P.page.evaluate(() => {
+    const b = document.querySelector('[data-testid="lang-switch"]').getBoundingClientRect();
+    const f = document.querySelector('.entry .form, [data-testid="name-input"]').getBoundingClientRect();
+    return { top: Math.round(b.top), bottom: Math.round(b.bottom), left: Math.round(b.left), right: Math.round(b.right), h: Math.round(b.height), vw: document.documentElement.clientWidth, formTop: Math.round(f.top) };
+  });
+  check(place.top >= 0 && place.bottom <= 640 && place.bottom <= place.formTop && place.right <= place.vw && place.h >= 32,
+    `${P.name}: at 360 × 640 the landing's language switch is not on screen above the form, or is under 32 px high (${JSON.stringify(place)}) (SPEC §11 X5.7)`);
+  await P.page.setViewport(P.viewport);
+  await sleep(150);
+  await click(P, 'lang-switch');
+  const ru = await P.page.waitForFunction(() => document.documentElement.lang === 'ru' && document.querySelector('[data-testid="lang-switch"]').getAttribute('data-lang') === 'ru', { timeout: 2000 }).then(() => true, () => false);
+  check(ru, `${P.name}: the landing did not switch to Russian (${JSON.stringify(await langShown(P))})`);
+  const create = (await P.page.$eval(sel('create-btn'), (e) => e.textContent.trim()).catch(() => '')) || '';
+  check(create === L('ru', 'landing.create'), `${P.name}: the create button reads "${create}" in Russian, expected "${L('ru', 'landing.create')}"`);
+  checkRu(CYR.test(create), `${P.name}: the create button's Russian text "${create}" has no Cyrillic`);
+  const stored = await P.page.evaluate(() => localStorage.getItem('bunker.lang')).catch(() => null);
+  check(stored === 'ru', `${P.name}: the language choice was not stored (bunker.lang = ${JSON.stringify(stored)})`);
+  // a Russian keyboard: the Cyrillic look-alikes are the code's Latin letters (design §9.2)
+  await typeInto(P, 'room-input', 'КМТХ');
+  const code = await P.page.$eval(sel('room-input'), (e) => e.value).catch(() => null);
+  check(code === 'KMTX', `${P.name}: typing «КМТХ» into the room code gave ${JSON.stringify(code)}, expected "KMTX" (design §9.2)`);
+  await P.page.$eval(sel('room-input'), (e) => { e.value = ''; e.dispatchEvent(new Event('input', { bubbles: true })); });
+  await shot('landing-ru', [P], { alsoMobile: true });
+  await click(P, 'lang-switch');
+  const en = await P.page.waitForFunction(() => document.documentElement.lang === 'en' && document.querySelector('[data-testid="lang-switch"]').getAttribute('data-lang') === 'en', { timeout: 2000 }).then(() => true, () => false);
+  const create2 = (await P.page.$eval(sel('create-btn'), (e) => e.textContent.trim()).catch(() => '')) || '';
+  const stored2 = await P.page.evaluate(() => localStorage.getItem('bunker.lang')).catch(() => null);
+  check(en && create2 === L('en', 'landing.create') && stored2 === 'en', `${P.name}: the switch back to English left ${JSON.stringify({ lang: await langShown(P), create2, stored2 })}`);
+  Object.assign(out, { place, create, code });
+  run.stats.lang = { ...(run.stats.lang || {}), landing: out };
+  log(`language switch on the landing page: ${JSON.stringify(out)}`);
+}
+
+// Fresh-marked cards (the 6 s highlight of a card just revealed or changed) on a page, as "player:category" keys.
+const freshKeys = (P) => P.page.$$eval('.fresh', (els) => els.map((e) => {
+  const p = e.closest('[data-player-id]');
+  return `${p ? p.getAttribute('data-player-id') : 'hand'}:${e.getAttribute('data-cat') || e.getAttribute('data-key') || ''}`;
+})).catch(() => []);
+// #app's text without the running clocks and the flashes (they change by themselves)
+const appText = (P) => P.page.evaluate(() => {
+  const c = document.getElementById('app').cloneNode(true);
+  for (const e of c.querySelectorAll('[data-ends], .toasts')) e.remove();
+  return c.textContent;
+}).catch(() => null);
+
+// A phone in play: the header's timer label ("Kai's turn", «Ход: Оля») keeps a readable width next to the language
+// pill and the narrator (it sits above the clock there; beside it, it once kept 2–3 letters: client-fixer-i1).
+async function phoneTimerCheck(P, where) {
+  const k = await P.page.evaluate(() => {
+    const e = document.querySelector('header .timer-cell .k');
+    if (!e || window.innerWidth > 639 || !window.__e2eVisible(e)) return null;
+    return { cw: e.clientWidth, sw: e.scrollWidth, text: e.textContent, vw: window.innerWidth };
+  }).catch(() => null);
+  if (!k) return;
+  check(k.cw >= Math.min(k.sw, 59), `${P.name} @${where}: the header's timer label "${k.text}" is cut to ${k.cw} px of ${k.sw} at ${k.vw} px (it needs at least 59 px)`);
+  (run.stats.timerLabel = run.stats.timerLabel || []).push({ who: P.name, where, ...k });
+}
+
+// A tap there and back on the switch (EN → RU → EN, 120 ms apart, in a room): the page never shows the language it
+// left, and nothing goes to the server (design §9.3: setLang goes out LANG_SEND_MS after the last tap, and not at all
+// when the choice ends where it started).
+async function langDoubleTapTest(bob) {
+  if (!I18N.loaded) return;
+  const cdp = await bob.page.createCDPSession();
+  const sent = [];
+  try {
+    await cdp.send('Network.enable');
+    cdp.on('Network.webSocketFrameSent', (e) => { if (/"setLang"/.test(e.response.payloadData)) sent.push(e.response.payloadData); });
+    const l0 = await langShown(bob);
+    await bob.page.evaluate(() => {
+      window.__e2eTap = [];
+      window.__e2eTapMo = new MutationObserver(() => window.__e2eTap.push(document.documentElement.lang));
+      window.__e2eTapMo.observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] });
+      const b = () => document.querySelector('[data-testid="lang-switch"]');
+      b().click();
+      setTimeout(() => b().click(), 120);
+    });
+    await sleep(1200);
+    const seen = await bob.page.evaluate(() => { window.__e2eTapMo.disconnect(); return window.__e2eTap; }).catch(() => null);
+    const l1 = await langShown(bob);
+    check(!!seen && seen.length === 0 && !!l0 && !!l1 && l1.html === l0.html && l1.sw === l0.sw && l1.you === l0.you,
+      `bob: a tap there and back on the language switch showed ${JSON.stringify(seen)} (before ${JSON.stringify(l0)}, after ${JSON.stringify(l1)}) (design §9.3)`);
+    check(sent.length === 0, `bob: a tap there and back on the language switch sent ${sent.length} setLang frame(s): ${JSON.stringify(sent)} (design §9.3)`);
+    run.stats.lang = { ...(run.stats.lang || {}), doubleTap: { langs: seen, setLang: sent.length } };
+  } finally { await cdp.detach().catch(() => {}); }
+}
+
+// bob's language switch mid-game (design §9.7): atomic (sampled every 25 ms: the page's language, the log, the hand
+// and the bar never disagree), within 2 s, only bob's page changes (the host's and the spectator's text and you.lang
+// stay), no card is marked fresh by it, and a narrator clip that is playing goes on. The render that changes the
+// language keeps the log and the bar status out of aria-live (a screen reader would queue the whole log again), and
+// they are live again a moment later. The bots are held still meanwhile.
+// o.slow: bob's link is throttled so that the answer takes about 3 s, longer than the 1.5 s after which the client once
+// committed anyway (a Russian page over English server text): the page must stay whole in its old language until the
+// answer arrives, and then change in one render (client-fixer-i1).
+async function langSwitchTest(host, bob, spec, to, o = {}) {
+  if (!I18N.loaded) return;
+  const held = run.bots.filter((b) => !b.paused);
+  for (const b of held) b.pause();
+  const res = { to };
+  let cdp = null;
+  try {
+    // no card still highlighted (a reveal a moment ago), so "no card turns fresh" means something
+    for (let i = 0; i < 80 && (await freshKeys(bob)).length; i++) await sleep(100);
+    const up = await bob.page.$$eval('.sc, .card.up', (els) => els.length).catch(() => 0);
+    const others = {};
+    for (const P of [host, spec]) others[P.name] = { text: await appText(P), lang: (await state(P)).you.lang };
+    const fresh0 = await freshKeys(bob);
+    const a0 = await narrAudio(bob);
+    await bob.page.evaluate(() => {
+      const cyr = (t) => /[А-Яа-яЁё]/.test(t || '');
+      const txt = (q, n) => [...document.querySelectorAll(q)].slice(-n).map((e) => e.textContent).join(' ');
+      window.__e2eLang = [];
+      const tick = (why) => window.__e2eLang.push({
+        why, t: Math.round(performance.now()), html: document.documentElement.lang,
+        log: cyr(txt('[data-testid="log"] li .lt', 4)), hand: cyr(txt('.hc-text', 8)),
+        bar: cyr((document.querySelector('[data-testid="action-bar"]') || {}).innerText),
+        sw: (document.querySelector('[data-testid="lang-switch"]') || { getAttribute: () => null }).getAttribute('data-lang'),
+        live: [document.querySelector('[data-testid="log"]'), document.querySelector('[data-testid="action-bar"]')].map((e) => (e ? e.getAttribute('aria-live') : '-')).join('/'),
+        // the switch's accessible name while the switch waits (review-switch-i2 finding 4)
+        swName: (document.querySelector('[data-testid="lang-switch"]') || { getAttribute: () => null }).getAttribute('aria-label'),
+        swBusy: (document.querySelector('[data-testid="lang-switch"]') || { getAttribute: () => null }).getAttribute('aria-busy'),
+        swLang: (document.querySelector('[data-testid="lang-switch"]') || { getAttribute: () => null }).getAttribute('lang'),
+      });
+      tick('start');
+      // every 25 ms, and after every render (a mutation observer's callback runs once the render has finished)
+      window.__e2eLangIv = setInterval(() => tick('timer'), 25);
+      window.__e2eLangMo = new MutationObserver(() => tick('render'));
+      window.__e2eLangMo.observe(document.getElementById('app'), { subtree: true, childList: true, characterData: true, attributes: true });
+    });
+    const limit = o.slow ? 9000 : 2000;
+    if (o.slow) {
+      const chars = await bob.page.evaluate(() => JSON.stringify(window.__bunkerState).length).catch(() => 60000);
+      res.kbps = Math.max(2, Math.round(chars / 1024 / 3));
+      cdp = await bob.page.createCDPSession();
+      await cdp.send('Network.enable');
+      await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: res.kbps * 1024, uploadThroughput: -1 });
+    }
+    const t0 = Date.now();
+    await click(bob, 'lang-switch');
+    const s1 = await waitState(bob, (s) => s.you && s.you.lang === to, `bob's state in ${to} after the switch`, limit).catch(() => null);
+    const html = await bob.page.waitForFunction((l) => document.documentElement.lang === l, { timeout: limit }, to).then(() => true, () => false);
+    res.ms = Date.now() - t0;
+    if (cdp) { await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }).catch(() => {}); }
+    check(!!s1 && html && res.ms <= limit, `bob: the switch to ${to} did not complete within ${limit / 1000} s (state ${s1 ? s1.you.lang : '-'}, page ${JSON.stringify(await langShown(bob))}) (SPEC §11 X5.7)`);
+    if (o.slow && res.ms < 1600) run.warnings.push(`bob: the throttled switch to ${to} (${res.kbps} KB/s) was answered in ${res.ms} ms: the slow path (answer after 1.5 s) was not exercised`);
+    await sleep(300);
+    const samples = await bob.page.evaluate(() => { clearInterval(window.__e2eLangIv); window.__e2eLangMo.disconnect(); return window.__e2eLang; }).catch(() => []);
+    // server text (the log, the hand's cards) is Russian exactly when the page is: never one without the other
+    const mixed = samples.filter((x) => (x.html === 'ru') !== x.log || (x.html === 'ru') !== x.hand);
+    check(samples.length >= 3 && mixed.length === 0, `bob: ${mixed.length} of ${samples.length} samples during the switch mixed two languages (page, log, hand): ${JSON.stringify(mixed.slice(0, 3))} (design §9.3)`);
+    check(samples[0] && samples[0].html === (to === 'ru' ? 'en' : 'ru') && samples[samples.length - 1].html === to, `bob: the samples do not go from the old language to ${to}: ${samples.map((x) => x.html).join(' ')}`);
+    const barMixed = samples.filter((x) => (x.html === 'ru') !== x.bar);
+    checkRu(barMixed.length === 0, `bob: ${barMixed.length} samples had the action bar in another language than the page: ${JSON.stringify(barMixed.slice(0, 3))}`);
+    check(samples.length > 0 && samples[samples.length - 1].sw === to, `bob: the switch shows data-lang=${samples.length ? samples[samples.length - 1].sw : '-'}, expected ${to}`);
+    res.samples = samples.length;
+    res.flips = samples.filter((x, i) => i && x.html !== samples[i - 1].html).length;
+    // (page language + the switch's choice per sample; the renders in between, after the click: 'e' old, 'r' Russian)
+    res.seq = samples.map((x) => (x.html === 'ru' ? 'r' : 'e') + (x.sw === 'ru' ? 'R' : 'E') + (x.why === 'render' ? '*' : '')).join(' ');
+    res.renders = samples.filter((x) => x.why === 'render').length;
+    // the render that changed the language kept the log and the bar status silent (aria-live off), and they are live
+    // again a moment later (reviewer-switch i1 finding 5)
+    const first = samples.find((x) => x.html === to);
+    check(!!first && first.live.split('/').every((x) => x === 'off' || x === '-'), `bob: the render that switched to ${to} left the live regions (log/bar) at aria-live ${first ? first.live : '-'}; expected off (a screen reader would read the whole log again)`);
+    const relive = await bob.page.waitForFunction(() => ['[data-testid="log"]', '[data-testid="action-bar"]'].every((q) => { const e = document.querySelector(q); return !e || e.getAttribute('aria-live') === 'polite'; }), { timeout: 2500 }).then(() => true, () => false);
+    check(relive, `bob: the log and the bar status did not become aria-live="polite" again after the switch to ${to}`);
+    res.quiet = first ? first.live : null;
+    // while the switch waits for the server, the button shows the choice (data-lang), and its accessible name is that
+    // language's own, which says what a tap does now (go back), with lang= and aria-busy; the language on screen names
+    // it again once the switch is done (review-switch-i2 finding 4)
+    const from = to === 'ru' ? 'en' : 'ru';
+    const badName = samples.filter((x) => (x.sw === x.html
+      ? !(x.swName === L(x.html, 'lang.switch') && x.swBusy === null && x.swLang === null)
+      : !(x.sw === to && x.html === from && x.swName === L(to, 'lang.switch') && x.swBusy === 'true' && x.swLang === to)));
+    res.pendingSamples = samples.filter((x) => x.sw !== x.html).length;
+    check(badName.length === 0, `bob: ${badName.length} samples of the switch to ${to} named the language switch wrongly (${JSON.stringify(badName.slice(0, 2).map((x) => ({ html: x.html, sw: x.sw, name: x.swName, busy: x.swBusy, lang: x.swLang })))})`);
+    await phoneTimerCheck(bob, `in ${to}`);
+    // no card marked fresh by the switch itself (a changed text is not a reveal)
+    const fresh1 = await freshKeys(bob);
+    const newFresh = fresh1.filter((k) => !fresh0.includes(k));
+    check(newFresh.length === 0, `bob: the switch marked ${newFresh.length} card(s) of ${up} on the table as new: ${JSON.stringify(newFresh.slice(0, 4))} (design §9.3)`);
+    res.cardsUp = up;
+    // the narrator's clip, playing when the switch was made, is not cut off (the game is known by the catastrophe's id)
+    if (a0 && a0.src && !a0.paused) {
+      const a1 = await narrAudio(bob);
+      check(!!a1 && a1.src === a0.src && !a1.paused && a1.t > a0.t, `bob: the narrator clip stopped or changed at the language switch (${JSON.stringify({ a0, a1 })}) (design §9.5)`);
+      res.narrator = a1 ? 'kept playing' : 'gone';
+    } else if (a0) {
+      // and a switch starts nothing by itself (SPEC §11 X5.16): a silent narrator stays silent, with the same clip
+      const a1 = await narrAudio(bob);
+      check(!!a1 && a1.src === a0.src && a1.paused, `bob: the language switch started the narrator (${JSON.stringify({ a0, a1 })}) (SPEC §11 X5.16)`);
+      res.narrator = a1 && a1.paused ? 'stayed silent' : 'played';
+    }
+    // nobody else changed: their language and their page
+    for (const P of [host, spec]) {
+      const st = await state(P);
+      const txt = await appText(P);
+      check(st && st.you.lang === others[P.name].lang, `${P.name}: you.lang changed to ${st && st.you.lang} when bob switched (SPEC §11 X5.1: a language is not a public change)`);
+      check(txt === others[P.name].text, `${P.name}: the page's text changed when bob switched language`);
+    }
+    if (to === 'ru') {
+      // a special card's chip shows the card's Russian title, and so does its popover (a tap on the phone)
+      const s = await state(bob);
+      const chip = await bob.page.evaluateHandle(() => [...document.querySelectorAll('#sec-specials [data-testid="card-chip"]')].find((e) => window.__e2eVisible(e)) || null);
+      const el = chip.asElement();
+      if (el) {
+        const title = await el.evaluate((e) => e.getAttribute('data-title'));
+        const own = s && s.me ? s.me.specials.map((x) => x.title) : [];
+        check(own.includes(title) && CYR.test(title), `bob: a special chip is titled ${JSON.stringify(title)} after the switch; expected one of his cards' Russian titles ${JSON.stringify(own)}`);
+        await el.evaluate((e) => e.scrollIntoView({ block: 'center' }));
+        await sleep(150);
+        const box = await el.boundingBox();
+        let pop = null;
+        if (box) {
+          await bob.page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2);
+          for (let i = 0; i < 20 && !pop; i++) { await sleep(80); pop = await bob.page.$eval(sel('card-popover'), (e) => e.getAttribute('data-title')).catch(() => null); }
+        }
+        check(pop === title, `bob: the popover of the "${title}" chip is titled ${JSON.stringify(pop)}`);
+        await shot('lang-ru-popover', [bob]);
+        await bob.page.keyboard.press('Escape');
+        res.chip = title;
+      } else run.warnings.push('bob: no special chip on his page to check the Russian title of');
+      await shot('lang-ru', [bob]);
+      // SPEC §11 X5.16: ▶ Listen now plays the Russian clip
+      await narratorListenTest(bob, 'ru');
+    }
+  } finally {
+    if (cdp) await cdp.detach().catch(() => {});
+    for (const b of held) b.resumePlay();
+  }
+  run.stats.lang = { ...(run.stats.lang || {}), [to === 'ru' ? 'bobToRu' : 'bobBack']: res };
+  log(`bob switched to ${to}: ${JSON.stringify(res)}`);
+}
+
+// Throttles P's download to about `bytes / seconds` (CDP; upload and latency as given). Returns the CDP session and the
+// rate in KB/s; unthrottle() and detach it afterwards.
+async function throttle(P, seconds, latency = 0) {
+  const chars = await P.page.evaluate(() => JSON.stringify(window.__bunkerState).length).catch(() => 60000);
+  const bps = Math.max(1024, Math.round(chars / seconds));
+  const cdp = await P.page.createCDPSession();
+  await cdp.send('Network.enable');
+  await cdp.send('Network.emulateNetworkConditions', { offline: false, latency, downloadThroughput: bps, uploadThroughput: -1 });
+  return { cdp, kbps: Math.round(bps / 102.4) / 10, chars };
+}
+async function unthrottle(t) {
+  if (!t) return;
+  await t.cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 }).catch(() => {});
+  await t.cdp.detach().catch(() => {});
+}
+// In-page recorder for the language checks below: every 20 ms and after every render, the page's language, the state's
+// you.lang, whether the log's last lines and the hand's cards are Russian, the connection banner and the socket.
+const LANG_REC = () => {
+  const cyr = (t) => /[А-Яа-яЁё]/.test(t || '');
+  const txt = (q, n) => [...document.querySelectorAll(q)].slice(-n).map((e) => e.textContent).join(' ');
+  window.__e2eRec = [];
+  const tick = (why) => {
+    const s = window.__bunkerState;
+    const c = window.__bunkerDebug ? window.__bunkerDebug.conn() : {};
+    window.__e2eRec.push({ why, t: Math.round(performance.now()), html: document.documentElement.lang, you: s && s.you ? s.you.lang : null,
+      log: cyr(txt('[data-testid="log"] li .lt', 4)), hand: cyr(txt('.hc-text', 8)), banner: !!document.querySelector('[data-testid="conn-banner"]'),
+      conn: `${c.status}${c.joined ? '/joined' : ''}`, sw: (document.querySelector('[data-testid="lang-switch"]') || { getAttribute: () => null }).getAttribute('data-lang') });
+  };
+  tick('start');
+  window.__e2eRecIv = setInterval(() => tick('timer'), 20);
+  window.__e2eRecMo = new MutationObserver(() => tick('render'));
+  window.__e2eRecMo.observe(document.getElementById('app'), { subtree: true, childList: true, characterData: true, attributes: true });
+};
+const langRecStop = (P) => P.page.evaluate(() => { clearInterval(window.__e2eRecIv); window.__e2eRecMo.disconnect(); return window.__e2eRec; }).catch(() => []);
+// server text (the log, the hand) in another language than the page, or the state on screen in another language
+const recMixed = (x) => (x.html === 'ru') !== x.log || (x.html === 'ru') !== x.hand || (!!x.you && x.you !== x.html);
+
+// A tap there and back on a slow link, the second tap after the first setLang went out (review-switch-i2 finding 3).
+// The answer to the language left arrives first and late (the link is throttled so that a state takes about 2.5 s,
+// past the 1.5 s after which the client once took it): the page must skip it and never show that language.
+async function langTapBackTest(bob) {
+  if (!I18N.loaded) return;
+  const held = run.bots.filter((b) => !b.paused);
+  for (const b of held) b.pause();
+  const res = {};
+  let t = null;
+  try {
+    await sleep(400);
+    const l0 = await langShown(bob);
+    const left = l0.html === 'ru' ? 'en' : 'ru';
+    t = await throttle(bob, 2.5);
+    res.kbps = t.kbps;
+    const frames = [];
+    const T0 = Date.now();
+    t.cdp.on('Network.webSocketFrameSent', (e) => { if (/"setLang"/.test(e.response.payloadData)) frames.push({ ms: Date.now() - T0, out: e.response.payloadData }); });
+    t.cdp.on('Network.webSocketFrameReceived', (e) => { const m = /^\{"t":"state"[\s\S]*?"you":\{[^}]*"lang":"(en|ru)"/.exec(e.response.payloadData); if (m) frames.push({ ms: Date.now() - T0, state: m[1] }); });
+    await bob.page.evaluate(LANG_REC);
+    await bob.page.evaluate(() => { const b = () => document.querySelector('[data-testid="lang-switch"]'); b().click(); setTimeout(() => b().click(), 650); });
+    // both answers: the one to the language left, then the one to the language kept
+    for (let i = 0; i < 200 && frames.filter((f) => f.state).length < 2; i++) await sleep(100);
+    await sleep(400);
+    const rec = await langRecStop(bob);
+    const l1 = await langShown(bob);
+    res.frames = frames.map((f) => `${f.ms}:${f.state ? 'state ' + f.state : 'setLang'}`).join(' ');
+    res.langs = [...new Set(rec.map((x) => x.html))].join(',');
+    const sent = frames.filter((f) => f.out).length;
+    const states = frames.filter((f) => f.state).map((f) => f.state);
+    check(sent === 2 && states.length === 2 && states[0] === left && states[1] === l0.html,
+      `bob: the tap there and back on a slow link did not go as set up (setLang ${sent}, answers ${JSON.stringify(states)}): the check says nothing (${res.frames})`);
+    check(rec.length > 5 && rec.every((x) => x.html === l0.html), `bob: a tap there and back on a slow link showed ${left} (${res.langs}; ${res.frames}) (review-switch-i2 finding 3)`);
+    check(!!l1 && l1.html === l0.html && l1.you === l0.html && l1.sw === l0.html, `bob: after the tap there and back the page is ${JSON.stringify(l1)}, expected ${l0.html}`);
+  } finally {
+    await unthrottle(t);
+    for (const b of held) b.resumePlay();
+  }
+  run.stats.lang = { ...(run.stats.lang || {}), tapBack: res };
+  log(`bob's tap there and back on a slow link: ${JSON.stringify(res)}`);
+}
+
+// A switch around a reconnect, on a slow link (a state takes about 2 s) with some latency (review-switch-i2 finding 2).
+// mode 'waiting': the switch is made while the page waits to reconnect (the banner is up). It happens at once, and the
+// resume's hello carries it; the banner stays up until the new socket's first state has replaced the old one (in the
+// other language). mode 'hello': the switch is made while the resume's hello, in the old language, is on its way. It
+// waits like an online switch: the page stays whole in its old language, and changes in one render when the answer
+// arrives. Either way no sample shows two languages without the connection banner.
+async function langReconnectTest(bob, mode, to) {
+  if (!I18N.loaded) return;
+  const held = run.bots.filter((b) => !b.paused);
+  for (const b of held) b.pause();
+  const res = { mode, to };
+  let t = null;
+  try {
+    await sleep(400);
+    const l0 = await langShown(bob);
+    t = await throttle(bob, 2, 150);
+    res.kbps = t.kbps;
+    await bob.page.evaluate(LANG_REC);
+    const T0 = Date.now();
+    await bob.page.evaluate(() => window.__bunkerDebug.drop());
+    let at = null;
+    for (let i = 0; i < 4000 && !at && Date.now() - T0 < 20000; i++) {
+      const c = await bob.page.evaluate(() => window.__bunkerDebug.conn()).catch(() => null);
+      if (c && (mode === 'waiting' ? c.status === 'waiting' : c.status === 'open' && !c.joined)) at = c;
+      else await sleep(3);
+    }
+    if (!check(!!at, `bob: the reconnect never reached the moment to switch in (${mode})`)) return;
+    await bob.page.evaluate(() => document.querySelector('[data-testid="lang-switch"]').click());
+    res.switchAtMs = Date.now() - T0;
+    const ok = await bob.page.waitForFunction((l) => { const s = window.__bunkerState; const c = window.__bunkerDebug.conn(); return document.documentElement.lang === l && s && s.you.lang === l && c.status === 'open' && c.joined && !document.querySelector('[data-testid="conn-banner"]'); }, { timeout: 25000, polling: 50 }, to).then(() => true, () => false);
+    res.ms = Date.now() - T0;
+    await sleep(300);
+    const rec = await langRecStop(bob);
+    check(ok, `bob: the switch to ${to} around a reconnect (${mode}) did not end online and in ${to} within 25 s (${JSON.stringify(await langShown(bob))})`);
+    const bad = rec.filter((x) => recMixed(x) && !x.banner);
+    res.samples = rec.length;
+    res.mixedWithBanner = rec.filter((x) => recMixed(x) && x.banner).length;
+    res.flips = rec.filter((x, i) => i && x.html !== rec[i - 1].html).length;
+    check(rec.length > 10 && bad.length === 0, `bob: ${bad.length} of ${rec.length} samples of a switch to ${to} around a reconnect (${mode}) mixed two languages with no connection banner: ${JSON.stringify(bad.slice(0, 3))} (review-switch-i2 finding 2)`);
+    // a switch made while the hello is on its way waits for the server: the page flips once, and only when the state
+    // in the new language is there
+    if (mode === 'hello') {
+      const early = rec.filter((x) => x.html === to && x.you !== to);
+      check(res.flips === 1 && early.length === 0 && rec[0].html === l0.html, `bob: the switch made while the resume's hello was on its way flipped the page ${res.flips} time(s), ${early.length} sample(s) before the answer (review-switch-i2 finding 2)`);
+    }
+  } finally {
+    await unthrottle(t);
+    for (const b of held) b.resumePlay();
+  }
+  run.stats.lang = { ...(run.stats.lang || {}), ['reconnect-' + mode]: res };
+  log(`bob switched to ${to} around a reconnect (${mode}): ${JSON.stringify(res)}`);
+}
+
+// SPEC §11 X5.2 on a slow link (review-switch-i2 finding 1). The host's Next goes out over a link throttled so that the
+// state that answers it takes about twice ANSWER_MS (4 s). The client must not take the socket for dead: the ping it
+// sends just ahead of every action is answered at once, so there is no "No answer from the server" toast, no new
+// socket and no banner, and the answer shows when it lands.
+async function slowActionTest(P, what, act, done) {
+  const held = run.bots.filter((b) => !b.paused);
+  for (const b of held) b.pause();
+  const res = { what };
+  let t = null;
+  try {
+    await sleep(300);
+    t = await throttle(P, 8.5, 100);
+    res.kbps = t.kbps;
+    res.kb = Math.round(t.chars / 1024);
+    let sockets = 0;
+    t.cdp.on('Network.webSocketCreated', () => { sockets++; });
+    await P.page.evaluate(() => {
+      window.__e2eSlow = { toasts: [], banner: false, conn: new Set() };
+      window.__e2eSlowIv = setInterval(() => {
+        const c = window.__bunkerDebug.conn();
+        window.__e2eSlow.conn.add(`${c.status}${c.joined ? '/joined' : ''}`);
+        if (document.querySelector('[data-testid="conn-banner"]')) window.__e2eSlow.banner = true;
+        for (const e of document.querySelectorAll('[data-testid="error-toast"]')) window.__e2eSlow.toasts.push(e.getAttribute('data-code'));
+      }, 50);
+    });
+    await sleep(300);
+    const t0 = Date.now();
+    await act();
+    const s1 = await waitState(P, done, `${P.name}: the answer to ${what} over a slow link`, 40000).catch(() => null);
+    res.ms = Date.now() - t0;
+    const w = await P.page.evaluate(() => { clearInterval(window.__e2eSlowIv); const x = window.__e2eSlow; return { toasts: [...new Set(x.toasts)], banner: x.banner, conn: [...x.conn] }; }).catch(() => null);
+    res.seen = w;
+    res.sockets = sockets;
+    check(!!s1, `${P.name}: the answer to ${what} never arrived over a ${t.kbps} KB/s link (SPEC §11 X5.2)`);
+    check(!!w && sockets === 0 && !w.banner && w.toasts.length === 0 && w.conn.every((c) => c === 'open/joined'),
+      `${P.name}: over a ${t.kbps} KB/s link (a ${res.kb} KB state) the client took its live socket for dead after ${what}: ${JSON.stringify({ sockets, ...w })} (review-switch-i2 finding 1)`);
+    if (res.ms < 5000) run.warnings.push(`${P.name}: the throttled answer to ${what} took only ${res.ms} ms, under ANSWER_MS (4 s) + 1 s: the slow path was not exercised`);
+  } finally {
+    await unthrottle(t);
+    for (const b of held) b.resumePlay();
+  }
+  run.stats.slowAction = res;
+  log(`${P.name}: ${what} over a slow link: ${JSON.stringify(res)}`);
+}
+
+// A Russian page (Dana, whose browser speaks Russian): in Russian with no Latin letter in the visible text beyond the
+// player and spectator names, the room code, the switch's EN/RU and the allowlist (°C, 3D, USB); at 360 × 640 no
+// horizontal scroll and the action bar flush (X7, with Russian lengths).
+async function ruPageCheck(P, where) {
+  if (!I18N.loaded) return;
+  await sleep(300);
+  const r = await P.page.evaluate(() => {
+    const s = window.__bunkerState;
+    const names = new Set();
+    if (s) {
+      for (const p of s.players || []) names.add(p.name);
+      for (const x of s.spectators || []) names.add(x.name);
+      for (const e of s.log || []) for (const x of e.parts || []) if (x && x.t === 'player') names.add(x.v);
+    }
+    const drop = [...names].filter(Boolean).sort((a, b) => b.length - a.length);
+    if (s && s.room) drop.push(s.room);
+    drop.push('°C', '3D', 'USB');
+    const bad = [];
+    const w = document.createTreeWalker(document.getElementById('app'), NodeFilter.SHOW_TEXT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) {
+      const el = n.parentElement;
+      if (!el || el.closest('[data-testid="lang-switch"]')) continue;
+      if (typeof el.checkVisibility === 'function' && !el.checkVisibility({ checkVisibilityCSS: true, visibilityProperty: true })) continue;
+      let t = n.nodeValue;
+      for (const d of drop) t = t.split(d).join(' ');
+      const m = t.match(/[A-Za-z][A-Za-z'’.-]*/g);
+      if (m) bad.push({ in: String(el.className || el.tagName).slice(0, 32), text: n.nodeValue.trim().slice(0, 70), latin: m.slice(0, 4) });
+    }
+    // text that CSS writes (::before / ::after: quoted strings and attr()), which a text-node scan cannot see (an English
+    // " · time's up" once came from a CSS literal)
+    for (const el of document.getElementById('app').querySelectorAll('*')) {
+      if (el.closest('[data-testid="lang-switch"]')) continue;
+      if (typeof el.checkVisibility === 'function' && !el.checkVisibility({ checkVisibilityCSS: true, visibilityProperty: true })) continue;
+      for (const pseudo of ['::before', '::after']) {
+        const cs = getComputedStyle(el, pseudo);
+        if (!cs.content || cs.content === 'none' || cs.content === 'normal' || cs.display === 'none') continue;
+        let t = [...cs.content.matchAll(/"((?:[^"\\]|\\.)*)"|attr\(([\w-]+)\)/g)].map((x) => (x[2] ? el.getAttribute(x[2]) || '' : x[1])).join(' ');
+        for (const d of drop) t = t.split(d).join(' ');
+        const m = t.match(/[A-Za-z][A-Za-z'’.-]*/g);
+        if (m) bad.push({ in: `${String(el.className || el.tagName).slice(0, 32)}${pseudo}`, text: cs.content.slice(0, 70), latin: m.slice(0, 4) });
+      }
+    }
+    return { html: document.documentElement.lang, you: s && s.you ? s.you.lang : null, n: bad.length, bad: bad.slice(0, 10), sw: document.documentElement.scrollWidth, iw: window.innerWidth };
+  }).catch((e) => ({ error: String(e) }));
+  check(r.html === 'ru' && r.you === 'ru', `${P.name} @${where}: the page is not Russian (page ${r.html}, you.lang ${r.you}) (SPEC §11 X5.7)`);
+  checkRu(r.n === 0, `${P.name} @${where}: ${r.n} Latin text(s) on the Russian page: ${JSON.stringify(r.bad)}`);
+  checkRu(r.sw <= r.iw + 1, `${P.name} @${where}: horizontal scroll at ${r.iw} px in Russian (scrollWidth ${r.sw})`);
+  await checkBarFlush(P, `${where} (ru)`);
+  await phoneTimerCheck(P, `${where} (ru)`);
+  (run.stats.ruPage = run.stats.ruPage || []).push({ where, latin: r.n, scroll: r.sw > r.iw + 1 });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // main
 
 async function main() {
+  await loadI18n();
   fs.mkdirSync(opts.screens, { recursive: true });
   for (const f of fs.readdirSync(opts.screens)) if (/^(\d\d-.*|FAIL-.*)\.png$|^e2e-(summary|failure-states)\.json$/.test(f)) fs.rmSync(path.join(opts.screens, f));
   if (opts.url) {
@@ -1217,6 +1810,7 @@ async function main() {
   await shot('landing', [host], { alsoMobile: true });
   await checkReportLinks(host, 'landing', '');   // SPEC §11 X10: the landing footer
   await checkVersion(host, 'landing');
+  await landingLangTest(host);   // SPEC §11 X5.7: the switch on the landing page, the look-alike room code
   check(!(await host.page.$(sel('profile-tag'))), 'the landing shows a profile tag without ?profile= (SPEC §11 X9.1)');
   await typeInto(host, 'name-input', 'Alice');
   await sleep(PAUSE);
@@ -1227,6 +1821,8 @@ async function main() {
   check(/^[ABCDEFGHJKLMNPQRSTUVWXYZ]{4}$/.test(code), `room-code text is ${JSON.stringify(code)}, expected exactly the 4-letter code`);
   const hs0 = await waitState(host, (s) => s.phase === 'lobby' && s.room === code && s.you.isHost, 'the lobby as host');
   host.id = hs0.you.id;
+  const hh = await host.page.evaluate(() => window.__e2eHellos || []).catch(() => []);
+  check(!I18N.loaded || (hh.length === 1 && hh[0].t === 'create' && hh[0].lang === 'en'), `host: the create hello carried ${JSON.stringify(hh)}; expected lang "en" (SPEC §11 X5.1)`);
   await waitHook(host, 'copy-link-btn', '', 'the copy-link button');
   log(`room ${code} created by Alice (${host.id})`);
   await checkBarEstimate(host, 'the host alone, below the minimum');
@@ -1282,6 +1878,20 @@ async function main() {
   await waitState(spec, (s) => s.phase === 'reveal', 'the spectator to see the game');
   await narratorStart(bob, [host, spec]);
   await shot('game-start', run.pages, { alsoMobile: true });
+  // SPEC §11 X5.8: bob plays in Russian from here through his first vote (his narrator clip is playing now), and
+  // switches back before the English checks of the final and of End game
+  if (I18N.loaded) {
+    // the host reveals first in round 1: a card on the table that the switch must not mark as new
+    const h1 = await state(host);
+    if (h1.turn && h1.turn.speakerId === host.id && !h1.turn.hasRevealed) await playMyTurn(host, h1, 'hostTurns');
+    await langDoubleTapTest(bob);
+    await langTapBackTest(bob);
+    await langSwitchTest(host, bob, spec, 'ru');
+    // a switch around a reconnect, both ways (bob is Russian again afterwards)
+    await langReconnectTest(bob, 'waiting', 'en');
+    await langReconnectTest(bob, 'hello', 'ru');
+    run.bobRu = { from: 'the start of game 1' };
+  }
 
   // 6. play
   const specialP = rng() < 0.5 ? [host, bob] : [bob, host];
@@ -1304,9 +1914,12 @@ async function main() {
     if (aw && (hs.round !== aw.round || !!hs.overtime !== aw.overtime || !['reveal', 'discussion'].includes(hs.phase))) {
       run.airlockWatch = null;
       const t = playerById(hs, aw.T);
-      const jammed = hs.log.some((e) => { const a = airlockLine(e.text, e.kind); return !!a && a.kind === 'jam' && a.target === aw.name; });
+      // (by key and target id, SPEC §11 X5.3; a server without keys: the English line and the name)
+      const onT = (a) => !!a && (a.t !== undefined ? a.t === aw.T : a.target === aw.name);
+      const jammed = hs.log.some((e) => { const a = airlockOf(e); return !!a && a.kind === 'jam' && onT(a); });
       // sealed by a bot (the victim may be back already: a revive), or its target is gone
-      const closed = (!!t && t.status !== 'alive') || hs.log.some((e) => e.kind === 'eject' && (AIRLOCK_SEALED_RE.exec(e.text) || [])[3] === aw.name);
+      const closed = (!!t && t.status !== 'alive') || hs.log.some((e) => { const a = airlockOf(e); return !!a && a.kind === 'seal' && onT(a); })
+        || hs.log.some((e) => !e.key && e.kind === 'eject' && (AIRLOCK_SEALED_RE.exec(e.text) || [])[3] === aw.name);
       check((jammed || closed) && !(hs.airlocks || []).some((a) => a.targetId === aw.T),
         `the airlock on ${aw.name} is still open after its round's discussion (jammed line ${jammed}, ${aw.name} ${t && t.status}; SPEC §11 X1.2)`);
       await checkAirlockBadges(host);
@@ -1332,6 +1945,11 @@ async function main() {
       }
       if (s.phase === 'vote' && s.vote && s.vote.voters.includes(s.you.id) && s.me && !s.me.myVote) {
         await castVote(P, s, P === host ? 'hostVotes' : 'bobVotes');
+        // SPEC §11 X5.8: bob's Russian stretch ends with his first vote
+        if (P === bob && run.bobRu && !run.bobRu.back && run.stats.bobVotes > 0) {
+          run.bobRu.back = `after his first vote (round ${s.round})`;
+          await langSwitchTest(host, bob, spec, 'en', { slow: true });
+        }
         acted = true;
         break;
       }
@@ -1388,9 +2006,12 @@ async function main() {
         // for a moment and a "did it work?" re-tap cannot vote (SPEC §11, f2)
         const watchHold = !run.stats.voteHold && hs2.schedule && hs2.schedule.kicksThisStep > 0 && !hs2.voteMods.cancelNext;
         if (watchHold) await watchVoteHold(host);
-        await click(host, 'next-btn', '', 'Next at the end of the discussion');
+        const leftDiscussion = (x) => x.phase !== 'discussion' || x.round !== hs.round || x.overtime !== hs.overtime || (x.timer && hs2.timer && x.timer.endsAt !== hs2.timer.endsAt);
+        // SPEC §11 X5.2: once, this Next goes out over a slow link (its answer takes about 2 × ANSWER_MS)
+        if (!run.stats.slowAction && !watchHold && hs.round >= 2) await slowActionTest(host, 'Next at the end of the discussion', () => click(host, 'next-btn', '', 'Next at the end of the discussion'), leftDiscussion);
+        else await click(host, 'next-btn', '', 'Next at the end of the discussion');
         run.stats.nextClicks++;
-        await waitState(host, (x) => x.phase !== 'discussion' || x.round !== hs.round || x.overtime !== hs.overtime || (x.timer && hs2.timer && x.timer.endsAt !== hs2.timer.endsAt), 'Next to leave the discussion');
+        await waitState(host, leftDiscussion, 'Next to leave the discussion');
         if (watchHold) await checkVoteHold(host);
       }
       continue;
@@ -1429,6 +2050,13 @@ async function main() {
 
   // 7. final
   log('final reached');
+  // (bob never voted in Russian, e.g. he was out first: back to English for the English checks from here on)
+  if (run.bobRu && !run.bobRu.back) {
+    run.bobRu.back = 'at the final (he cast no vote in Russian)';
+    run.warnings.push(`bob's Russian stretch ended ${run.bobRu.back}`);
+    await langSwitchTest(host, bob, spec, 'en', { slow: true });
+  }
+  if (run.bobRu) run.stats.lang = { ...(run.stats.lang || {}), bobStretch: run.bobRu };
   for (const P of humans) await checkSentSteps(P);
   const sentN = run.stats.sentSteps;
   check((sentN.vote || 0) > 0 && ((sentN.reveal || 0) + (sentN.endTurn || 0)) > 0 && (sentN.next || 0) > 0,
@@ -1439,6 +2067,7 @@ async function main() {
   check(!!run.stats.reload, 'the reload test did not run');
   check(!!run.stats.estimate && run.stats.estimate.ok, 'the lobby estimate check did not run');
   if (!run.stats.popover) run.warnings.push('the card-chip popover check did not run (no special was played in a discussion)');
+  if (!run.stats.slowAction) run.warnings.push('the slow-link action check did not run (no discussion from round 2 on without the vote-hold check)');
   // SPEC §11 X1: from 4 players on, at least two Airlocks are dealt, so the check must run (under 4 none are dealt)
   const airlockRan = run.stats.airlock && !run.stats.airlock.skipped;
   if (!airlockRan && run.stats.airlock && run.stats.airlock.expected) run.warnings.push(`the airlock UI check did not run: ${run.stats.airlock.skipped}`);
@@ -1494,6 +2123,25 @@ async function main() {
   await mockChecks();
   // 11. SPEC §11 X9.1: ?profile= isolation in one browser context
   await profileTest();
+  // 12. SPEC §11 X5.15: permessage-deflate, as the spawned server's BUNKER_WS_DEFLATE says
+  wsDeflateCheck();
+}
+
+/**
+ * SPEC §11 X5.15: Chrome offers permessage-deflate on every WebSocket; a spawned server takes it exactly when its
+ * BUNKER_WS_DEFLATE (this process's environment, passed on) turns it on, always without context takeover. So every
+ * socket a page opened agreed on the same thing, and with deflate on, the whole run above was played over it. A
+ * running server (--url) is only reported.
+ */
+function wsDeflateCheck() {
+  const seen = Object.entries(run.stats.ws);
+  check((run.stats.ws.host || []).length > 0, `the host page's WebSocket handshake was not seen (${JSON.stringify(run.stats.ws)})`);
+  if (!run.server) return;
+  const want = configFromEnv().wsDeflate ? 'permessage-deflate; server_no_context_takeover' : '';
+  for (const [page, list] of seen) {
+    check(list.every((x) => x === want), `${page}: its WebSockets agreed on ${JSON.stringify(list)}, expected ${JSON.stringify(want)} (BUNKER_WS_DEFLATE, SPEC §11 X5.15)`);
+  }
+  log(`WebSockets (SPEC §11 X5.15): ${seen.reduce((n, [, l]) => n + l.length, 0)} handshakes on ${seen.length} pages, all ${JSON.stringify(want)}`);
 }
 
 // SPEC §11 X6: "End game → back to the lobby". The host starts another game; a friend who arrives during it can only
@@ -1507,13 +2155,26 @@ async function endGameTest(host, bob, spec, code) {
   await waitState(host, (s) => s.phase === 'reveal', 'the second game to start');
   await waitState(bob, (s) => s.phase === 'reveal', 'bob in the second game');
   // a late arrival opens the link while the game runs: joined as a spectator
-  const late = await newPage(await run.browser.createBrowserContext(), 'late', MOBILE);
+  // (SPEC §11 X5.8: Dana's phone speaks Russian and she chose nothing, so her first visit is Russian; she stays so,
+  // on a 360 × 640 screen)
+  const late = await newPage(await run.browser.createBrowserContext(), 'late', I18N.loaded ? PHONE_360 : MOBILE, { lang: 'ru' });
   await late.page.goto(`${run.baseUrl}/?room=${code}`, { waitUntil: 'domcontentloaded' });
+  if (I18N.loaded) {
+    await waitHook(late, 'name-input');
+    const l0 = await langShown(late);
+    check(!!l0 && l0.html === 'ru' && l0.sw === 'ru', `Dana: a first visit from a Russian browser is not Russian (${JSON.stringify(l0)}) (SPEC §11 X5.7)`);
+  }
   await typeInto(late, 'name-input', 'Dana');
   await sleep(PAUSE);
   await click(late, 'join-btn');
   const ls0 = await waitState(late, (s) => s.you.role === 'spectator' && GAME_PHASES_E2E.includes(s.phase), 'the late arrival watching the running game');
   late.id = ls0.you.id;
+  if (I18N.loaded) {
+    // her join carried the language: the server spoke Russian from its first answer, and no setLang was needed
+    const w = await late.page.evaluate(() => ({ hellos: window.__e2eHellos || [], setLang: window.__e2eSetLang || 0 })).catch(() => null);
+    check(!!w && w.hellos.length === 1 && w.hellos[0].t === 'join' && w.hellos[0].lang === 'ru' && w.setLang === 0, `Dana: her hellos were ${JSON.stringify(w)}; the join must carry lang "ru" (SPEC §11 X5.1)`);
+  }
+  await ruPageCheck(late, 'watching game 2');
   // mid-round: the host's Next moves the reveals on by a speaker or two, then the host ends it
   for (let i = 0; i < 2; i++) {
     const h0 = await state(host);
@@ -1553,9 +2214,13 @@ async function endGameTest(host, bob, spec, code) {
   check(sent2 === 1, `host: End game sent ${sent2} endGame frames (expected exactly 1)`);
   check(back.players.length === hs0.players.filter((p) => p.status !== 'left').length && back.players.some((p) => p.id === bob.id),
     `End game: ${back.players.length} seated in the lobby, expected everyone who had not left (${hs0.players.length})`);
-  check((back.log || []).some((e) => e.kind === 'system' && e.text === 'The host ended the game'), 'End game: the log has no "The host ended the game" line');
+  check((back.log || []).some((e) => e.kind === 'system' && (e.key ? e.key === 'log.endGame' : e.text === 'The host ended the game')), 'End game: the log has no "The host ended the game" line');
   const ls1 = await state(late);
   check(ls1.you.role === 'spectator' && (await state(spec)).you.role === 'spectator', 'End game: a spectator was seated by it');
+  // Dana (Russian) is told too: by the hooks and the keys, not by English words
+  const danaToast = await late.page.waitForSelector('[data-testid="info-toast"][data-code="ended"]', { timeout: 3000 }).then(() => true, () => false);
+  check(danaToast && (ls1.log || []).some((e) => e.key === 'log.endGame' && e.kind === 'system'), `Dana: after End game no "ended" flash (${danaToast}) or no log.endGame line in her log`);
+  await ruPageCheck(late, 'the lobby after End game');
   // everyone is told why (a flash) and the lobby's bar says so
   const told = await bob.page.evaluate(() => {
     const t = [...document.querySelectorAll('[data-testid="info-toast"][data-code="ended"]')].map((e) => e.textContent);
@@ -1576,10 +2241,14 @@ async function endGameTest(host, bob, spec, code) {
   }
   await click(late, 'take-seat-btn', '', 'Take a seat (late arrival)');
   await waitState(late, (s) => s.you.role === 'player' && s.players.some((p) => p.id === late.id), 'the late arrival seated');
+  await ruPageCheck(late, 'seated in the lobby');
+  await narratorRuLobby(late);   // SPEC §11 X5.16: she turns the narrator on; game 3 must read to her in Russian
   await waitState(host, (s) => s.players.some((p) => p.id === late.id), 'the host to see the late arrival seated');
   await sleep(PAUSE);
   await click(host, 'start-btn', '', 'Start (with the late arrival)');
   const ls2 = await waitState(late, (s) => s.phase === 'reveal' && !!s.me && Object.keys(s.me.cards || {}).length === 8, 'the late arrival dealt into the new game');
+  await narratorRuStart(late);
+  await ruPageCheck(late, 'playing game 3');
   await waitHook(host, 'player-card', `[data-player-id="${late.id}"]`, 'the late arrival on the host\'s table').catch(async (e) => {
     if (!(await host.page.$(sel('player-card', `[data-player-id="${late.id}"]`)))) throw e;
   });
@@ -1596,7 +2265,7 @@ const GAME_PHASES_E2E = ['reveal', 'discussion', 'vote', 'defense'];
 // cause is the one finalCause() gives for the state, and exactly the airlock lines are styled as airlock lines.
 async function checkFinalReading(s) {
   const want = finalCause(s).kind;
-  const airN = s.log.filter((e) => airlockLine(e.text, e.kind)).length;
+  const airN = s.log.filter((e) => airlockOf(e)).length;
   for (const P of run.pages) {
     const got = await P.page.evaluate(() => {
       const c = document.querySelector('[data-testid="final-cause"]');
@@ -1977,6 +2646,94 @@ const narrAudio = (P) => P.page.evaluate(() => {
   const seekEnd = a && a.seekable.length ? a.seekable.end(a.seekable.length - 1) : 0;
   return a ? { src: a.getAttribute('src'), paused: a.paused, t: a.currentTime, count: document.querySelectorAll('audio').length, dur: a.duration, seekEnd } : null;
 }).catch(() => null);
+/**
+ * narration.json's clip of the catastrophe `c` in `lang` (SPEC §11 X5.16): the entry by the catastrophe's id (an entry
+ * without `id`: its English src basename; a state without an id: the English title), then its clips[lang], else the
+ * English clip. -> { src, lang (of that clip), entry } or null.
+ */
+async function narrClipOf(P, c, lang) {
+  const list = await P.page.evaluate(() => fetch('audio/narration.json', { cache: 'no-store' }).then((r) => r.json())).catch(() => []);
+  const cid = c && typeof c.id === 'string' ? c.id : null;
+  const title = String((c && c.title) || '').toLowerCase();
+  const e = (Array.isArray(list) ? list : []).find((x) => x && typeof x.title === 'string' && typeof x.src === 'string'
+    && (cid ? (x.id ? x.id === cid : x.src.endsWith(`/${cid}.mp3`)) : x.title.toLowerCase() === title));
+  if (!e) return null;
+  const own = e.clips && e.clips[lang] && typeof e.clips[lang].src === 'string' ? e.clips[lang] : null;
+  return own ? { src: own.src, lang, entry: e } : { src: e.src, lang: 'en', entry: e };
+}
+/** Waits (up to 5 s) for P's narrator to play `src`, and returns two samples 600 ms apart: { ok, a0, a1 }. */
+async function narrPlays(P, src) {
+  const on = (a) => !!a && !!a.src && a.src.endsWith('/' + src) && !a.paused && a.t > 0.05;
+  let a0 = await narrAudio(P);
+  for (let i = 0; i < 50 && !on(a0); i++) { await sleep(100); a0 = await narrAudio(P); }
+  await sleep(600);
+  const a1 = await narrAudio(P);
+  return { ok: on(a0) && on(a1) && a1.t > a0.t + 0.25, a0, a1 };
+}
+// SPEC §11 X5.16: after a language switch, ▶ Listen plays the catastrophe in the new language. Through the header
+// popover (at the top of the page, on the phone too): Stop the clip that is playing, then ▶. The element's clip becomes
+// the one in `lang` and plays (the click is the gesture), and every ▶ says (data-lang) which language it plays.
+async function narratorListenTest(P, lang) {
+  if (!run.stats.narrator || run.stats.narrator.skipped || run.stats.narrator.on !== P.name) return;
+  const s = await state(P);
+  const clip = await narrClipOf(P, s && s.catastrophe, lang);
+  if (!check(!!clip && clip.lang === lang, `no ${lang} clip in audio/narration.json for "${s && s.catastrophe && s.catastrophe.title}" (SPEC §11 X5.16)`)) return;
+  const res = { lang, clip: clip.src };
+  const langs = await hookValues(P, 'narrator-play', 'data-lang');
+  check(langs.length >= 1 && langs.every((x) => x === lang), `${P.name}: after the switch to ${lang} the ▶ Listen buttons play ${JSON.stringify(langs)}`);
+  await click(P, 'narrator-menu');
+  await waitHook(P, 'narrator-play-menu', '', 'the ▶ in the narrator popover', 3000);
+  check(!(await P.page.$(sel('narrator-lang-note'))), `${P.name}: the narrator popover says the clip is English only, but narration.json has a ${lang} clip`);
+  const a = await narrAudio(P);
+  if (a && a.src && !a.paused) {
+    res.stopped = a.src.replace(/^.*?\/audio\//, 'audio/');
+    await click(P, 'narrator-play-menu', '', 'Stop the playing clip');
+    await P.page.waitForFunction(() => document.querySelector('audio[data-testid="narrator-audio"]').paused, { timeout: 3000 }).catch(() => {});
+  }
+  await click(P, 'narrator-play-menu', '', `▶ Listen, now in ${lang}`);
+  const r = await narrPlays(P, clip.src);
+  check(r.ok, `${P.name}: ▶ Listen after the switch to ${lang} does not play ${clip.src} (${JSON.stringify({ a0: r.a0, a1: r.a1 })}) (SPEC §11 X5.16)`);
+  await P.page.keyboard.press('Escape');
+  res.t = r.a0 && r.a1 ? [+r.a0.t.toFixed(2), +r.a1.t.toFixed(2)] : null;
+  run.stats.narrator.afterSwitch = res;
+  log(`narrator after the switch to ${lang}: ${JSON.stringify(res)}`);
+}
+// SPEC §11 X5.16: a Russian player's narrator reads in Russian. Dana (a Russian browser) turns it on in the lobby, and
+// its words no longer say it is English; at the start of the next game her page plays her catastrophe's Russian clip by
+// itself (her clicks in the lobby are the gesture Chrome's real autoplay policy wants), and every ▶ says it plays ru.
+async function narratorRuLobby(P) {
+  if (!I18N.loaded) return;
+  const btn = await P.page.waitForSelector(sel('narrator-menu'), { visible: true, timeout: 3000 }).catch(() => null);
+  if (!btn) {
+    const msg = `${P.name}: no narrator control (narrator-menu) in the lobby header`;
+    if (!opts.url && !opts.publicDir) check(false, msg); else run.warnings.push(`${msg}; the Russian narrator check skipped`);
+    return;
+  }
+  await click(P, 'narrator-menu');
+  await click(P, 'narrator-toggle');
+  const on = await P.page.waitForFunction((q) => document.querySelector(q)?.getAttribute('aria-checked') === 'true', { timeout: 3000 }, sel('narrator-toggle')).then(() => true, () => false);
+  check(on, `${P.name}: the narrator switch did not turn on`);
+  const lead = await P.page.$eval('.narr-pop-lead', (e) => e.textContent).catch(() => '');
+  checkRu(lead === L('ru', 'narr.lead') && !/англ/i.test(lead), `${P.name}: the narrator popover's lead reads ${JSON.stringify(lead)}; expected narr.lead in Russian, which no longer says the narration is English (SPEC §11 X5.16)`);
+  await P.page.keyboard.press('Escape');
+  await P.page.waitForFunction((q) => !document.querySelector(q), { timeout: 3000 }, sel('narrator-toggle')).catch(() => {});
+  run.stats.narratorRu = { on: P.name };
+}
+async function narratorRuStart(P) {
+  if (!run.stats.narratorRu) return;
+  const t0 = Date.now();
+  const s = await state(P);
+  const clip = await narrClipOf(P, s && s.catastrophe, 'ru');
+  if (!check(!!clip && clip.lang === 'ru' && /^audio\/catastrophes-ru\//.test(clip.src), `no Russian clip (audio/catastrophes-ru/…) in audio/narration.json for "${s && s.catastrophe && s.catastrophe.title}": ${JSON.stringify(clip && clip.src)} (SPEC §11 X5.16)`)) return;
+  const r = await narrPlays(P, clip.src);
+  check(r.ok, `${P.name}: a Russian page with the narrator on, the game started, but ${clip.src} is not playing by itself (${JSON.stringify({ a0: r.a0, a1: r.a1 })}) (SPEC §11 X5.16)`);
+  const langs = await hookValues(P, 'narrator-play', 'data-lang');
+  check(langs.length >= 1 && langs.every((x) => x === 'ru'), `${P.name}: the ▶ Listen buttons play ${JSON.stringify(langs)}, expected ru`);
+  const words = await P.page.$$eval(sel('narrator-play'), (els) => els.filter((e) => window.__e2eVisible(e)).map((e) => `${e.getAttribute('title')} ${e.getAttribute('aria-label')} ${e.textContent}`)).catch(() => []);
+  checkRu(words.length >= 1 && words.every((x) => !/англ/i.test(x) && CYR.test(x)), `${P.name}: the ▶ Listen words still say English: ${JSON.stringify(words)} (SPEC §11 X5.16)`);
+  run.stats.narratorRu = { ...run.stats.narratorRu, clip: clip.src, t: r.a0 && r.a1 ? [+r.a0.t.toFixed(2), +r.a1.t.toFixed(2)] : null, ms: Date.now() - t0 };
+  log(`narrator in Russian: ${JSON.stringify(run.stats.narratorRu)}`);
+}
 async function narratorLobby(P) {
   const t0 = Date.now();
   const btn = await P.page.waitForSelector(sel('narrator-menu'), { visible: true, timeout: 3000 }).catch(() => null);
@@ -2005,9 +2762,11 @@ async function narratorStart(P, others) {
   const t0 = Date.now();
   const s = await state(P);
   const title = s && s.catastrophe ? s.catastrophe.title : '';
-  const clips = await P.page.evaluate(() => fetch('audio/narration.json').then((r) => r.json())).catch(() => []);
-  const clip = (Array.isArray(clips) ? clips : []).find((x) => x && typeof x.title === 'string' && x.title.toLowerCase() === title.toLowerCase());
+  // (the clip in the page's language: English here, audio/catastrophes/…, SPEC §11 X5.16)
+  const lang = await pageLang(P);
+  const clip = await narrClipOf(P, s && s.catastrophe, lang);
   if (!check(!!clip, `no clip in audio/narration.json for the dealt catastrophe "${title}"`)) return;
+  check(lang !== 'en' || /^audio\/catastrophes\//.test(clip.src), `the English clip of "${title}" is ${clip.src}, not in audio/catastrophes/`);
   let a0 = await narrAudio(P);
   for (let i = 0; i < 50 && !(a0 && a0.src && !a0.paused && a0.t > 0.05); i++) { await sleep(100); a0 = await narrAudio(P); }
   await sleep(600);
@@ -2056,6 +2815,16 @@ async function reloadTest(P) {
   }
   run.stats.reload = { ms, round: after.round, phase: after.phase };
   log(`${P.name} resumed as ${after.you.id} after ${ms} ms`);
+  // SPEC §11 X5.7: a page switched to Russian is still Russian after a reload (the choice is stored, and the resume
+  // carries it)
+  if (P.name === 'bob' && run.bobRu && !run.bobRu.back) {
+    const l = await langShown(P);
+    check(!!l && l.html === 'ru' && l.sw === 'ru' && after.you.lang === 'ru', `bob: after the reload his page is not Russian any more (${JSON.stringify(l)}, you.lang ${after.you.lang})`);
+    // the resume itself carried the language (no setLang was needed to put the server right)
+    const w = await P.page.evaluate(() => ({ hellos: window.__e2eHellos || [], setLang: window.__e2eSetLang || 0 })).catch(() => null);
+    check(!!w && w.hellos.length >= 1 && w.hellos.every((x) => x.lang === 'ru') && w.setLang === 0, `bob: after the reload the hellos were ${JSON.stringify(w)}; the resume must carry lang "ru" (SPEC §11 X5.1)`);
+    run.bobRu.reload = l && l.html;
+  }
   await sleep(PAUSE);
   if (run.stats.narrator && run.stats.narrator.on === P.name) {
     // the narrator reads a game out only when the page saw it start: a reload mid-game must not replay it

@@ -5,7 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <meta name="theme-color" content="#0b0b09">
-<meta name="description" content="Bunker Online — the table for the post-apocalyptic discussion game. Play over voice; this page deals the cards, runs turns and counts votes.">
+<meta name="description" content="Бункер онлайн — онлайн-стол по мотивам дискуссионной игры «Бункер»: вы говорите по голосовой связи, а страница раздаёт карты, ведёт ходы и считает голоса. Bunker Online — the table for the post-apocalyptic discussion game. Play over voice; this page deals the cards, runs turns and counts votes.">
+<!-- SPEC §11 X5.7: link previews read this page without JavaScript, so the description and the noscript text are in
+     both languages, Russian first; the title stays the brand (app.js localizes it once the page runs) -->
 <title>Bunker Online</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
@@ -13,6 +15,6 @@
 <link rel="modulepreload" href="narrator.js"><!-- narrator hook: the opt-in catastrophe narrator (loaded by app.js) -->
 </head>
 <body>
-<div id="app" class="app"><noscript><p style="padding:24px;font-family:monospace;color:#f5c518">Bunker Online needs JavaScript.</p></noscript></div>
+<div id="app" class="app"><noscript><p style="padding:24px;font-family:monospace;color:#f5c518"><span lang="ru">Бункер онлайн работает только с JavaScript.</span> Bunker Online needs JavaScript.</p></noscript></div>
 </body>
 </html>

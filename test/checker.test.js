@@ -8,7 +8,7 @@ import { EventEmitter } from 'node:events';
 import { createGame, EFFECTS } from '../server/game.js';
 import { mulberry32 } from '../server/rng.js';
 import { AIRLOCK_CARD, REVIVE_CARD } from '../server/content.js';
-import { Checker, x1Deal } from './helpers-sim.js';
+import { Checker, FRAME_BUDGET, x1Deal } from './helpers-sim.js';
 
 function sp(effect) { return { id: effect, title: `T:${effect}`, text: `Card ${effect}`, effect, target: EFFECTS[effect].targets[0] }; }
 const FILL = sp('bunker_add_feature');
@@ -18,7 +18,11 @@ const REV = { ...REVIVE_CARD };
 
 /** An engine game (hand-made deal: specials[seat] = [a, b]) whose every change is broadcast to stub clients. */
 /** `fixedDeal`: the engine's §11 X1 fixed deal (then `specials` only fill the other slots, in deal order). */
-function world(n, specials, { seed = 3, fixedDeal = false, checkDeal = fixedDeal } = {}) {
+/**
+ * §11 X5: `langs(i)` gives member i its language (players first, then the watcher), `neutral` the Checker's mode, and
+ * `ruWatcher` adds a Russian spectator whose stream the leak scan walks too.
+ */
+function world(n, specials, { seed = 3, fixedDeal = false, checkDeal = fixedDeal, langs = null, neutral = false, ruWatcher = false } = {}) {
   let card = 0;
   let k = 0;
   const dealer = {
@@ -31,33 +35,45 @@ function world(n, specials, { seed = 3, fixedDeal = false, checkDeal = fixedDeal
   let t = 1_800_000_000_000;
   const g = createGame({ room: 'ABCD', rng: mulberry32(seed), now: () => (t += 100), minPlayers: 2, dealer, fixedSpecials: fixedDeal });
   const ids = [];
-  for (let i = 0; i < n; i++) ids.push(g.join(`P${i}`).id);
+  for (let i = 0; i < n; i++) ids.push(g.join(`P${i}`, { lang: langs ? langs(i) : 'en' }).id);
   const wid = g.join('Watcher', { spectator: true }).id;
-  const checker = new Checker({ label: 'unit', checkDeal });
+  const rid = ruWatcher ? g.join('Watcher ru', { spectator: true, lang: 'ru' }).id : null;
+  const checker = new Checker({ label: 'unit', checkDeal, neutral });
   const clients = new Map();
   const stub = (id, name) => { const b = new EventEmitter(); Object.assign(b, { id, name, socketGen: 1, left: false }); return b; };
-  for (const id of [...ids, wid]) {
+  for (const id of [...ids, wid, ...(rid ? [rid] : [])]) {
     const b = stub(id, id);
     clients.set(id, b);
-    checker.attach(b, { reference: id === wid });
+    checker.attach(b, { reference: id === wid, leakRef: id === rid });
   }
-  const broadcast = (tamper) => {
+  // every state comes with its size on the wire, as a bot reports it (§11 X5.2: the Checker holds a shortened log
+  // window against the frame budget); `sizeOf(msg, id)` overrides it (undefined: a size the client does not know)
+  const broadcast = (tamper, sizeOf) => {
     for (const [id, b] of clients) {
       let v = g.view(id);
       if (!v) continue;
       if (tamper) v = tamper(structuredClone(v), id);
-      b.emit('message', { t: 'state', ...v });
+      const msg = { t: 'state', ...v };
+      b.emit('message', msg, { bytes: sizeOf ? sizeOf(msg, id) : Buffer.byteLength(JSON.stringify(msg)) });
     }
   };
-  const act = (id, msg, tamper) => {
+  const act = (id, msg, tamper, sizeOf) => {
     const res = g.handle(id, msg);
     assert.deepEqual(res, { ok: true }, `${id} ${JSON.stringify(msg)}: ${res.code} ${res.message}`);
     if (msg.t === 'leave') clients.get(id).left = true;
-    broadcast(tamper);
+    broadcast(tamper, sizeOf);
   };
   const uid = (id, effect) => g.players.find((p) => p.id === id).specials.find((s) => s.effect === effect && !s.used).uid;
+  /** A spectator who joins now (a late recipient: it sees the old log lines for the first time). */
+  const lateWatcher = (name, lang = 'en') => {
+    const id = g.join(name, { spectator: true, lang }).id;
+    const b = stub(id, id);
+    clients.set(id, b);
+    checker.attach(b, {});
+    return id;
+  };
   broadcast();
-  return { g, ids, checker, act, broadcast, uid, host: ids[0] };
+  return { g, ids, checker, act, broadcast, uid, host: ids[0], rid, lateWatcher };
 }
 
 /** Next until pred (votes in these tests are cast explicitly). */
@@ -322,5 +338,195 @@ describe('the Checker on exact engine sequences', () => {
     nextUntil(w, (g) => g.phase === 'final');
     const rep = w.checker.finish();
     assert.ok(rep.violations.some((x) => /\(x1\) deal: 0 Airlock and 0 revive holders at N=6; SPEC §11 X1 wants 2 and 1/.test(x)), rep.violations.join('\n'));
+  });
+});
+
+// ---- SPEC §11 X5: languages ------------------------------------------------------------------------------------------
+
+describe('the Checker with several languages (§11 X5)', () => {
+  const mixed = { langs: (i) => (i % 2 ? 'ru' : 'en'), neutral: true, ruWatcher: true };
+
+  test('a mixed-language table (and a Russian leak stream): clean, airlocks by key, the deal by id', () => {
+    const w = world(8, {}, { ...mixed, fixedDeal: true, seed: 28 });
+    w.act(w.host, { t: 'start' });
+    const air = w.g.players.filter((p) => p.specials.some((c) => c.effect === 'airlock')).map((p) => p.id);
+    nextUntil(w, (g) => g.round === 2 && g.phase === 'discussion');
+    const victim = w.ids.find((id) => !air.includes(id));
+    w.act(air[0], { t: 'special', uid: w.uid(air[0], 'airlock'), targetId: victim });
+    w.act(air[1], { t: 'special', uid: w.uid(air[1], 'airlock'), targetId: victim });
+    w.act(air[2], { t: 'special', uid: w.uid(air[2], 'airlock'), targetId: w.ids.find((id) => id !== victim && !air.includes(id)) });
+    nextUntil(w, (g) => g.phase === 'final');
+    const rep = w.checker.finish();
+    assert.deepEqual(rep.violations, [], rep.violations.join('\n'));
+    assert.deepEqual([rep.games[0].airlockSealed, rep.games[0].airlockJammed, rep.games[0].dealChecked], [1, 1, true]);
+    assert.deepEqual(rep.leakStats.streams.map((x) => x.lang), ['en', 'ru']);
+    assert.ok(rep.leakStats.streams.every((x) => x.slots > 0));
+  });
+
+  test('...but without `neutral`, recipients in two languages differ (the fingerprints hold every word)', () => {
+    const w = world(4, {}, { langs: (i) => (i % 2 ? 'ru' : 'en') });
+    w.act(w.host, { t: 'start' });
+    const rep = w.checker.finish();
+    assert.ok(rep.violations.some((x) => /\(a\) .*diverges from the reference|\(a\) .*was never seen by the reference/.test(x)), rep.violations.join('\n'));
+  });
+
+  test('...and a hidden card in a Russian line (its text, a chip or a param) is caught by the Russian stream only', () => {
+    for (const where of ['text', 'parts', 'params']) {
+      const w = world(6, {}, mixed);
+      w.act(w.host, { t: 'start' });
+      nextUntil(w, (g) => g.round === 2 && g.phase === 'reveal');
+      const owner = w.ids[1]; // Russian
+      const secret = w.g.players.find((p) => p.id === owner).cards.baggage.text;
+      // a lying server: the Russian views of the next line carry the owner's hidden Baggage
+      w.act(w.host, { t: 'next' }, (v) => {
+        if (v.you.lang !== 'ru') return v;
+        const e = { ...v.log.at(-1) };
+        if (where === 'text') {
+          e.text += ` ${secret}`;
+          e.parts = typeof e.parts.at(-1) === 'string' ? [...e.parts.slice(0, -1), `${e.parts.at(-1)} ${secret}`] : [...e.parts, ` ${secret}`];
+        }
+        if (where === 'parts') e.parts = [...e.parts.slice(0, -1), { t: 'card', id: 'x', v: typeof e.parts.at(-1) === 'string' ? e.parts.at(-1) : e.parts.at(-1).v, label: 'x', title: 'x', text: secret }];
+        if (where === 'params') e.params = { ...e.params, hint: secret };
+        v.log = [...v.log.slice(0, -1), e];
+        return v;
+      });
+      const rep = w.checker.finish();
+      assert.ok(rep.violations.some((x) => /\(b\) LEAK: the hidden p\d+\.baggage .* \[p\d+, ru\]/.test(x)), `${where}: ${rep.violations.join('\n')}`);
+      assert.ok(!rep.violations.some((x) => /LEAK.*, en\]/.test(x)), `${where}: the English stream saw a Russian leak`);
+      assert.ok(!rep.violations.some((x) => /§7 schema/.test(x)), `${where}: the tampered line itself is well-formed: ${rep.violations.join('\n')}`);
+    }
+  });
+
+  test('...and a log entry that differs between recipients, or changes after it was sent, is caught', () => {
+    { // neutral: the same entry id with other params for one recipient
+      const w = world(4, {}, mixed);
+      w.act(w.host, { t: 'start' }, (v, id) => (id === w.ids[2] ? { ...v, log: [...v.log.slice(0, -1), { ...v.log.at(-1), params: { ...v.log.at(-1).params, r: 9 } }] } : v));
+      const rep = w.checker.finish();
+      assert.ok(rep.violations.some((x) => /\(a\) .*log entry #\d+ differs between recipients/.test(x)), rep.violations.join('\n'));
+    }
+    { // an old entry rewritten later, in the same language
+      const w = world(4, {}, mixed);
+      w.act(w.host, { t: 'start' });
+      w.act(w.host, { t: 'next' }, (v, id) => (id === w.ids[0] ? { ...v, log: [{ ...v.log[0], text: 'rewritten', parts: ['rewritten'] }, ...v.log.slice(1)] } : v));
+      const rep = w.checker.finish();
+      assert.ok(rep.violations.some((x) => /log entry #1 changed after it was sent/.test(x)), rep.violations.join('\n'));
+    }
+  });
+
+  // §11 X5.2, the report's §14 fallback (server/rooms.js): the oldest lines of a long log may go without parts
+  const bareOf = (e) => ({ id: e.id, ts: e.ts, kind: e.kind, text: e.text, key: e.key, params: e.params });
+  const cutOld = (v) => ({ ...v, log: v.log.map((e, i) => (i < v.log.length - 20 ? bareOf(e) : e)) });
+  test('a late recipient who gets the oldest lines of a long log without parts (the §14 cut) is clean', () => {
+    const w = world(6, {}, { seed: 5 });
+    w.act(w.host, { t: 'start' });
+    nextUntil(w, (g) => g.log.length >= 45);
+    const late = w.lateWatcher('Late');
+    w.act(w.host, { t: 'next' }, (v, id) => (id === late ? cutOld(v) : v));
+    nextUntil(w, (g) => g.phase === 'final');
+    const rep = w.checker.finish();
+    assert.deepEqual(rep.violations, [], rep.violations.join('\n'));
+  });
+
+  test('...but the parts of one line that differ between two recipients of one language are caught', () => {
+    const w = world(6, {}, { seed: 5 });
+    w.act(w.host, { t: 'start' });
+    nextUntil(w, (g) => g.log.length >= 30);
+    w.act(w.host, { t: 'next' }, (v, id) => {
+      if (id !== w.ids[2]) return v;
+      const i = v.log.findLastIndex((e) => e.parts.some((x) => typeof x === 'object' && x.t === 'player'));
+      const e = v.log[i];
+      const parts = e.parts.map((x) => (typeof x === 'object' && x.t === 'player' ? { ...x, id: 'p99' } : x));
+      return { ...v, log: v.log.map((y, j) => (j === i ? { ...e, parts } : y)) };
+    });
+    const rep = w.checker.finish();
+    assert.ok(rep.violations.some((x) => /\(a\) .*the parts of log entry #\d+ differ between recipients/.test(x)), rep.violations.join('\n'));
+  });
+
+  test('...and a line without parts among the newest 20 is a §7 schema violation', () => {
+    const w = world(6, {}, { seed: 5 });
+    w.act(w.host, { t: 'start' });
+    nextUntil(w, (g) => g.log.length >= 30);
+    w.act(w.host, { t: 'next' }, (v, id) => (id === w.ids[1] ? { ...v, log: v.log.map((e, i) => (i === v.log.length - 2 ? bareOf(e) : e)) } : v));
+    const rep = w.checker.finish();
+    assert.ok(rep.violations.some((x) => /has no parts, but an older entry has them/.test(x)), rep.violations.join('\n'));
+  });
+
+  // §11 X5.2, the frame guard (server/rooms.js): a frame at 120 KB leaves the oldest lines off; nowhere else
+  describe('the frame guard: a shortened log window', () => {
+    const played = (o = {}) => {
+      const w = world(6, {}, { seed: 5, ...o });
+      w.act(w.host, { t: 'start' });
+      nextUntil(w, (g) => g.log.length >= 45);
+      return w;
+    };
+    const sized = (who, n) => (msg, id) => (id === who ? n : Buffer.byteLength(JSON.stringify(msg)));
+    const dropOld = (who, k) => (v, id) => (id === who ? { ...v, log: v.log.slice(k) } : v);
+    const run = (fn, o) => { const w = played(o); fn(w); return w.checker.finish().violations; };
+
+    test('the oldest lines left off a frame at the budget (the next one would not fit) are clean, and the window may grow back', () => {
+      const v = run((w) => {
+        w.act(w.host, { t: 'next' }, dropOld(w.ids[1], 3), sized(w.ids[1], FRAME_BUDGET - 20));
+        w.act(w.host, { t: 'next' }, dropOld(w.ids[1], 1), sized(w.ids[1], FRAME_BUDGET));
+        w.act(w.host, { t: 'next' });
+        nextUntil(w, (g) => g.phase === 'final');
+      });
+      assert.deepEqual(v, [], v.join('\n'));
+    });
+
+    test('...but lines left off a frame that had room for them are caught', () => {
+      const v = run((w) => w.act(w.host, { t: 'next' }, dropOld(w.ids[1], 3), sized(w.ids[1], 50_000)));
+      assert.ok(v.some((x) => /the log is lines #\d+-#\d+ \(\d+ of \d+\): line #\d+ \(\d+ bytes\) was left off a 50000-byte frame although it fit/.test(x)), v.join('\n'));
+    });
+
+    test('...and so is a gap in the window, a frame over the budget with more than 20 lines, and a short window of unknown size', () => {
+      const gap = run((w) => w.act(w.host, { t: 'next' }, (s, id) => (id === w.ids[2] ? { ...s, log: s.log.filter((_, i) => i !== 5) } : s)));
+      assert.ok(gap.some((x) => /log ids jump from #\d+ to #\d+ \(a window has no gaps\)/.test(x)), gap.join('\n'));
+      const over = run((w) => w.act(w.host, { t: 'next' }, dropOld(w.ids[1], 3), sized(w.ids[1], FRAME_BUDGET + 100)));
+      assert.ok(over.some((x) => /the frame is 122980 bytes, over 122880, with more than 20 lines left/.test(x)), over.join('\n'));
+      const unknown = run((w) => w.act(w.host, { t: 'next' }, dropOld(w.ids[1], 3), sized(w.ids[1], undefined)));
+      assert.ok(unknown.some((x) => /and the frame's size is unknown/.test(x)), unknown.join('\n'));
+    });
+
+    test('a line never seen in that language: the frame must be near the budget', () => {
+      const near = run((w) => {
+        const ru = w.lateWatcher('Поздний', 'ru');
+        w.act(w.host, { t: 'next' }, dropOld(ru, 3), sized(ru, FRAME_BUDGET - 100));
+      }, { neutral: true });
+      assert.deepEqual(near, [], near.join('\n'));
+      const far = run((w) => {
+        const ru = w.lateWatcher('Поздний', 'ru');
+        w.act(w.host, { t: 'next' }, dropOld(ru, 3), sized(ru, 30_000));
+      }, { neutral: true });
+      assert.ok(far.some((x) => /a 30000-byte frame is not at the budget \(122880\), yet it left lines off/.test(x)), far.join('\n'));
+    });
+
+    test('Play again after a final whose frame left lines off: the lobby\'s longer window keeps the log; a lobby that loses it is caught', () => {
+      // (the reference stream is the one Play again is checked on)
+      const final = (w) => {
+        nextUntil(w, (g) => g.phase === 'final');
+        const ref = w.g.spectators[0].id;
+        w.broadcast(dropOld(ref, 4), sized(ref, FRAME_BUDGET - 10));
+        return ref;
+      };
+      const kept = run((w) => { final(w); w.act(w.host, { t: 'playAgain' }); });
+      assert.deepEqual(kept, [], kept.join('\n'));
+      const lost = run((w) => {
+        const ref = final(w);
+        w.act(w.host, { t: 'playAgain' }, (s, id) => (id === ref ? { ...s, log: s.log.slice(-1) } : s), sized(ref, FRAME_BUDGET - 10));
+      });
+      assert.ok(lost.some((x) => /the log was not kept/.test(x)), lost.join('\n'));
+    });
+  });
+
+  test('...and a Russian reference still catches an airlock that vanishes without its "jammed" line (by key)', () => {
+    const w = world(6, { 0: [AIR, FILL] }, { langs: () => 'ru', neutral: false });
+    // every member Russian but the reference (English): switch it too
+    w.g.setLang(w.g.spectators[0].id, 'ru');
+    w.act(w.host, { t: 'start' });
+    nextUntil(w, (g) => g.round === 2 && g.phase === 'discussion');
+    w.act(w.host, { t: 'special', uid: w.uid(w.host, 'airlock'), targetId: w.ids[4] });
+    w.act(w.host, { t: 'next' }, (v) => ({ ...v, log: v.log.filter((e) => e.key !== 'log.airlockJam') }));
+    const rep = w.checker.finish();
+    assert.ok(rep.violations.some((x) => /closed unsealed without a "jammed" line/.test(x)), rep.violations.join('\n'));
   });
 });

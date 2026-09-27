@@ -1,0 +1,32 @@
+{
+ "asteroid-impact": {
+  "pick": "M1-s11",
+  "was": "M1-s5",
+  "why": "M1-s5 is cut off: generation stopped inside the last word «восемь» (raw render still at -32 dB re peak in its final 10 ms); M1-s11 ends cleanly, passes every gate (with 11 peers), Whisper 0 errors"
+ },
+ "gray-goo": {
+  "pick": "M1-s101",
+  "was": "M1-s42",
+  "why": "Whisper hears «рои наноботов» as «роя на ноботов» (25.7 s) in M1-s42; M1-s101 (same score, 85.6) is heard right"
+ },
+ "silent-spring": {
+  "pick": "F1-s101",
+  "was": "F1-s11",
+  "why": "Whisper hears «опылителей» as «упылителей» (7.0 s) in F1-s11, and its voice starts at 1.02 s; F1-s101 is heard right, voice at 0.66 s"
+ },
+ "spore-rain": {
+  "pick": "F1-s53",
+  "was": "F1-s23",
+  "why": "F1-s23 fails the gates once the peer test has 26 peers (misheard «серой»); F1-s53 (attempt 1, original script) passes them, score 88.8; residual: title «из» heard as «и» by Whisper (function word; 21 of 26 seeds, the [сː] of «из спор» is ~45 ms short)"
+ },
+ "the-gray-fever": {
+  "pick": "F2-s7",
+  "was": "F2-s5",
+  "why": "F2-s5 ends with a tick: a 10 ms sound 20 ms before the end of the render, ~15 dB above the reverb tail (34.9 s); F2-s7 ends cleanly, score 94.0, Whisper only ни→не (same sound)"
+ },
+ "the-yellow-cloud": {
+  "pick": "F2-s77",
+  "was": "F2-s7",
+  "why": "Whisper hears «Бедствие пока местное» as «Бедствия пока местные» (19.4-20.7 s) in F2-s7, which also ends with a tick; of 12 seeds, F2-s77 (attempt 1) is the best one heard right by both Whisper passes (F2-s31 scores 84.4 but the VAD pass still hears the plural), ends cleanly, score 80.9"
+ }
+}

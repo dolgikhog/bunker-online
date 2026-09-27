@@ -3,108 +3,252 @@
   "title": "Asteroid Impact",
   "src": "audio/catastrophes/asteroid-impact.mp3",
   "voice": "bm_george",
-  "durationSec": 39.52
+  "durationSec": 39.52,
+  "id": "asteroid-impact",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/asteroid-impact-cd70f75f.mp3",
+    "voice": "M1",
+    "durationSec": 38.42
+   }
+  }
  },
  {
   "title": "Gamma-Ray Burst",
   "src": "audio/catastrophes/gamma-ray-burst.mp3",
   "voice": "bm_lewis",
-  "durationSec": 39.82
+  "durationSec": 39.82,
+  "id": "gamma-ray-burst",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/gamma-ray-burst-9bbe06da.mp3",
+    "voice": "M1",
+    "durationSec": 38.9
+   }
+  }
  },
  {
   "title": "Gray Goo",
   "src": "audio/catastrophes/gray-goo.mp3",
   "voice": "bm_daniel",
-  "durationSec": 33.93
+  "durationSec": 33.93,
+  "id": "gray-goo",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/gray-goo-351520e2.mp3",
+    "voice": "M1",
+    "durationSec": 38.66
+   }
+  }
  },
  {
   "title": "Machine Uprising",
   "src": "audio/catastrophes/machine-uprising.mp3",
   "voice": "bm_daniel",
-  "durationSec": 37.31
+  "durationSec": 37.31,
+  "id": "machine-uprising",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/machine-uprising-17b8eca4.mp3",
+    "voice": "M1",
+    "durationSec": 39.94
+   }
+  }
  },
  {
   "title": "New Ice Age",
   "src": "audio/catastrophes/new-ice-age.mp3",
   "voice": "bm_lewis",
-  "durationSec": 37.61
+  "durationSec": 37.61,
+  "id": "new-ice-age",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/new-ice-age-e7fad061.mp3",
+    "voice": "M2",
+    "durationSec": 37.14
+   }
+  }
  },
  {
   "title": "Nuclear Winter",
   "src": "audio/catastrophes/nuclear-winter.mp3",
   "voice": "bm_george",
-  "durationSec": 38.29
+  "durationSec": 38.29,
+  "id": "nuclear-winter",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/nuclear-winter-2689d593.mp3",
+    "voice": "M1",
+    "durationSec": 38.66
+   }
+  }
  },
  {
   "title": "Pole Reversal",
   "src": "audio/catastrophes/pole-reversal.mp3",
   "voice": "bm_fable",
-  "durationSec": 35.85
+  "durationSec": 35.85,
+  "id": "pole-reversal",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/pole-reversal-e4cd7371.mp3",
+    "voice": "M2",
+    "durationSec": 37.06
+   }
+  }
  },
  {
   "title": "Scorched Earth",
   "src": "audio/catastrophes/scorched-earth.mp3",
   "voice": "bm_lewis",
-  "durationSec": 39.44
+  "durationSec": 39.44,
+  "id": "scorched-earth",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/scorched-earth-bcfdfd70.mp3",
+    "voice": "M2",
+    "durationSec": 39.38
+   }
+  }
  },
  {
   "title": "Silent Spring",
   "src": "audio/catastrophes/silent-spring.mp3",
   "voice": "bf_isabella",
-  "durationSec": 33.22
+  "durationSec": 33.22,
+  "id": "silent-spring",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/silent-spring-0a4a773b.mp3",
+    "voice": "F1",
+    "durationSec": 36.82
+   }
+  }
  },
  {
   "title": "Solar Superflare",
   "src": "audio/catastrophes/solar-superflare.mp3",
   "voice": "bm_daniel",
-  "durationSec": 33.74
+  "durationSec": 33.74,
+  "id": "solar-superflare",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/solar-superflare-7834cbb9.mp3",
+    "voice": "M1",
+    "durationSec": 39.06
+   }
+  }
  },
  {
   "title": "Spore Rain",
   "src": "audio/catastrophes/spore-rain.mp3",
   "voice": "bf_isabella",
-  "durationSec": 35.15
+  "durationSec": 35.15,
+  "id": "spore-rain",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/spore-rain-32f31a53.mp3",
+    "voice": "F1",
+    "durationSec": 35.94
+   }
+  }
  },
  {
   "title": "Supervolcano",
   "src": "audio/catastrophes/supervolcano.mp3",
   "voice": "bm_george",
-  "durationSec": 39.78
+  "durationSec": 39.78,
+  "id": "supervolcano",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/supervolcano-5e80524d.mp3",
+    "voice": "M1",
+    "durationSec": 39.14
+   }
+  }
  },
  {
   "title": "The Barren Plague",
   "src": "audio/catastrophes/the-barren-plague.mp3",
   "voice": "bf_emma",
-  "durationSec": 39.48
+  "durationSec": 39.48,
+  "id": "the-barren-plague",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/the-barren-plague-98135cc9.mp3",
+    "voice": "F2",
+    "durationSec": 38.1
+   }
+  }
  },
  {
   "title": "The Biting Plague",
   "src": "audio/catastrophes/the-biting-plague.mp3",
   "voice": "bm_fable",
-  "durationSec": 36.78
+  "durationSec": 36.78,
+  "id": "the-biting-plague",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/the-biting-plague-72d0e3a0.mp3",
+    "voice": "M2",
+    "durationSec": 39.22
+   }
+  }
  },
  {
   "title": "The Gray Fever",
   "src": "audio/catastrophes/the-gray-fever.mp3",
   "voice": "bf_emma",
-  "durationSec": 33.35
+  "durationSec": 33.35,
+  "id": "the-gray-fever",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/the-gray-fever-1a402cb7.mp3",
+    "voice": "F2",
+    "durationSec": 37.86
+   }
+  }
  },
  {
   "title": "The Great Flood",
   "src": "audio/catastrophes/the-great-flood.mp3",
   "voice": "bm_fable",
-  "durationSec": 34.85
+  "durationSec": 34.85,
+  "id": "the-great-flood",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/the-great-flood-b4d00bff.mp3",
+    "voice": "M2",
+    "durationSec": 36.02
+   }
+  }
  },
  {
   "title": "The Visitors",
   "src": "audio/catastrophes/the-visitors.mp3",
   "voice": "bf_lily",
-  "durationSec": 34.55
+  "durationSec": 34.55,
+  "id": "the-visitors",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/the-visitors-4c54b944.mp3",
+    "voice": "F1",
+    "durationSec": 34.74
+   }
+  }
  },
  {
   "title": "The Yellow Cloud",
   "src": "audio/catastrophes/the-yellow-cloud.mp3",
   "voice": "bf_alice",
-  "durationSec": 37.1
+  "durationSec": 37.1,
+  "id": "the-yellow-cloud",
+  "clips": {
+   "ru": {
+    "src": "audio/catastrophes-ru/the-yellow-cloud-8d3e579d.mp3",
+    "voice": "F2",
+    "durationSec": 37.3
+   }
+  }
  }
 ]

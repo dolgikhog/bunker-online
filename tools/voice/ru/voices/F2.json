@@ -1,0 +1,16 @@
+{
+ "voice": "F2",
+ "file": "F2.flac",
+ "gender": "female",
+ "instruct": "A woman in her forties with a cool, clear, precise mid-range voice, a native Russian speaker. Cold, clinical and composed, like a public-health official reading an emergency briefing: crisp diction, an even, natural speaking pace, not slow, no emotion in the voice, short pauses between statements. Standard Russian pronunciation, no accent.",
+ "seed": 11,
+ "design_model": [
+  "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+  "5ecdb67327fd37bb2e042aab12ff7391903235d3"
+ ],
+ "design_text": "Серая лихорадка. Лихорадка, от которой сереет кожа, пронеслась по аэропортам быстрее любого карантина. Большинство заражённых умирают за неделю, а выздоровевшие остаются заразными.",
+ "cut_sec": 7.88,
+ "ref_text": "Серая лихорадка. Лихорадка, от которой сереет кожа, пронеслась по аэропортам быстрее любого карантина.",
+ "sha256": "9c73ff5add1290ad3446590fd5d10497687f3d011b5127db9fb30d02f054f5fc",
+ "sha256_of": "the 24 kHz 16-bit mono WAV that the FLAC decodes to (the reference clip as frozen; make_voice_ru.py restores it into work/voices/ and checks this sum)"
+}

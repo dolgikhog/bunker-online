@@ -1,0 +1,17 @@
+{
+ "voice": "F1",
+ "file": "F1.flac",
+ "gender": "female",
+ "instruct": "A soft young woman's voice, a native Russian speaker, quiet and unnervingly polite. Calm and even, at a natural speaking pace, not slow, with an eerie, unsettling undertone and short pauses, like someone telling a ghost story at night. Standard Russian pronunciation, no accent.",
+ "seed": 23,
+ "design_model": [
+  "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+  "5ecdb67327fd37bb2e042aab12ff7391903235d3"
+ ],
+ "design_text": "Гости. Над каждой столицей появились серебристые корабли... и вежливо попросили всех разойтись по домам. Те, кто остался на улице, просто исчезли. Корабли до сих пор висят в небе. И, похоже... чего-то ждут. Выжившие: от двадцати пяти до сорока процентов. И все прячутся. На поверхности: всё цело, но безлюдно. По ночам — странные огни. Угрозы: лучи, которые забирают людей... и то, что нужно гостям. Поверхность станет безопасной через год... или через четыре.",
+ "cut_sec": 9.5,
+ "ref_text": "Гости. Над каждой столицей появились серебристые корабли... и вежливо попросили всех разойтись по домам.",
+ "sha256": "56d7b9e463f5f75b916ad006472845d6b2be1856892445608ee18e5394ea962b",
+ "note": "frozen in the sampling run by cut_refs.py (refs/qwendesign_f.wav)",
+ "sha256_of": "the 24 kHz 16-bit mono WAV that the FLAC decodes to (the reference clip as frozen; make_voice_ru.py restores it into work/voices/ and checks this sum)"
+}

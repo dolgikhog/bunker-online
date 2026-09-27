@@ -1306,6 +1306,353 @@ for r in 1..7:
     - the e2e RU pass: an atomic switch that changes only that page, the game goes on, the choice persists and the
       narrator clip is not cut off; a RU first visit with no Latin and the bar flush at 360×640.
 
+### X5.9–X5.14: Russian language, as built (2026-09-26, i18n-qa)
+
+This folds the "Spec deltas" of every report of the X5 build: `i18n-server-A1/A2`, `i18n-content-B1/B2`,
+`i18n-client-C1/C2`, `i18n-integration`, `ru-content-*`, `ru-rules-R1/R2`, `ru-client`, the i1/i2 reviews,
+`fix-*-i1/i2` and `gate-i18n-i1/i2`. Where it differs from X5.1–X5.8, it wins. It replaces these statements there:
+- X5.2's baseline "13.1 ms and 41.7 KB", and "120 KB" read as JSON characters (X5.10);
+- X5.3's "`parts` on every log entry" (X5.10);
+- X5.6's "a form with a slash is a failure" (X5.12 allows five whole-noun pairs);
+- X5.7's "at most 1.5 s" and the leading-edge throttle (X5.13).
+
+- **X5.9 Protocol (X5.1).**
+  - A hello's valid `lang` applies before the hello is handled, even when the hello then fails.
+  - A bad `lang` (also `null` on `setLang`) is `bad_request` "Invalid field".
+  - A `resume` without `lang` copies the member's language onto the socket.
+  - Clients send every action and every `setLang` right behind a `{t:'ping'}` on the same socket, as a liveness probe.
+    There is no new message type.
+  - A state is one WebSocket text message, sent in two fragments: the recipient's own head, then `,"log":[…]}`. The
+    log's bytes are encoded once per language and log version and shared by every recipient of that language
+    (`rooms.stateFrame`).
+- **X5.10 The state's log and the size budget (X5.2, X5.3).**
+  - **Budget.** Every `state` message is at most 122,880 bytes of UTF-8 (`rooms.js` `FRAME_BUDGET`), for any names up to
+    NAME_MAX, in either language. `tools/bench-broadcast.js` measures it at 16 players + 50 spectators with real
+    15–20-letter names:
+    - pre-X5: at most 70 KB;
+    - EN: at most 106 KB;
+    - RU: at the budget on special-heavy seeds.
+
+    CPU per broadcast is below pre-X5: 12–18 ms against 16–20 ms, measured on the same machine in the same run. The
+    thinnest margin is the all-RU final, at 3–6%.
+  - **Log window.** The state's `log` is the newest lines of the game's log: at most 200, with contiguous ids, ending at
+    the newest line.
+  - **Cuts,** in this order and only when needed:
+    1. `parts` come off the oldest entries while the log's JSON would pass 84 KB (`LOG_WIRE_BUDGET`), but never off
+       the newest 20 (`PARTS_MIN`). Such an entry is `{id, ts, kind, text, key, params}`, and clients render it from
+       `text`.
+    2. If the head plus the log would still pass the budget, the parts cut is redone against what the head leaves.
+    3. Then the oldest lines are left off, as few as needed and never the newest 20. Only long-name Russian finals with
+       many spectators get here, and they lose about one round of lines.
+
+    Every recipient whose frame fits gets the same log bytes. This replaces report §14's "parts only on the newest 60
+    entries".
+  - `key` and `params` are always sent. `text` is always sent today. A client rebuilds a missing `text` from `parts`,
+    so a later server may drop it.
+  - **Wire params:**
+    - a special becomes its `ref`, or else its own id;
+    - a catastrophe becomes its content id (`null` for a stand-in or a literal);
+    - a bunker name becomes `null`;
+    - card and feature tokens are left out.
+
+    `cardtext` (in `log.special`) and `airlock` (the Airlock card part, in every message) are derived when rendering.
+    They are never on the wire.
+- **X5.11 Engine, messages, content and the checker (X5.4, X5.5).**
+  - **Engine.**
+    - `fail(code, text)` with a text that is not a key is a keyless failure, sent as is. `_log(kind, text)` with such a
+      text is kept as `log.dev.text`. Both exist for `server/dev.js`.
+    - A special without a title is `special.untitled` in every language.
+    - `game.js` exports `LEGACY_LOG_KEY` and `LANGS`.
+  - **Messages** added to report §4/§5:
+    - `rp.bare`, `rp.otBare`, `fmt.quote`, `word.airlock`, `word.nobody`, `special.untitled` and `err.devOff`;
+    - `log.dev.*` (8 lines plus `log.dev.text`) and `err.dev.*` (17).
+
+    `mods.used` is a template over the nested `mod.*` messages plus `n`. In server messages an empty list prints
+    `word.nobody` («никого»), and a `null` optional nested message prints nothing.
+  - **Params.** §7.1 adds `x2`, `on` and `seated` (boolean), `seed` (raw text), and the derived `airlock` and `cardtext`.
+    `server/i18n/index.js` exports `SCHEMA` (param types) and `renderValue`. A server function value gets `f`: core
+    `helpers()` plus `t`, `k`, `join` and `list`.
+  - **Content.**
+    - There are 13 files per language: labels, mods, professions, health, hobbies, phobias, skills, traits, baggage,
+      biology, catastrophes, bunker and specials.
+    - Content templates use content-local param names (`n`, `i`, `base`, `mod`, `nick`, `letter`, `months`, `range`).
+      §7.1 governs only messages and client keys.
+    - `student` takes `{n}` (the year) and `{i}` (its index, 0–4).
+    - An option on an `{n:a-b}` param is indexed by the number itself and has hi + 1 choices, in any content file.
+    - `content.js` also exports:
+      - `FALLBACK_SPECIAL`;
+      - the fallback tokens `FALLBACK_FEATURE_TOK`, `FALLBACK_CATASTROPHE_TOK`, `FALLBACK_BUNKER_NAME_TOK` and
+        `FALLBACK_BUNKER_TOK`;
+      - `litTok` and `bunkerWithFeature`.
+    - Tokens are frozen, so a new feature replaces the bunker token.
+    - A Russian function value that throws falls back to the English render of the whole token.
+  - **Formatter** (`public/i18n/core.js`).
+    - It adds `helpers(lang, hook)`, `placeholders` and `parseTemplate`.
+    - Selectors read `Number(value)`.
+    - An option index out of range renders `''` and warns once.
+    - `@cap` capitalises the first letter.
+    - In `ru`, a negative number is written with U+2212.
+  - **Checker** (`tools/i18n-check.js`).
+    - Dev-only keys (`log.dev.*`, `err.dev.*`) are exempt from the missing, Latin and param-name rules.
+    - `"` and `”` in Russian are errors.
+    - Titles carry no quotes and no final period.
+    - Every label entry needs all seven forms.
+    - `word.airlock` must equal the Airlock's title in lower case, and `fmt.quote` must be `«{title}»`.
+    - A printed `yrs` param carries its own plural word, so it is exempt from the plural lint.
+  - **The gender review list** is `test/fixtures/i18n-gender-review.txt`, tracked (`--review <file>` points elsewhere;
+    `--out <dir>`, default `.scratch/i18n-qa/`, now only takes the sample sheet `ru-sample.txt`).
+    - Each line is `mark<TAB>area<TAB>file<TAB>key<TAB>words<TAB>text`. The mark is `?`, `ok` or `fix`, and it is kept
+      across runs. A line is known by file, key and text, with every run of spaces (no-break ones too) read as one
+      space, so a changed text comes back as `?`.
+    - `npm run i18n:check` rewrites the file (only when it changes). `--gate` needs every line `ok`, and so does
+      `npm test` (`test/i18n-catalog.test.js`), which never writes the file. A fresh clone passes `--gate`.
+    - It covers messages and client strings that name a player or «ты», plus cards and specials. Catastrophe narratives
+      and bunker features are left out.
+- **X5.12 Russian as written (X5.6).** The glossary in report §10 still applies, with these changes.
+  - **Vote words.**
+    - A ballot is «тур»: a vote step («голосование») has one or more туров. The log reads «голосование, тур 1 из 2», and
+      the bar «Тур 1 из 2 · проголосовали: 3/6». «Этап голосования» is not used.
+    - A count of ejections is «изгнаний: N» everywhere: the header, the stakes and the track. «Вылет» and «вылетает»
+      are kept for the Airlock and for the result tag «Вылет».
+  - **Fixed words.**
+    - The category labels are fixed in `server/content/ru/labels.js`, with seven forms each. The skill label is
+      «Навык».
+    - The special titles are fixed in `ru/specials.js` (checkpoint R1). The fixed cards are «Шлюз» and «Вернулся из
+      леса», and Extra Bunk is «Раскладушка».
+    - Card-state stamps and "hidden" sub-labels are neuter status words: «Открыто», «Скрыто», «Не раскрыто», «скрыто у
+      3 из 8».
+    - The kick notice is «Тебя удалили из комнаты {code}.». The log line stays «Ведущий удаляет из игры: {p}».
+  - **Gender-free rewrites:**
+    - `log.eject`: «Голосов нет — решает судьба.»;
+    - `log.airlockJam`: «…заклинило — задраить его было некому.»;
+    - `err.ownAirlock`: «…задраить его может только другой игрок»;
+    - `mods.used`: «Вместе с голосованием сгорает/сгорают: …».
+
+    `err.tooFewPlayers` takes the genitive after «не меньше».
+  - **Lists and questions.**
+    - `log.tie`, `log.revote` and `log.dev.forceTie` use `{ids@and}` in RU.
+    - A question never holds an `@and` list: the names go outside it («Переголосование: {list@and}. Кто останется
+      снаружи?»).
+    - After a colon the text goes on in lower case. A full sentence is joined with a period instead («Основной тур.
+      {text}»).
+  - **Slash pairs.** Only whole nouns on a card, and exactly five professions: nurse, midwife, tailor, actor and opera
+    singer («Акушерка / акушер»). Any other slash or bracket form fails.
+  - **Biology.** Adopted is «из приёмной семьи». `student` is an ordinal word («первый курс» … «пятый курс»). `self`,
+    `revoked` and `fake` read «самоучка, N лет опыта», «лицензию отозвали после N лет практики» and «липовый диплом, N
+    лет практики». Height words agree with the card's own sex.
+  - **Bunker.**
+    - The forecast is a single-unit range after «через»: «через 2–6 лет», «через 1,5–5 лет», «через 6–24 месяца».
+    - The lines are «Сидеть под землёй {months}» and «Еды на {months}». `months()` gives «1,5 года» or «1 год 3
+      месяца».
+    - The object letters are 'АБЛДЕКМНПРСТВХЖ', index-aligned with the English ones. Z is «Ж», not «З», which reads as
+      the digit 3 («412-З»): a letter that passes for a digit is not used.
+    - Units outside §7's invariable list (м, л, шт.) are spelled out with a plural selector.
+  - **Brand and typography.**
+    - The brand in running text and `app.title` is «Бункер онлайн» (sentence case).
+    - Other brand names are Cyrillic (Дискорд, Телеграм, Гитхаб). "Press Ctrl+C" becomes «Скопируй вручную».
+    - A number and its unit in a short UI hint are joined by a no-break space («60 с»).
+    - The room-code hint says the code is 4 Latin letters and that Russian look-alikes work too.
+  - **The gender review list** had 8 lines. QA marked all of them ok: each word agrees with a noun, not a player, and
+    «Вернулся из леса» is the owner's title, only ever a quoted card name. The merge of the sound seat (PR #2) added a
+    9th, `narr.tableOther`, marked ok: its «англ.» is the abbreviation in «Слушать (англ.)», not a verb.
+  - **No-break characters** (after QA, written as `\u00a0`, `\u2060`, `\u2011` escapes in the sources): a printed
+    number and the word it counts (`{n}\u00a0{n|игрок|…}`, months(), range(), the Biology age, «60 с», «12 кг»); a
+    noun and the number after it («раунд 7», «тур 1 из 2», «ход 3 из 8», «с раунда 2»); a word joiner after the en
+    dash of a range («4–16 игроков» on the landing footer, in both languages; range(), `est.range`); and a no-break
+    hyphen in «Объект 412-Ж».
+- **X5.13 Client (X5.7).**
+  - **Where the switch sits.**
+    - On the landing page it has its own row above the brand.
+    - In a lobby it is in the first header row, before Rules.
+    - On phones in play it is in the second header row, after the jump chips and before the narrator, and the timer label
+      sits above the clock.
+    - On tablets in play (640–1179 px) it is at the jump row's right end, left of the narrator.
+    - At 1180 px and wider it is before Rules.
+    - Below 640 px the pill shows the language a tap switches to. From 640 px it shows `EN | RU` with the current one
+      lit.
+  - **A switch.**
+    - The choice is stored at once.
+    - `setLang` goes out on the trailing edge, 250 ms after the last tap. Nothing is sent when the choice ends on the
+      language that the page and the server already have.
+    - With a live socket in a room, the page keeps its language until the answering state. That `setLang` rides behind
+      a liveness probe (`PING_WAIT_MS` = 8 s). A dead socket reconnects with the banner up, and the switch then commits
+      offline.
+    - A cap commits anyway: 10 s plus the slow-link wait.
+    - The answer for a language the user has left is skipped until the latest `setLang` is answered, within the cap.
+    - The rule is now: atomic while the socket is open; mixed only offline, and then with the banner up.
+  - **Reconnects.**
+    - After `joined`, if the state on screen is in another language than the page, the banner stays up until the new
+      socket's first state.
+    - A switch made while a resume's hello is in flight waits like an online switch, and `joined` sends its `setLang` at
+      once.
+    - A hello resets the reconcile's 5 s guard.
+  - **Slow links.**
+    - The waits for an answer grow by 1.5 × the last state's size ÷ the measured download rate.
+    - While a state is known to be on its way, the waits also allow for it at 4 KB/s.
+    - After a probe runs out, the waits double (up to ×4) until a state arrives. The extra wait is capped at 30 s.
+    - A live socket is never called dead while a state downloads at 4 KB/s or more.
+  - **Accessibility.**
+    - The render that commits a language keeps the log and the bar status at `aria-live="off"` for 1 s.
+    - While a switch waits, the switch is named in the chosen language's own words (`lang.switch`), with `lang=` and
+      `aria-busy="true"`.
+  - **Where the language comes from.**
+    - `?lang=` comes first. It is applied, stored and then removed from the URL; a mock page keeps it and stores
+      nothing.
+    - Then `bunker.lang`, which goes through `pkey()`, so a profile tab keeps `bunker.lang@<id>`.
+    - Then `navigator.language`.
+
+    A `storage` event from another tab of the same profile switches this tab too.
+  - **Modules and keys.**
+    - `public/i18n/index.js` has `initLang({memory, storageKey})`, `setLang(l, {store})`, `saveLang`, `langStorageKey`,
+      `pickLang`, `has` and `latinCode` (the look-alike map).
+    - There are 848 client keys (851 after the merge of PR #2's `narr.table*`). `public/strings.js` is gone: its strings
+      are now `landing.profile*`, `fb.*` and `narr.table*`.
+    - Keys beyond the report's inventory include `track.otShort`, `hdr.timeUp`, `lang.switch`, `toast.whyOffline`,
+      `toast.whyHandover` and `final.causeLine`.
+    - The kicked notice uses `landing.kicked` and `landing.kickedPlain`. The server's `reason` is never shown.
+    - `style.css` holds no user-visible text, and the RU e2e scan covers CSS-generated text.
+  - **Log lines and the narrator.**
+    - A keyed log entry renders from `parts`, with player names as `span.lt-name[data-player-id]`. The readers are in
+      `public/loglines.js`.
+    - The narrator finds its clip by `catastrophe.id` (the manifest `src` basename). It knows the game by room plus
+      catastrophe id, and every title it shows comes from the state.
+    - `index.html` has a bilingual description and noscript, Russian first. `<title>` stays "Bunker Online".
+  - **Layout.**
+    - `:lang(ru)` sets `--display` to the system font, heavier and tighter. RU headers are tightened up to 799 px.
+    - On a phone, a phase name that would push Rules or ⋯ onto a row of their own shrinks (down to 10 px), then
+      ellipsizes.
+    - From 1180 px the one-row header's cells do not shrink, and the "next vote" cell ellipsizes first.
+    - In play from 1440 to 1599 px, the header brand shows only its trefoil.
+    - The time's-up tag `hdr.timeUp` is a DOM span, so it is part of `innerText` and the accessible text. On tablets
+      and desktops it sits beside the clock, whole, whatever the name's length. On phones only the red clock shows.
+  - **Layout in RU.**
+    - The matrix status column is wider, and chip titles take up to 2 lines.
+    - Host buttons are 11 px on phones.
+    - Special titles wrap in the picker's head (× stays on the sheet at 360 px) and on the hand's card, and the card's
+      state label takes the next line when needed.
+    - Status chips hyphenate.
+  - **A known limit.** After a reconnect whose first state is in another language, a card swapped while the page was
+    offline is not highlighted. Only hidden → shown counts. A fix needs language-neutral card ids in the StateView.
+  - **The e2e as built.**
+    - EN forcing covers `?profile=` tabs too.
+    - Bob's RU stretch runs from the start of game 1 through his first vote. It is sampled every 25 ms and after every
+      render.
+    - It also covers a reload, a throttled switch there and back, the reconnect cases "waiting" and "hello", and a
+      throttled slow Next.
+    - Dana is checked at four points, and every hello's `lang` is checked.
+- **X5.14 Build and acceptance (X5.8).**
+  - **`server/dev.js`** belonged to `i18n-server` for this build. It logs `log.dev.*` and fails with `err.dev.*` keys and
+    language-neutral params, so every member reads dev lines and errors in their own language. `log.dev.text` is only
+    for a caller that passes ready text. The RU dev keys are translated and keep the literal `[dev]` and the op names.
+  - **Gate 5a.** `tools/bench-broadcast.js` exits 0 when both hold:
+    - CPU is at most pre-X5, at the full-log point and at the final;
+    - every state is at most 120 KB, in the lockstep game and in the size sweep (seeds 4, 11, 13, 3 and 7; ru and en
+      tables).
+
+    It uses real names by default and reports both characters and UTF-8 bytes.
+  - **Checker (tests).**
+    - A `neutral` mode, and `attach(bot, {leakRef})`.
+    - Log entries are validated once per client, and are immutable afterwards.
+    - `runTable` takes `langs`, `watcherLang`, `toggleLang` and `neutral`.
+  - **botlib and bots.** botlib has `setLang`, `toggleLang`, `BOT_NAMES_RU`, `realNames`, `AIR_KEYS` and
+    `LANGS`/`normLang`. `bots.js` has `--lang ru`, which also gives Cyrillic names.
+  - **Server.** A server whose stdout/stderr reader has gone drops its log lines instead of failing.
+  - **Timing.** `npm test` takes about 2 min, because the simulations parse states 2.5× bigger.
+  - **Sign-off** (2026-09-26, i18n-qa). Every item of report §13 is met on the tree the i2 gate hashed; the evidence
+    is in `reports/i18n-qa.md`. Owner questions left open (report §14):
+    - `translate="no"` on the app root;
+    - a language hint in invite links;
+    - the «изгнан» / «остался в лесу» deviation;
+    - the display font on a real iPhone.
+
+### X5.15: WebSocket compression (permessage-deflate), measured and left off (2026-09-26, ws-compression; detail in reports/ws-compression.md)
+
+- **The question.** A Russian state at 16 players + 50 spectators is up to 120 KB (X5.10), and every recipient gets one
+  after every change: up to 7.9 MB per broadcast, and about 29 MB per member over a game. The production VPS has one
+  vCPU. Browsers offer permessage-deflate (RFC 7692) on every WebSocket, and Caddy passes the offer through (not checked
+  on the box).
+- **Measured** with `taskset -c 0 node tools/bench-broadcast.js` (one core; the all-RU and the mixed table; the
+  full-log point and the final):
+  - **bytes:** 5.1–5.5× fewer. A RU final goes from 119.7 KB to 23 KB per recipient, and a RU player's whole game from
+    29 MB to 5.5 MB;
+  - **CPU per broadcast:** 51–65 ms against pre-X5's 15–17 ms, so 3.2–3.9×. The X5.2 budget is at most 1×. zlib level
+    1 is already the fastest, and no setting came near the budget (report, tuning table);
+  - **memory:** the deflater takes about 180–200 KB of RSS per socket, from the first message it compresses; the
+    socket and its inflater take about 20 KB more than a plain socket.
+- **Decision: off by default** (`server/index.js` `WS_DEFLATE_DEFAULT = false`). `BUNKER_WS_DEFLATE=1` turns it on
+  with `WS_DEFLATE`, and `=0` turns it off. With it on, the bench gates the deflate CPU too, so the owner can trade CPU
+  for bytes only knowingly.
+- **`WS_DEFLATE`:**
+  - zlib level 1 and memLevel 8;
+  - `server_no_context_takeover`: every message is compressed on its own. The `joined` token never shares a window
+    with other people's names, and messages under 1 KB (`threshold`) are sent as they are;
+  - no window-bits parameters, so every browser offer is accepted as made;
+  - ws's `concurrencyLimit` of 10.
+
+  `MAX_PAYLOAD` still bounds a client message after inflating: such a message closes the socket with 1009.
+- **Tools and tests.**
+  - The bench also times the X5 broadcast over deflate sockets, in a loop of its own. It reports the bytes on the wire
+    for every kind, a member's whole game compressed, and the memory per socket. Options: `--deflate off` and
+    `--z-*`.
+  - `test/ws-deflate.test.js` covers the switch, the wire (RSV1, a fresh inflater for each message, the 1009), and a
+    whole game over negotiated sockets.
+  - The e2e records every page's `Sec-WebSocket-Extensions` and checks it against the spawned server's setting. Run
+    it with `BUNKER_WS_DEFLATE=1` to play the whole run over deflate in Chrome.
+- **Not built.** Compressing the shared log once per language and only the head per recipient. The prototype spent
+  12–17 ms of zlib per broadcast instead of 34–38 ms, which is still about 2× pre-X5 with the sockets. It would also
+  need ws internals to send a frame that is already compressed. A smaller state (deltas) is the real lever on bytes.
+
+### X5.16: Russian narration (2026-09-27, voice-ru-integrator; detail in reports/voice-ru-integration.md)
+
+It replaces X5's "Narration clips stay English-only", X5.7's "in `ru`, says that it is English" and X5.13's "the
+manifest `src` basename".
+- **Clips.** All 18 catastrophes also have a Russian clip, made by `tools/voice/ru/make_voice_ru.py` (Qwen3-TTS,
+  four invented voices; `tools/voice/README.md`). They live in `public/audio/catastrophes-ru/<id>-<sha1[:8]>.mp3`:
+  128 kbps mono MP3 at -12 LUFS, 34–40 s. The name always carries the content hash, since `/audio/*` is cached for
+  7 days.
+- **`public/audio/narration.json`** is still an array sorted by title, one entry per catastrophe:
+  `{title, src, voice, durationSec, id, clips: {ru: {src, voice, durationSec}}}`.
+  - `title`, `src`, `voice` and `durationSec` are unchanged: the English clip, and the fallback for every language.
+    A client from before X5.16 reads the file as before.
+  - `id` is the catastrophe's content id. The narrator matches the entry by it, and, for an entry without one, by
+    the English `src` basename. An English clip renamed `<id>-<hash8>.mp3` by a rebuild is no longer lost.
+  - `clips.<lang>` is the same catastrophe in another language. `make_voice.py` (English) keeps it through a
+    rebuild; `make_voice_ru.py publish` writes `clips.ru`.
+- **Narrator.**
+  - The clip that plays is the one in the language on screen when it starts, whether by the game start's autoplay,
+    ▶ Listen or the autoplay prompt. A language with no clip of its own plays the English one.
+  - A language switch starts nothing and stops nothing: a clip that is playing goes on, and the next ▶ Listen plays
+    the new language. All other behaviour is unchanged: once per game start, no autoplay after a reload, the /dev
+    sound seat, byte ranges, the iOS volume note.
+  - The Russian words no longer say "English" (`narr.listen` «Слушать», `narr.lead`, `narr.hearTitle`,
+    `narr.listenAria`, `narr.pillSub`, `narr.menuOnTitle`, and the hints that quote the button). Only when the
+    English clip is the fallback do the new `narr.listenEn` «Слушать (англ.)», `narr.hearTitleEn`,
+    `narr.listenAriaEn` and `narr.pillSubEn` say so, and the popover adds `narr.onlyEn`. The button carries
+    `data-lang`: the language of the clip it plays. Without «англ.», `narr.tableOther` drops off the gender review
+    list (X5.12).
+- **Pipeline.** `tools/voice/ru/` holds everything needed to make the clips again:
+  - the script;
+  - the 18 ear scripts and the RU card fingerprints they were written from;
+  - the four frozen reference voices (lossless FLAC of the WAV the clones were made from, checked by sha256), with
+    their design prompts and seeds;
+  - the verifier's pinned candidates (`picks.json`) and a record of each published clip's voice and seed
+    (`manifest.json`).
+
+  `tools/voice/fx.sh` takes `MP3_KBPS`, or `--kbps`. The default is 96, and the English output is byte-identical.
+  `tools/voice/requirements-ru.txt` pins the Python set. Models, venvs and caches are git-ignored.
+- **Tests.**
+  - `test/narration.test.js`: every catastrophe has an English and a Russian clip, and every file exists. Each clip's
+    MP3 frames give its length, which is 20–42 s and matches `durationSec`. Each clip has the bitrate of its language,
+    and each RU name is its content hash. No file in either directory is unreferenced. Every clip answers
+    `Range: bytes=0-1` with 206.
+  - `tools/e2e.js`:
+    - the English start plays `audio/catastrophes/…`;
+    - after bob's switch to Russian, the English clip goes on, and ▶ Listen then plays `audio/catastrophes-ru/…`,
+      with `currentTime` advancing;
+    - the switch back plays nothing by itself;
+    - Dana, whose browser is Russian, turns the narrator on in the lobby, and at game 3's start her page plays her
+      catastrophe's `audio/catastrophes-ru/…` clip by itself, under Chrome's real autoplay policy.
+
 ### X9: local test build, profiles and a dev test table with shortcuts (2026-09-26, owner request)
 
 The owner tests alone in one browser. Every incognito window shares one storage, so every tab became the same player.
@@ -1348,6 +1695,106 @@ The owner tests alone in one browser. Every incognito window shares one storage,
 - `?profile` isolation in the e2e: two tabs in one browser context are two players.
 - `/dev` and `/devinfo` return 404 without dev mode, and dev ops are rejected.
 - A puppeteer smoke of the test table: 4 seats, a new game, bots, start, `giveSpecial airlock` to P1 and P2, both play it on P3, P3 is ejected, then `skipToVote`, `forceTie`, and the god view. Then the sound, under Chrome's real autoplay policy: one seat reads the catastrophe at Start, and ▶ Listen and the switch move it.
+
+### X9.7: the test build as built (2026-09-26; devtools-server D1–D15, devtools-client, gate-devtools, and the X5 build; folded by i18n-qa)
+
+- **D1 codes.**
+  - Without dev mode, every `{t:'dev'}` gets `not_allowed` before anything else is read, joined or not ("Dev mode is off:
+    test shortcuts are not available on this server", `err.devOff`).
+  - In dev mode the codes follow §7:
+    - `bad_request` for an unknown op, a missing or mistyped field, `count` outside 1–15, `specials` outside 0..1, an
+      `effect` that is not one of the 16 §5/X1 effects (or is `eject`), `ids` not 2–16 strings, `on` not boolean, or a
+      bad seed;
+    - then `not_in_room`, `room_full` (addBots), `wrong_phase` and `not_allowed`.
+  - Extra keys are ignored.
+  - Any member may send an op: a player of any status who has not left, or a spectator. A successful op gets no reply of
+    its own, only the broadcast `state`.
+- **D2 seed.**
+  - `create.seed` is a string of 1–64 characters after trimming (a blank one means no seed) or a safe integer. `"42"`
+    and `42` deal alike.
+  - The room's rng is `mulberry32(seedFromString(seed))`. The same seed and the same seats give the same deal, down to
+    the reveal order. The room code does not come from it.
+  - The room logs `log.dev.seed` right after the creator's join lines. Without dev mode `seed` is never read.
+- **D3 log lines.** Kind `info`, as `log.dev.*` keys, so each member reads them in their own language. The dev line
+  comes before the lines the op causes.
+- **D4 giveSpecial.**
+  - Allowed in reveal, discussion, vote and defense.
+  - The target is any seated player who has not left, an ejected one included. `eject` is `not_allowed`.
+  - The card is the content's card of that effect (the fixed X1 cards for `airlock` and `revive`). It replaces, in order
+    of preference: an unused card of the same effect, else an unused card dev mode did not give, else the oldest
+    dev-given unused card.
+  - The player is then topped up to 2 unused cards. Used cards stay in the hand, so in dev mode `me.specials` holds 2–9
+    cards. `specialsLeft` stays at most 2.
+  - `minRound` still applies: an Airlock plays from round 2.
+- **D5 autoReveal.** Reveal phase only. Each remaining speaker gets what the host's Next does: an auto-reveal if needed,
+  then the turn moves on. It ends in the discussion.
+- **D6 skipToVote.**
+  - From reveal, discussion or defense, the game runs on as the host's Next would with nobody acting, until a ballot is
+    open.
+  - Open airlocks jam as usual.
+  - A vote step skipped by Cancel vote is logged and does not count.
+  - `vote`, the lobby and the final are `wrong_phase`.
+  - It stops in the final only when the ballot it reached closed at once and that ejection ended the game.
+- **D7 forceTie.**
+  - Only in an open main ballot. With no ballot it is `wrong_phase`; in a revote it is `not_allowed`.
+  - Every id must be a candidate of that ballot. An unknown, not-alive, immune or repeated id is `not_allowed`.
+  - The votes are rewritten: each tied player gets the same W votes, the largest W the voters can make. Everyone else
+    gets 0, nobody votes for themself, ×2 counts twice, and unused voters abstain.
+  - If no W ≥ 1 works, the answer is `not_allowed` and nothing changes.
+  - The ballot then closes through the normal tally into the defense.
+- **D8 god.**
+  - It is per socket, and lasts until `on:false` or the socket closes. A resume on a new socket has no god view.
+    Spectators may use it.
+  - `god` is the last key of the state. It lists every seated player with cards, left players too, and is `{}` in the
+    lobby.
+  - The toggle is logged and broadcast.
+  - Its texts are the engine's English fields, and the /dev god table is English, column names included. That fits
+    X9.3's English-only table.
+- **D9 fastTimers.** Allowed in any phase. It also cuts a running timer to at most 5 s from now.
+- **D10 addBots.**
+  - In the lobby it adds as many bots as there are free seats (`room_full` when none is free). In any other phase they
+    join as spectators, up to 50.
+  - `specials` (0..1, default 0) is each bot's chance per round to play a card. By default dev bots only reveal, end
+    turns and vote at random.
+  - Bots act after 0.5 s and end their turn after 1 s. A bot host presses Next in a discussion after 10 s.
+  - The bots run in process, over a loopback: no network, no per-IP cap and no rate limit, and they do not count in
+    `/stats`.
+  - They leave when no human member is left, and the room is deleted. They also leave after 3 min with no human
+    connected.
+- **D11 routes.**
+  - `/dev` and `/dev/` answer `public/dev.html`.
+  - Without dev mode, `/dev`, `/devinfo`, `/dev/*`, `/devinfo/*` and every `public/dev.*` file get the static 404, byte
+    for byte. The first path segment is compared lower-cased, after decoding.
+  - `X-Frame-Options` is SAMEORIGIN in dev mode and DENY otherwise.
+- **D12.** Dev mode lifts the V1 per-network room cap. The 200-room cap stays.
+- **D13.** `BUNKER_DEV=1` with `BUNKER_TRUST_PROXY=1` or `NODE_ENV=production` refuses to start (`DEV_REFUSED`, exit 1).
+  In-process test servers pass `dev: false`, so `npm test` passes with `BUNKER_DEV` exported.
+- **D14.** The banner goes to stdout after the listening lines. The stderr diagnostics line ends with `; DEV MODE (test
+  shortcuts at /dev)`.
+- **D15.** The /dev page is English only. Dev lines and errors are keys (X5.14).
+- **Client.**
+  - **Seat 1.** Before the first game, seat 1's frame is `/?profile=p1&name=P1`. It creates the room through the bridge
+    (`create {name:'P1', seed}`). After that, every seat uses the X9.3 autojoin URL.
+  - **autojoin** resumes when this browser already holds that profile's seat. The `name` param is read only by autojoin,
+    in dev mode.
+  - **`/devinfo`** is asked for only inside a frame or with `autojoin=1`.
+  - **The target dropdown** is fed by the host seat's StateView as the bridge posts it. The god view shows on that
+    seat's socket.
+  - **Storage keys** are `<key>@<profile>`, and every key goes through `pkey()`, `bunker.lang` included.
+  - **The /dev page.**
+    - The god view is a players × categories table docked under the seats, with a fold (`dev-god-fold`).
+    - The controls column hides (`dev-ctl-toggle`), and its log is pinned under the controls.
+    - Op buttons are enabled only in their phases, with the reason in their tooltip.
+    - A dev-log error from a non-English seat is tagged with that seat's language.
+    - **🔊 Sound** (X9.3, merged with X5): the /dev control, its top-bar status and the seat badges are English like
+      the rest of the page. The note in a seat's own narrator popover («Тестовый стол: звук у места P2…») is the
+      seat's client, so it is translated: `narr.tableOn`, `narr.tableOther` ({who} = the seat's name) and
+      `narr.tableOff` in `public/i18n/{en,ru}.js` (they were `public/strings.js` narrTable*).
+- **X10 as built.**
+  - New test ids: `header-menu-btn`, `header-menu` and `profile-tag`.
+  - The links and the version carry `data-where` (`landing`, `menu`, `rules` or `final`).
+  - Without `version.json` the version reads `vdev`. The client reads the body of a 404, so the request finishes.
+  - `lang` in the links comes from `<html lang>`.
 
 ### X10: "Report an issue" and a visible version (2026-09-26, owner request)
 

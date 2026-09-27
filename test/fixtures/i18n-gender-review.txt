@@ -1,0 +1,14 @@
+# Gender review list (reports/i18n-design.md §11): every Russian string with a player or «ты» and a word that looks
+# like a past tense or a short participle, and every card or special with such a word. Mark the first column ok or
+# fix (tab-separated; the checker keeps the marks when it rewrites this file). The release gate needs every line
+# marked and none marked fix. This file is tracked (tools/i18n-check.js REVIEW_FILE): `npm run i18n:check` rewrites
+# it, and a new or changed line comes back marked ?; `npm test` fails until every line is marked ok.
+# mark	area	file	key	words	text
+ok	content	specials	airlock.text	Нужен	Нужен напарник. С раунда 2, во время раскрытия или обсуждения, выбери другого игрока и запусти на него шлюз. Если в этом же раунде до голосования кто-то ещё сыграет на него второй «Шлюз», твоя цель вылетает из бункера — без голосования. Без напарника шлюз заклинит, когда закончится обсуждение. Иммунитет на голосовании от шлюза не спасает.
+ok	content	specials	revive.title	Вернулся	Вернулся из леса
+ok	messages	server/i18n/ru.js	err.ownAirlock	запущен	Твой шлюз на игрока {t} уже запущен: задраить его может только другой игрок
+ok	client	public/i18n/ru.js	landing.lede	Случилась	Случилась катастрофа. Коек в бункере хватит только на половину из вас. Раскрывай карты, доказывай в голосовом чате, что без тебя бункеру не обойтись, и голосуй, кто останется снаружи.
+ok	client	public/i18n/ru.js	pop.playedBy	Сыграна	Сыграна игроком {p}
+ok	client	public/i18n/ru.js	pop.neverPlayed	сыграна	Карта игрока {p} · не сыграна
+ok	client	public/i18n/ru.js	picker.warnPeek	сыграна	Все увидят эту карту и на кого она сыграна — но не то, что откроется тебе.
+ok	client	public/i18n/ru.js	toast.voteMoved	сыграна	Голосование успело уйти вперёд, поэтому карта «{title}» не сыграна. Она по-прежнему у тебя.

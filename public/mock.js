@@ -61,7 +61,9 @@ function special(key, uid, used = false) {
   const s = SPECIALS[key];
   return { uid, title: s.title, text: s.text, effect: s.effect, target: s.target, category: s.category, timing: TIMING[s.effect] || 'anytime', minRound: s.effect === 'eject' || s.effect === 'airlock' ? 2 : 1, used };
 }
+// (id: SPEC §11 X5.2, the content id the narrator finds the clip by; the fixtures stay English and keyless, design §9.6)
 const CATASTROPHE = {
+  id: 'nuclear-winter',
   title: 'Nuclear winter',
   text: 'A limited nuclear exchange threw enough ash into the stratosphere to block the sun. Crops have failed everywhere and the surface is freezing. Radio stations went silent one by one.',
   details: ['Remaining world population: about 4%', 'Surface temperature: −40 °C in winter', 'Radiation outside: deadly for the first 6 months'],
@@ -205,7 +207,8 @@ const SCENARIOS = {
   },
   'landing-kicked': {
     title: 'Landing after being kicked, room prefilled',
-    make: () => ({ landing: { form: { name: 'Anna', room: 'KXQR' }, notice: { kind: 'warn', text: 'The host removed you from room KXQR.' } } }),
+    // (a notice is the client's own words: its i18n key, so ?lang=ru shows it in Russian; the fixtures stay English)
+    make: () => ({ landing: { form: { name: 'Anna', room: 'KXQR' }, notice: { kind: 'warn', key: 'landing.kickedPlain', params: { code: 'KXQR' } } } }),
   },
   'landing-invite': {
     title: 'Landing opened from an invite link (/?room=KXQR): Join that room is the main button',
