@@ -47,6 +47,11 @@ tools/voice/.venv/
 tools/voice/venv/
 tools/voice/models/
 tools/voice/work/
+# the Russian build (tools/voice/ru/): its venv, its caches and candidates, a Hugging Face cache put next to it
+tools/voice/.venv-ru/
+tools/voice/ru/work/
+tools/voice/ru/hf/
+tools/voice/ru/models/
 .venv/
 venv/
 __pycache__/

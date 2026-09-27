@@ -1,0 +1,16 @@
+{
+ "voice": "M2",
+ "file": "M2.flac",
+ "gender": "male",
+ "instruct": "An older man in his sixties with a low, weary, slightly gravelly voice, a native Russian speaker. Calm, quiet and unhurried, like an old radio operator who has seen everything, with a steady undertone of dread and short pauses, at a natural speaking pace, not slow. Clear standard Russian pronunciation, no foreign accent.",
+ "seed": 23,
+ "design_model": [
+  "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+  "5ecdb67327fd37bb2e042aab12ff7391903235d3"
+ ],
+ "design_text": "Новый ледниковый период. Океанские течения, которые грели Северное полушарие, остановились почти в одночасье. Через год ледники наступали на Европу и Северную Америку... а зима так и не кончилась.",
+ "cut_sec": 9.03,
+ "ref_text": "Новый ледниковый период. Океанские течения, которые грели Северное полушарие, остановились почти в одночасье.",
+ "sha256": "09b8faaf211827ddb7a80c7b9d63dc7a0dd695e00378a676eda10ebe521ee79e",
+ "sha256_of": "the 24 kHz 16-bit mono WAV that the FLAC decodes to (the reference clip as frozen; make_voice_ru.py restores it into work/voices/ and checks this sum)"
+}

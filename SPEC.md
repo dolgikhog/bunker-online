@@ -1602,6 +1602,57 @@ This folds the "Spec deltas" of every report of the X5 build: `i18n-server-A1/A2
   12–17 ms of zlib per broadcast instead of 34–38 ms, which is still about 2× pre-X5 with the sockets. It would also
   need ws internals to send a frame that is already compressed. A smaller state (deltas) is the real lever on bytes.
 
+### X5.16: Russian narration (2026-09-27, voice-ru-integrator; detail in reports/voice-ru-integration.md)
+
+It replaces X5's "Narration clips stay English-only", X5.7's "in `ru`, says that it is English" and X5.13's "the
+manifest `src` basename".
+- **Clips.** All 18 catastrophes also have a Russian clip, made by `tools/voice/ru/make_voice_ru.py` (Qwen3-TTS,
+  four invented voices; `tools/voice/README.md`). They live in `public/audio/catastrophes-ru/<id>-<sha1[:8]>.mp3`:
+  128 kbps mono MP3 at -12 LUFS, 34–40 s. The name always carries the content hash, since `/audio/*` is cached for
+  7 days.
+- **`public/audio/narration.json`** is still an array sorted by title, one entry per catastrophe:
+  `{title, src, voice, durationSec, id, clips: {ru: {src, voice, durationSec}}}`.
+  - `title`, `src`, `voice` and `durationSec` are unchanged: the English clip, and the fallback for every language.
+    A client from before X5.16 reads the file as before.
+  - `id` is the catastrophe's content id. The narrator matches the entry by it, and, for an entry without one, by
+    the English `src` basename. An English clip renamed `<id>-<hash8>.mp3` by a rebuild is no longer lost.
+  - `clips.<lang>` is the same catastrophe in another language. `make_voice.py` (English) keeps it through a
+    rebuild; `make_voice_ru.py publish` writes `clips.ru`.
+- **Narrator.**
+  - The clip that plays is the one in the language on screen when it starts, whether by the game start's autoplay,
+    ▶ Listen or the autoplay prompt. A language with no clip of its own plays the English one.
+  - A language switch starts nothing and stops nothing: a clip that is playing goes on, and the next ▶ Listen plays
+    the new language. All other behaviour is unchanged: once per game start, no autoplay after a reload, the /dev
+    sound seat, byte ranges, the iOS volume note.
+  - The Russian words no longer say "English" (`narr.listen` «Слушать», `narr.lead`, `narr.hearTitle`,
+    `narr.listenAria`, `narr.pillSub`, `narr.menuOnTitle`, and the hints that quote the button). Only when the
+    English clip is the fallback do the new `narr.listenEn` «Слушать (англ.)», `narr.hearTitleEn`,
+    `narr.listenAriaEn` and `narr.pillSubEn` say so, and the popover adds `narr.onlyEn`. The button carries
+    `data-lang`: the language of the clip it plays. Without «англ.», `narr.tableOther` drops off the gender review
+    list (X5.12).
+- **Pipeline.** `tools/voice/ru/` holds everything needed to make the clips again:
+  - the script;
+  - the 18 ear scripts and the RU card fingerprints they were written from;
+  - the four frozen reference voices (lossless FLAC of the WAV the clones were made from, checked by sha256), with
+    their design prompts and seeds;
+  - the verifier's pinned candidates (`picks.json`) and a record of each published clip's voice and seed
+    (`manifest.json`).
+
+  `tools/voice/fx.sh` takes `MP3_KBPS`, or `--kbps`. The default is 96, and the English output is byte-identical.
+  `tools/voice/requirements-ru.txt` pins the Python set. Models, venvs and caches are git-ignored.
+- **Tests.**
+  - `test/narration.test.js`: every catastrophe has an English and a Russian clip, and every file exists. Each clip's
+    MP3 frames give its length, which is 20–42 s and matches `durationSec`. Each clip has the bitrate of its language,
+    and each RU name is its content hash. No file in either directory is unreferenced. Every clip answers
+    `Range: bytes=0-1` with 206.
+  - `tools/e2e.js`:
+    - the English start plays `audio/catastrophes/…`;
+    - after bob's switch to Russian, the English clip goes on, and ▶ Listen then plays `audio/catastrophes-ru/…`,
+      with `currentTime` advancing;
+    - the switch back plays nothing by itself;
+    - Dana, whose browser is Russian, turns the narrator on in the lobby, and at game 3's start her page plays her
+      catastrophe's `audio/catastrophes-ru/…` clip by itself, under Chrome's real autoplay policy.
+
 ### X9: local test build, profiles and a dev test table with shortcuts (2026-09-26, owner request)
 
 The owner tests alone in one browser. Every incognito window shares one storage, so every tab became the same player.

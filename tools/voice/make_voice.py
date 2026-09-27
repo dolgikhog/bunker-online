@@ -17,7 +17,9 @@ Pipeline
   4. fx.sh: pitch/EQ/room/rumble bed, limiter + two-pass loudnorm to -12 LUFS (VOICE_LUFS), MP3 96k
      mono, verified on the MP3 itself.
   5. public/audio/catastrophes/<name>.mp3 and public/audio/narration.json
-     ([{title, src, voice, durationSec}], sorted by title: what public/narrator.js reads).
+     ([{title, src, voice, durationSec, id, clips}], sorted by title: what public/narrator.js reads). id is the
+     card's content id (its slug); clips holds the other languages' clips (clips.ru, written by ru/make_voice_ru.py,
+     SPEC §11 X5.16), which this build keeps as they are.
 
 File names and caching: production serves /audio/* with a 7-day cache, so a clip whose audio changed
 must get a NEW file name. This script does that by itself: an unchanged render (byte-identical MP3)
@@ -594,6 +596,14 @@ def load_narration(path: Path) -> dict[str, dict]:
     return {e["title"].strip().lower(): e for e in json.loads(path.read_text(encoding="utf-8"))}
 
 
+def other_clips(published: dict[str, dict], slug: str, old: dict | None) -> dict:
+    """The card's clips in other languages (narration.json `clips`, SPEC §11 X5.16), kept through an English rebuild:
+    from its entry by title, else by content id (a card whose title changed)."""
+    if old is None:
+        old = next((e for e in published.values() if e.get("id") == slug), None)
+    return {"clips": old["clips"]} if old and old.get("clips") else {}
+
+
 def write_narration(path: Path, entries: list[dict]) -> None:
     # same layout as the file public/narrator.js has always been served (indent 1, UTF-8, no final newline)
     entries = sorted(entries, key=lambda e: e["title"])
@@ -700,7 +710,7 @@ def main() -> None:
         if only is not None and slug not in only:
             # not rebuilt this time: keep what is published, if it is still there
             if old and (cat_dir / Path(old["src"]).name).exists():
-                narration.append(old)
+                narration.append({**old, "id": slug} if "id" not in old else old)
                 if slug in build_old:
                     build.append(build_old[slug])
             continue
@@ -714,7 +724,8 @@ def main() -> None:
         if gone is not None:
             superseded.append(gone)
             print(f"  {slug}: new audio -> {name} (replaces {gone.name})")
-        narration.append(dict(title=title, src=f"audio/catastrophes/{name}", voice=cast["voice"], durationSec=dur))
+        narration.append(dict(title=title, src=f"audio/catastrophes/{name}", voice=cast["voice"], durationSec=dur, id=slug,
+                              **other_clips(published, slug, old)))
         build.append(dict(
             title=title, slug=slug, file=name, voice=cast["voice"], speed=cast["speed"],
             gender="female" if cast["voice"].startswith("bf_") else "male", durationSec=dur, script=plain_script(script),

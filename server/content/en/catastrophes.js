@@ -1,5 +1,5 @@
-// English catastrophes (SPEC §5; reports/i18n-design.md §6.1, §6.4): 18 entries, keyed by the narration clip's
-// basename (public/audio/catastrophes/<id>.mp3), which the client uses to find the clip.
+// English catastrophes (SPEC §5; reports/i18n-design.md §6.1, §6.4): 18 entries, keyed by the content id that
+// public/audio/narration.json names each catastrophe's clips by (SPEC §11 X5.16), which the client uses to find them.
 //
 // Today's strings, verbatim. Title and text are plain text. Each detail line may hold {n:a-b} placeholders (a whole
 // number from a to b, drawn when the catastrophe is dealt); ../ru/catastrophes.js refers to them by position ({0}).

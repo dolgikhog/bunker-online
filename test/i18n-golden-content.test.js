@@ -116,12 +116,15 @@ describe('English content files: today\'s strings under the B1 ids', () => {
     same(CATASTROPHE_IDS, OLD.CATASTROPHES.map((c) => slug(c.title)));
     same(Object.values(list), OLD.CATASTROPHES.map(({ title, text, details }) => ({ title, text, details })));
     same(CATASTROPHE_IDS.map((id) => STAY[id]), OLD.CATASTROPHES.map((c) => c.stay));
+    // (SPEC §11 X5.16: an entry names its id; its English clip is audio/catastrophes/<id>.mp3, or <id>-<hash8>.mp3
+    // after a rebuild changed the audio. test/narration.test.js checks every language's clips.)
     const clips = fs.readdirSync(new URL('../public/audio/catastrophes/', import.meta.url)).filter((f) => f.endsWith('.mp3'));
-    same(CATASTROPHE_IDS.map((id) => `${id}.mp3`).sort(), clips.sort(), 'every catastrophe has its clip, and every clip its catastrophe');
     const manifest = JSON.parse(fs.readFileSync(new URL('../public/audio/narration.json', import.meta.url), 'utf8'));
+    same(manifest.map((c) => c.id).sort(), [...CATASTROPHE_IDS].sort(), 'narration.json: one entry per catastrophe, by its id');
+    same(manifest.map((c) => c.src.replace(/^audio\/catastrophes\//, '')).sort(), clips.sort(), 'every catastrophe has its clip, and every clip its catastrophe');
     for (const c of manifest) {
-      const id = c.src.replace(/^audio\/catastrophes\/|\.mp3$/g, '');
-      assert.equal(list[id]?.title, c.title, `narration.json ${c.src}`);
+      assert.match(c.src, new RegExp(`^audio/catastrophes/${c.id}(-[0-9a-f]{8})?\\.mp3$`), `narration.json ${c.id}: ${c.src}`);
+      assert.equal(list[c.id]?.title, c.title, `narration.json ${c.src}`);
     }
     assert.equal(EN.catastrophes.fallbackTitle, 'Catastrophe');
   });

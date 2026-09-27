@@ -15,11 +15,14 @@
 #           faded in/out, sidechain-ducked ~7 dB by the voice; ~20 LU under the voice in pauses
 #   master: fade-out tail -> gain to target + 4x-oversampled limiter (ceiling -2.6 dBFS) ->
 #           two-pass EBU R128 loudnorm (target $VOICE_LUFS, default -12 LUFS, linear mode) ->
-#           MP3 mono 96 kbps 44.1 kHz, then the MP3 itself is measured and the master redone until
-#           it reads target +/- 0.3 LUFS and <= -1.2 dBTP (encoder loss/overshoot compensated)
+#           MP3 mono 44.1 kHz at $MP3_KBPS kbps (default 96; --kbps sets it too), then the MP3 itself is
+#           measured and the master redone until it reads target +/- 0.3 LUFS and <= -1.2 dBTP (encoder
+#           loss/overshoot compensated)
 # --dry skips pitch/EQ/room/bed and only pads, normalises and encodes (for A/B comparison).
+# The English clips use the default 96 kbps; the Russian build (ru/make_voice_ru.py) sets MP3_KBPS=128, because at
+# 96 kbps its deep male voices miss the -1.2 dBTP ceiling.
 # Needs ffmpeg + ffprobe with libmp3lame, plus librubberband for any --pitch other than 1.0.
-# Called by make_voice.py; see tools/voice/README.md.
+# Called by make_voice.py (English) and ru/make_voice_ru.py (Russian); see tools/voice/README.md.
 set -euo pipefail
 
 PITCH=1.0      # pitch ratio, e.g. 0.955 = about -0.8 semitone (4.5 % down)
@@ -32,8 +35,9 @@ TITLE=""
 ARTIST="Bunker Online narrator"
 TARGET_I=${VOICE_LUFS:--12}
 TARGET_TP=-1.5
+MP3_KBPS=${MP3_KBPS:-96}   # MP3 bitrate, kbps (the environment's MP3_KBPS, or --kbps)
 
-usage() { sed -n 2,22p "$0"; exit 1; }
+usage() { sed -n 2,25p "$0"; exit 1; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --pitch) PITCH="$2"; shift 2 ;;
@@ -43,6 +47,7 @@ while [[ $# -gt 0 ]]; do
     --tail) TAIL="$2"; shift 2 ;;
     --title) TITLE="$2"; shift 2 ;;
     --artist) ARTIST="$2"; shift 2 ;;
+    --kbps) MP3_KBPS="$2"; shift 2 ;;
     --dry) MODE=dry; shift ;;
     -h|--help) usage ;;
     --) shift; break ;;
@@ -51,6 +56,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ $# -eq 2 ]] || usage
+[[ $MP3_KBPS =~ ^(32|40|48|56|64|80|96|112|128|160|192|224|256|320)$ ]] || { echo "fx.sh: MP3_KBPS=$MP3_KBPS is not an MP3 bitrate" >&2; exit 2; }
 IN="$1"; OUT="$2"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/fx.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
@@ -140,7 +146,7 @@ for ROUND in 1 2 3 4; do
   LN_TP=$(awk -v p="$MTP" -v t="$I_GOAL" -v i="$MI" 'BEGIN{x=p+(t-i)+0.2; if(x>-0.5)x=-0.5; printf "%.2f", x}')
   ffmpeg -nostdin -hide_banner -y -i "$TMP/lim.wav" \
     -af "loudnorm=I=${I_GOAL}:TP=${LN_TP}:LRA=20:measured_I=${MI}:measured_TP=${MTP}:measured_LRA=${MLRA}:measured_thresh=${MTH}:offset=${OFF}:linear=true:print_format=json,aresample=44100" \
-    -ac 1 -ar 44100 -c:a libmp3lame -b:a 96k -id3v2_version 3 "${META[@]}" "$OUT" 2>"$TMP/pass2.log"
+    -ac 1 -ar 44100 -c:a libmp3lame -b:a "${MP3_KBPS}k" -id3v2_version 3 "${META[@]}" "$OUT" 2>"$TMP/pass2.log"
   NT=$(sed -n 's/.*"normalization_type" : "\([^"]*\)".*/\1/p' "$TMP/pass2.log")
   final_stats "$OUT"
   if awk -v i="$FI" -v p="$FTP" -v t="$TARGET_I" 'BEGIN{d=i-t; exit !((d<0?-d:d)<=0.3 && p<=-1.2)}'; then break; fi

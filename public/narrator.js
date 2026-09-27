@@ -1,6 +1,7 @@
 /* Bunker Online — the catastrophe narrator (opt-in, per player, per device).
  *
- * A dramatic British voice reads the catastrophe aloud when a game starts, for the players who turned it on.
+ * A dramatic voice reads the catastrophe aloud when a game starts, for the players who turned it on: in the viewer's
+ * language (a British voice in English, a Russian one in Russian), else in English.
  * Self-contained ES module, no dependencies, CSP-safe (no inline code, same-origin media). The host page imports it
  * and calls four functions; everything else (storage, the <audio> element, the "tap to listen" prompt, clicks on
  * [data-narr] controls) lives here:
@@ -15,18 +16,22 @@
  * and, in a seat of the /dev test table only (its dev bridge in app.js), devSound() and devState() (see there).
  *
  * Returned nodes are plain DOM elements (the host morphs them into its tree; the wrappers carry data-key).
- * Clips: audio/narration.json = [{ title, src, voice, durationSec }], matched to the catastrophe's content id (SPEC §11
- * X5.2: catastrophe.id = the clip's file name, audio/catastrophes/<id>.mp3), or, for a state without one (a mock, a
- * server from before X5), to catastrophe.title case-insensitively. The narration is English only: in Russian the
- * English clip plays and the narr.* words say so (design §9.5). Every title the narrator shows is the state's
- * catastrophe title, in the viewer's language; the manifest's English title is only the fallback lookup.
+ * Clips (SPEC §11 X5.16): audio/narration.json = [{ title, src, voice, durationSec, id, clips: { ru: { src, voice,
+ * durationSec } } }]. The top-level clip is the English one, and the fallback for every language; clips.<lang> is the
+ * same catastrophe in another language. An entry is matched to the catastrophe's content id (`id`; an entry without
+ * one: its English clip's file name, SPEC §11 X5.2), or, for a state without an id (a mock, a server from before X5),
+ * to catastrophe.title case-insensitively. The clip that plays is the one in the language on screen when it starts
+ * (the game start's autoplay, ▶ Listen, the prompt); a language with no clip of its own plays the English one, and the
+ * narr.*En words say so. Every title the narrator shows is the state's catastrophe title, in the viewer's language;
+ * the manifest's English title is only the fallback lookup.
  * The game on screen is known by its room and the catastrophe's id (never its title, which a language switch changes):
- * a switch mid-game neither stops a clip that is playing nor loses the first round's autoplay.
+ * a switch mid-game neither stops a clip that is playing nor loses the first round's autoplay, and starts nothing by
+ * itself; the next ▶ Listen plays the new language.
  * No clip for a catastrophe -> no narrator controls for that game (the header toggle stays: it is a preference). */
 
 import { pkey } from './profile.js';
 // SPEC §11 X5.7: every text goes through i18n (narr.* in public/i18n/en.js, ru.js). `tr` because `t` names events here.
-import { t as tr, onLang } from './i18n/index.js';
+import { t as tr, onLang, lang as viewerLang, LANGS } from './i18n/index.js';
 
 // storage keys, namespaced by ?profile= (SPEC §11 X9.1): pkey() in load/save, and in the `storage` event check
 const PREF_KEY = 'bunker.narrator';
@@ -40,8 +45,9 @@ const FRESH_MS = 15000;
 let opts = { onChange() {}, notify() {}, memory: false };
 const mem = new Map();
 const prefs = { on: false, vol: 100 };
-let clips = null;             // Map<lower-case title, {title, src, voice, durationSec}> once narration.json is in
-let clipsById = new Map();    // the same clips by content id (the src file name without .mp3)
+let clips = null;             // Map<lower-case English title, entry> once narration.json is in; entry = { title, id,
+                              // byLang: { en: clip, ru?: clip } }, clip = { lang, src, voice, durationSec }
+let clipsById = new Map();    // the same entries by content id
 let audio = null;             // the one <audio> element (outside the host's tree, so a re-render never touches it)
 let volumeWorks = true;       // false where media volume is fixed (iOS Safari): the slider is replaced by a note
 let pill = null;              // the "▶ Listen to the catastrophe" prompt shown when the browser refused to autoplay
@@ -119,14 +125,18 @@ function glyph(kind) {
 }
 
 /* ------------------------------------------------------------------ clips */
-// The clip for a catastrophe: by its content id, else (no id: a mock, a server from before X5) by its English title.
-function clipFor(id, title) {
+// The narration of a catastrophe: by its content id, else (no id: a mock, a server from before X5) by its English title.
+function entryFor(id, title) {
   if (!clips) return null;
   if (typeof id === 'string' && id) return clipsById.get(id) || null;
   return typeof title === 'string' ? clips.get(title.trim().toLowerCase()) || null : null;
 }
-function catClip(c) { return c ? clipFor(c.id, c.title) : null; }
-function currentClip() { return st.game ? clipFor(st.game.id, st.game.label) : null; }
+// its clip in the language on screen now, else the English one (SPEC §11 X5.16)
+function inLang(entry) { return entry ? entry.byLang[viewerLang()] || entry.byLang.en : null; }
+// the clip is not in the viewer's language (none was made): the words say it is English
+function isFallback(c) { return !!c && c.lang !== viewerLang(); }
+function catClip(c) { return c ? inLang(entryFor(c.id, c.title)) : null; }
+function currentClip() { return st.game ? inLang(entryFor(st.game.id, st.game.label)) : null; }
 // the catastrophe's title as the state gives it (the viewer's language)
 function shownTitle(s) { return s && s.catastrophe && typeof s.catastrophe.title === 'string' ? s.catastrophe.title : ''; }
 function clipUrl(c) { return new URL(c.src, BASE).href; }
@@ -135,19 +145,28 @@ function clipUrl(c) { return new URL(c.src, BASE).href; }
 const manifestReq = fetch(MANIFEST_URL, { cache: 'no-cache', credentials: 'same-origin' })
   .then((res) => { if (!res.ok) throw new Error(String(res.status)); return res.json(); });
 manifestReq.catch(() => { /* handled in loadManifest */ });
+// one clip of a manifest entry, or null: same-origin relative paths only
+function clipOf(x, lang) {
+  if (!x || typeof x !== 'object' || typeof x.src !== 'string' || !x.src || /^[a-z][a-z0-9+.-]*:|^\/\//i.test(x.src)) return null;
+  return { lang, src: x.src, voice: typeof x.voice === 'string' ? x.voice : '', durationSec: Number(x.durationSec) || 0 };
+}
 async function loadManifest() {
   try {
     const list = await manifestReq;
     const m = new Map();
     const byId = new Map();
     for (const x of Array.isArray(list) ? list : []) {
-      if (!x || typeof x.title !== 'string' || typeof x.src !== 'string') continue;
-      // same-origin relative paths only
-      if (/^[a-z][a-z0-9+.-]*:|^\/\//i.test(x.src)) continue;
-      const clip = { title: x.title, src: x.src, voice: x.voice || '', durationSec: Number(x.durationSec) || 0 };
-      m.set(x.title.trim().toLowerCase(), clip);
+      if (!x || typeof x.title !== 'string') continue;
+      const en = clipOf(x, 'en');    // the top-level clip: English, and the fallback (an entry without it is skipped)
+      if (!en) continue;
+      const byLang = { en };
+      const more = x.clips && typeof x.clips === 'object' ? x.clips : {};
+      for (const l of LANGS) if (l !== 'en' && Object.prototype.hasOwnProperty.call(more, l)) { const c = clipOf(more[l], l); if (c) byLang[l] = c; }
       const base = /([^/]+)\.[a-z0-9]+$/i.exec(x.src);
-      if (base) byId.set(base[1], clip);
+      const id = typeof x.id === 'string' && x.id ? x.id : base ? base[1] : '';
+      const entry = { title: x.title, id, byLang };
+      m.set(x.title.trim().toLowerCase(), entry);
+      if (id) byId.set(id, entry);
     }
     clips = m;
     clipsById = byId;
@@ -318,22 +337,24 @@ export function sync(s) {
 }
 
 /* ------------------------------------------------------------------ UI pieces for the host's tree */
-function listenLabel() {
+function listenLabel(c) {
   if (st.status === 'loading') return tr('narr.loading');
   if (st.status === 'playing') return tr('narr.stop');
-  return tr('narr.listen');
+  return tr(isFallback(c) ? 'narr.listenEn' : 'narr.listen');
 }
-// title: the catastrophe's title as the state shows it (the viewer's language)
+// c: the clip ▶ plays now (the viewer's language, else English); title: the catastrophe's title as the state shows it
+// (the viewer's language). data-lang: the language of that clip.
 function listenButton(c, title, where, testid) {
   if (!c) return null;
   const on = playing();
+  const en = isFallback(c);
   return el('button', {
     class: ['narr-listen', on && 'is-on', st.status === 'loading' && 'is-loading', st.status === 'error' && 'is-error'],
-    'data-narr': 'play', 'data-where': where, 'data-testid': testid, 'data-state': st.status,
+    'data-narr': 'play', 'data-where': where, 'data-testid': testid, 'data-state': st.status, 'data-lang': c.lang,
     'aria-pressed': String(on),
-    title: on ? tr('narr.stopTitle') : tr('narr.hearTitle', { title, secs: Math.round(c.durationSec) || 40 }),
-    'aria-label': on ? tr('narr.stopTitle') : tr('narr.listenAria', { title }),
-  }, glyph(on ? 'stop' : 'play'), el('span', { class: 'narr-listen-t', text: listenLabel() }));
+    title: on ? tr('narr.stopTitle') : tr(en ? 'narr.hearTitleEn' : 'narr.hearTitle', { title, secs: Math.round(c.durationSec) || 40 }),
+    'aria-label': on ? tr('narr.stopTitle') : tr(en ? 'narr.listenAriaEn' : 'narr.listenAria', { title }),
+  }, glyph(on ? 'stop' : 'play'), el('span', { class: 'narr-listen-t', text: listenLabel(c) }));
 }
 export function titleRow(titleEl, s, where) {
   if (!started || !s || !s.catastrophe || s.phase === 'lobby') return titleEl;
@@ -388,6 +409,7 @@ function popover(s) {
         el('span', { class: 'narr-vol-k', text: tr('narr.volume') }),
         el('span', { class: 'narr-vol-na', text: tr('narr.volumeFixed') })),
     c ? el('div', { class: 'narr-pop-play' }, listenButton(c, title, 'menu', 'narrator-play-menu'), el('span', { class: 'narr-pop-clip', text: title })) : null,
+    c && isFallback(c) ? el('p', { class: 'narr-pop-note', 'data-testid': 'narrator-lang-note', text: tr('narr.onlyEn') }) : null,
     inGame && clips && !c ? el('p', { class: 'narr-pop-note', text: tr('narr.noClip') }) : null,
     el('p', { class: ['narr-pop-note', st.status === 'error' && 'is-error'], role: 'status', text: note }));
 }
@@ -405,7 +427,7 @@ function updatePill() {
   if (show) {
     pill.setAttribute('data-title', title);
     const sub = pill.querySelector('.narr-pill-sub');
-    if (sub) sub.textContent = tr('narr.pillSub', { title });
+    if (sub) sub.textContent = tr(isFallback(c) ? 'narr.pillSubEn' : 'narr.pillSub', { title });
   }
 }
 // sets a text or an attribute only when it differs (the pill is not morphed: no churn for screen readers)
@@ -419,7 +441,7 @@ function pillWords() {
   setAttr(x, 'aria-label', tr('narr.noThanks'));
   setAttr(x, 'title', tr('narr.noThanks'));
   const c = !pill.hidden ? currentClip() : null;
-  if (c) setText(pill.querySelector('.narr-pill-sub'), tr('narr.pillSub', { title: st.game ? st.game.label : '' }));
+  if (c) setText(pill.querySelector('.narr-pill-sub'), tr(isFallback(c) ? 'narr.pillSubEn' : 'narr.pillSub', { title: st.game ? st.game.label : '' }));
 }
 function makePill() {
   pill = el('div', { class: 'narr-pill', role: 'region', 'aria-label': tr('narr.pillRegion'), hidden: true },
@@ -513,7 +535,8 @@ export function init(o = {}) {
   document.addEventListener('input', onInput);
   document.addEventListener('keydown', onKey);
   if (!opts.memory) window.addEventListener('storage', onStorage);
-  // a language switch without a new state (the landing page, offline): the pill's words follow it too
+  // a language switch: the pill's words follow it (also without a new state: the landing page, offline). It starts
+  // nothing and stops nothing: a clip that is playing goes on, and the next ▶ Listen plays the new language's clip
   onLang(() => updatePill());
   loadManifest();
 }

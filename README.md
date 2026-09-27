@@ -49,9 +49,8 @@ Each player picks their own language with the **EN / RU** switch:
 - Your browser remembers the choice.
 - On a first visit the game starts in Russian if your browser's language is Russian, and in English otherwise.
 
-Everything is translated: the cards, catastrophes, bunkers, special cards, the log, errors and the rules. Player names
-are never translated. The only exception is the narration, which is English in both languages; the Russian screen says
-so. [По-русски ниже](#по-русски).
+Everything is translated: the cards, catastrophes, bunkers, special cards, the log, errors, the rules and the
+narration. Player names are never translated. [По-русски ниже](#по-русски).
 
 ### How a game goes
 1. **Setup.** Everyone sees the **Catastrophe**, the **Bunker** (size, food, how long you must stay, its features)
@@ -159,16 +158,19 @@ real pace. Here is the estimate (SPEC §11 X4) for each preset, with its range i
 Each preset's timers are, in order: round-1 speech / later speeches / discussion / defense.
 
 ### Narrator
-Each of the 18 catastrophes has a recorded narration by a British voice, male or female depending on the story. The clips are about 35 s each.
+Each of the 18 catastrophes has a recorded narration in both languages, male or female depending on the story: a British voice in English, a Russian one in Russian. The clips are about 35 s each.
 - Every player decides for themselves with the **🔊 Narrator** button in the header. It is off by default, and the setting and its volume slider are remembered in that browser.
 - When it is on, the catastrophe is read aloud **once**, when the game starts. A reload never replays it.
 - **▶ Listen**, next to the catastrophe title, plays it again at any time, even with the narrator off.
 - If the browser blocks sound (common on iPhones), a "▶ Listen to the catastrophe" button appears, and one tap plays it.
 - The sound comes from each player's own device, because Discord does not carry browser audio.
-- The narration is English only. With the page in Russian, the same English clip plays, and the Russian buttons say
-  so («Слушать (англ.)»).
-- The clips live in `public/audio/` and are made from the card texts with Kokoro TTS plus an effects chain, mastered to -12 LUFS. [`tools/voice/`](tools/voice/README.md) rebuilds them.
-- Production caches `/audio/*` for 7 days, so a re-rendered clip needs a new file name. The build in `tools/voice/` renames changed clips by itself.
+- It reads in the language of your screen. A switch mid-game does not cut off a clip that is playing and starts
+  nothing by itself; the next ▶ Listen plays the other language. A catastrophe with no clip in your language would
+  play the English one, and the buttons would say so («Слушать (англ.)»).
+- The clips live in `public/audio/` (`catastrophes/` in English, `catastrophes-ru/` in Russian, both listed in
+  `narration.json`), mastered to -12 LUFS. The English ones are made with Kokoro TTS and the Russian ones with
+  Qwen3-TTS, both through the same effects chain. [`tools/voice/`](tools/voice/README.md) rebuilds them.
+- Production caches `/audio/*` for 7 days, so a re-rendered clip needs a new file name. Both builds in `tools/voice/` name changed clips by themselves.
 
 ### Limits
 - **4–16 players** per game, plus up to **50 spectators**.
@@ -189,8 +191,13 @@ Each of the 18 catastrophes has a recorded narration by a British voice, male or
   телефоне во время игры он во второй строке шапки.
 - Язык у каждого свой: переключение меняет только твой экран. Игра идёт дальше, и у остальных ничего не меняется.
 - Браузер запоминает выбор. При первом входе игра открывается по-русски, если браузер русскоязычный.
-- Переведено всё, кроме имён игроков и озвучки. Рассказчик читает катастрофу только по-английски, и русский экран об
-  этом предупреждает.
+- Переведено всё, включая озвучку; не переводятся только имена игроков.
+
+**Рассказчик.** Кнопка **🔊 Рассказчик** в шапке включает озвучку катастрофы: в начале игры её прочитают вслух один
+раз, по-русски (у каждой из 18 катастроф своя запись, мужским или женским голосом под настроение истории). Кнопка ▶
+«Слушать» рядом с названием катастрофы включает её ещё раз в любой момент. Настройка своя у каждого и хранится в
+браузере; по умолчанию рассказчик выключен. Если переключить язык во время игры, звучащая запись доиграет, а следующее
+«Слушать» включит озвучку на новом языке.
 
 **Как играть.** Случилась катастрофа, а коек в бункере хватит только на половину из вас. Каждому раздают 8 скрытых
 карт характеристик (профессия, биология, здоровье, хобби, фобия, навык, характер, багаж) и 2 карты особых условий. В
@@ -327,7 +334,7 @@ or `fix` by a reviewer; `npm test` and `node tools/i18n-check.js --gate` need ev
 | Command | What it runs | Time |
 |---|---|---|
 | `npm test` | Unit tests plus full-game simulations over real WebSockets, in English, Russian and mixed tables. They spawn their own servers on free ports | ~2 min |
-| `npm run e2e` | A browser end-to-end run: puppeteer-core with `/usr/bin/google-chrome-stable`, a desktop host, a phone player, a spectator and bots. It includes a Russian pass: a mid-game language switch and a Russian late arrival at 360 px. Useful options: `--players 16`, `--headful`, `--slow`, `--url URL` (use a running server), `--screens DIR` (default `reports/screens/e2e`) | ~2–3 min |
+| `npm run e2e` | A browser end-to-end run: puppeteer-core with `/usr/bin/google-chrome-stable`, a desktop host, a phone player, a spectator and bots. It includes a Russian pass: a mid-game language switch (after it, ▶ Listen plays the Russian clip) and a Russian late arrival at 360 px, whose narrator reads the next game's catastrophe in Russian. Useful options: `--players 16`, `--headful`, `--slow`, `--url URL` (use a running server), `--screens DIR` (default `reports/screens/e2e`) | ~2–3 min |
 | `npm run i18n:check` | Checks every Russian text against English: keys, placeholders, plurals, no Latin letters, gender-neutral wording. `npm test` runs the same checks | ~1 s |
 | `node tools/bench-broadcast.js` | The broadcast budget at 16 players + 50 spectators: CPU no higher than before X5, and every state ≤ 120 KB. It also times the same broadcast over permessage-deflate and reports the bytes on the wire and the memory per socket (SPEC §11 X5.15). `taskset -c 0` in front of it measures on one core, as on the production VPS | ~45 s (~50 s on one core) |
 

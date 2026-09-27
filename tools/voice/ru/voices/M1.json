@@ -1,0 +1,17 @@
+{
+ "voice": "M1",
+ "file": "M1.flac",
+ "gender": "male",
+ "instruct": "A deep, grave male baritone in his fifties, a native Russian news announcer. Measured, weighty, somber and restrained delivery at a steady pace with short dramatic pauses, like the last emergency radio broadcast before the sirens. Clear standard Russian pronunciation, no foreign accent.",
+ "seed": 7,
+ "design_model": [
+  "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+  "5ecdb67327fd37bb2e042aab12ff7391903235d3"
+ ],
+ "design_text": "Ядерная зима. Пограничный спор... меньше чем за час перерос в обмен ядерными ударами. Дым горящих городов заслонил солнце, и планета замерзает. Урожай погиб... везде и сразу. Выжившие: от трёх до восьми процентов населения Земли. На поверхности: от тридцати до пятидесяти градусов мороза. Вечные сумерки. Радиоактивные осадки. Угрозы: холод, радиация... и голодные мародёры. Поверхность станет безопасной через два года... или через шесть.",
+ "cut_sec": 11.73,
+ "ref_text": "Ядерная зима. Пограничный спор... меньше чем за час перерос в обмен ядерными ударами. Дым горящих городов заслонил солнце, и планета замерзает.",
+ "sha256": "0153db75878d5cf3d75a0944012a92731d34c5b55cc78754a5ba446006e62988",
+ "note": "frozen in the sampling run by cut_refs.py (refs/qwendesign_m.wav)",
+ "sha256_of": "the 24 kHz 16-bit mono WAV that the FLAC decodes to (the reference clip as frozen; make_voice_ru.py restores it into work/voices/ and checks this sum)"
+}

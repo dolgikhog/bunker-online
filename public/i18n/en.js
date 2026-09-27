@@ -893,8 +893,9 @@ export default {
   'fb.menuLead': 'Something broke, or you have an idea? Tell us on GitHub (a free account is needed).',
   'fb.lead': 'Something off, or an idea for the game?',
 
-  // ---- the narrator (public/narrator.js). In ru the English clip plays: say so in narr.lead, narr.listen,
-  // narr.hearTitle and narr.pillSub (design §9.5). title = the catastrophe's title, secs = the clip's length
+  // ---- the narrator (public/narrator.js). The clip plays in the viewer's language (SPEC §11 X5.16); a language with
+  // no clip of its own plays the English one, and the *En variants (narr.listenEn, narr.hearTitleEn, narr.listenAriaEn,
+  // narr.pillSubEn, narr.onlyEn) say so. title = the catastrophe's title, secs = the clip's length
   'narr.name': 'Narrator',
   'narr.menuOnTitle': 'Narrator is on: the catastrophe is read aloud when a game starts',
   'narr.menuOffTitle': 'Narrator is off: turn it on to hear the catastrophe read aloud',
@@ -909,11 +910,15 @@ export default {
   'narr.volumeFixed': 'Use your device’s volume buttons.',
   'narr.noClip': 'No narration for this catastrophe.',
   'narr.listen': 'Listen',
+  'narr.listenEn': 'Listen (in English)',
   'narr.loading': 'Loading…',
   'narr.stop': 'Stop',
   'narr.stopTitle': 'Stop the narration',
   'narr.hearTitle': 'Hear “{title}” read aloud (about {secs} s)',
+  'narr.hearTitleEn': 'Hear “{title}” read aloud in English (about {secs} s)',
   'narr.listenAria': 'Listen to the catastrophe, {title}',
+  'narr.listenAriaEn': 'Listen to the catastrophe in English, {title}',
+  'narr.onlyEn': 'This catastrophe is read in English only: it has no narration in your language yet.',
   'narr.playing': 'Playing “{title}”.',
   'narr.hintLobbyOn': 'Narrator on — you’ll hear the catastrophe when the game starts.',
   'narr.hintGameOn': 'Narrator on — it reads the catastrophe when a game starts. Press ▶ Listen to hear this one now.',
@@ -926,6 +931,7 @@ export default {
   'narr.pillRegion': 'Narration',
   'narr.pillTitle': 'Listen to the catastrophe',
   'narr.pillSub': '{title} — your browser wants one tap for sound',
+  'narr.pillSubEn': '{title} (in English) — your browser wants one tap for sound',
   'narr.noThanks': 'No thanks',
   // a seat of the /dev test table (dev mode only; merged from PR #2, were public/strings.js narrTable*): the table gives
   // the sound to one seat at a time, and the popover says which (who = a seat's name, P1…P16). The /dev page itself

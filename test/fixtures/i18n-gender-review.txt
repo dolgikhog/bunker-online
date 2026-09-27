@@ -12,4 +12,3 @@ ok	client	public/i18n/ru.js	pop.playedBy	Сыграна	Сыграна игро�
 ok	client	public/i18n/ru.js	pop.neverPlayed	сыграна	Карта игрока {p} · не сыграна
 ok	client	public/i18n/ru.js	picker.warnPeek	сыграна	Все увидят эту карту и на кого она сыграна — но не то, что откроется тебе.
 ok	client	public/i18n/ru.js	toast.voteMoved	сыграна	Голосование успело уйти вперёд, поэтому карта «{title}» не сыграна. Она по-прежнему у тебя.
-ok	client	public/i18n/ru.js	narr.tableOther	англ	Тестовый стол: звук у места {who}. ▶ «Слушать (англ.)» или переключатель здесь переносят его на это место.

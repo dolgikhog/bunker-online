@@ -71,7 +71,11 @@ Narrator (public/narrator.js): the phone player turns it on in the lobby; at the
 that page by itself (Chrome keeps its real autoplay policy, only muted: the clicks in the lobby are the gesture), the
 host and the spectator (switch off) stay silent, every page shows ▶ Listen, and the reload mid-game does not replay it.
 The clip is served in byte ranges (Range: bytes=0-1 -> 206, Accept-Ranges: bytes) and is seekable to its end: without
-that, Safari and every iOS browser do not play it.
+that, Safari and every iOS browser do not play it. The clip is the one in the page's language (SPEC §11 X5.16): the
+English start plays audio/catastrophes/…; after bob's switch to Russian, ▶ Listen (Stop, then ▶) plays
+audio/catastrophes-ru/…; a switch starts nothing by itself; Dana (Russian) turns the narrator on in the lobby after End
+game, and at game 3's start her page plays her catastrophe's Russian clip by itself, and its words say nothing of
+English.
 Profiles and report links (SPEC §11 X9.1, X10): two tabs of ONE browser context with ?profile=alpha / ?profile=beta join
 one room as two players, each resumes its own seat after a reload, the invite link has no profile, a tab without one
 sees neither seat, and the narrator setting stays per profile. "Report an issue" / "Suggest an idea" are checked on the
@@ -1498,6 +1502,11 @@ async function langSwitchTest(host, bob, spec, to, o = {}) {
       const a1 = await narrAudio(bob);
       check(!!a1 && a1.src === a0.src && !a1.paused && a1.t > a0.t, `bob: the narrator clip stopped or changed at the language switch (${JSON.stringify({ a0, a1 })}) (design §9.5)`);
       res.narrator = a1 ? 'kept playing' : 'gone';
+    } else if (a0) {
+      // and a switch starts nothing by itself (SPEC §11 X5.16): a silent narrator stays silent, with the same clip
+      const a1 = await narrAudio(bob);
+      check(!!a1 && a1.src === a0.src && a1.paused, `bob: the language switch started the narrator (${JSON.stringify({ a0, a1 })}) (SPEC §11 X5.16)`);
+      res.narrator = a1 && a1.paused ? 'stayed silent' : 'played';
     }
     // nobody else changed: their language and their page
     for (const P of [host, spec]) {
@@ -1529,6 +1538,8 @@ async function langSwitchTest(host, bob, spec, to, o = {}) {
         res.chip = title;
       } else run.warnings.push('bob: no special chip on his page to check the Russian title of');
       await shot('lang-ru', [bob]);
+      // SPEC §11 X5.16: ▶ Listen now plays the Russian clip
+      await narratorListenTest(bob, 'ru');
     }
   } finally {
     if (cdp) await cdp.detach().catch(() => {});
@@ -2231,10 +2242,12 @@ async function endGameTest(host, bob, spec, code) {
   await click(late, 'take-seat-btn', '', 'Take a seat (late arrival)');
   await waitState(late, (s) => s.you.role === 'player' && s.players.some((p) => p.id === late.id), 'the late arrival seated');
   await ruPageCheck(late, 'seated in the lobby');
+  await narratorRuLobby(late);   // SPEC §11 X5.16: she turns the narrator on; game 3 must read to her in Russian
   await waitState(host, (s) => s.players.some((p) => p.id === late.id), 'the host to see the late arrival seated');
   await sleep(PAUSE);
   await click(host, 'start-btn', '', 'Start (with the late arrival)');
   const ls2 = await waitState(late, (s) => s.phase === 'reveal' && !!s.me && Object.keys(s.me.cards || {}).length === 8, 'the late arrival dealt into the new game');
+  await narratorRuStart(late);
   await ruPageCheck(late, 'playing game 3');
   await waitHook(host, 'player-card', `[data-player-id="${late.id}"]`, 'the late arrival on the host\'s table').catch(async (e) => {
     if (!(await host.page.$(sel('player-card', `[data-player-id="${late.id}"]`)))) throw e;
@@ -2633,6 +2646,94 @@ const narrAudio = (P) => P.page.evaluate(() => {
   const seekEnd = a && a.seekable.length ? a.seekable.end(a.seekable.length - 1) : 0;
   return a ? { src: a.getAttribute('src'), paused: a.paused, t: a.currentTime, count: document.querySelectorAll('audio').length, dur: a.duration, seekEnd } : null;
 }).catch(() => null);
+/**
+ * narration.json's clip of the catastrophe `c` in `lang` (SPEC §11 X5.16): the entry by the catastrophe's id (an entry
+ * without `id`: its English src basename; a state without an id: the English title), then its clips[lang], else the
+ * English clip. -> { src, lang (of that clip), entry } or null.
+ */
+async function narrClipOf(P, c, lang) {
+  const list = await P.page.evaluate(() => fetch('audio/narration.json', { cache: 'no-store' }).then((r) => r.json())).catch(() => []);
+  const cid = c && typeof c.id === 'string' ? c.id : null;
+  const title = String((c && c.title) || '').toLowerCase();
+  const e = (Array.isArray(list) ? list : []).find((x) => x && typeof x.title === 'string' && typeof x.src === 'string'
+    && (cid ? (x.id ? x.id === cid : x.src.endsWith(`/${cid}.mp3`)) : x.title.toLowerCase() === title));
+  if (!e) return null;
+  const own = e.clips && e.clips[lang] && typeof e.clips[lang].src === 'string' ? e.clips[lang] : null;
+  return own ? { src: own.src, lang, entry: e } : { src: e.src, lang: 'en', entry: e };
+}
+/** Waits (up to 5 s) for P's narrator to play `src`, and returns two samples 600 ms apart: { ok, a0, a1 }. */
+async function narrPlays(P, src) {
+  const on = (a) => !!a && !!a.src && a.src.endsWith('/' + src) && !a.paused && a.t > 0.05;
+  let a0 = await narrAudio(P);
+  for (let i = 0; i < 50 && !on(a0); i++) { await sleep(100); a0 = await narrAudio(P); }
+  await sleep(600);
+  const a1 = await narrAudio(P);
+  return { ok: on(a0) && on(a1) && a1.t > a0.t + 0.25, a0, a1 };
+}
+// SPEC §11 X5.16: after a language switch, ▶ Listen plays the catastrophe in the new language. Through the header
+// popover (at the top of the page, on the phone too): Stop the clip that is playing, then ▶. The element's clip becomes
+// the one in `lang` and plays (the click is the gesture), and every ▶ says (data-lang) which language it plays.
+async function narratorListenTest(P, lang) {
+  if (!run.stats.narrator || run.stats.narrator.skipped || run.stats.narrator.on !== P.name) return;
+  const s = await state(P);
+  const clip = await narrClipOf(P, s && s.catastrophe, lang);
+  if (!check(!!clip && clip.lang === lang, `no ${lang} clip in audio/narration.json for "${s && s.catastrophe && s.catastrophe.title}" (SPEC §11 X5.16)`)) return;
+  const res = { lang, clip: clip.src };
+  const langs = await hookValues(P, 'narrator-play', 'data-lang');
+  check(langs.length >= 1 && langs.every((x) => x === lang), `${P.name}: after the switch to ${lang} the ▶ Listen buttons play ${JSON.stringify(langs)}`);
+  await click(P, 'narrator-menu');
+  await waitHook(P, 'narrator-play-menu', '', 'the ▶ in the narrator popover', 3000);
+  check(!(await P.page.$(sel('narrator-lang-note'))), `${P.name}: the narrator popover says the clip is English only, but narration.json has a ${lang} clip`);
+  const a = await narrAudio(P);
+  if (a && a.src && !a.paused) {
+    res.stopped = a.src.replace(/^.*?\/audio\//, 'audio/');
+    await click(P, 'narrator-play-menu', '', 'Stop the playing clip');
+    await P.page.waitForFunction(() => document.querySelector('audio[data-testid="narrator-audio"]').paused, { timeout: 3000 }).catch(() => {});
+  }
+  await click(P, 'narrator-play-menu', '', `▶ Listen, now in ${lang}`);
+  const r = await narrPlays(P, clip.src);
+  check(r.ok, `${P.name}: ▶ Listen after the switch to ${lang} does not play ${clip.src} (${JSON.stringify({ a0: r.a0, a1: r.a1 })}) (SPEC §11 X5.16)`);
+  await P.page.keyboard.press('Escape');
+  res.t = r.a0 && r.a1 ? [+r.a0.t.toFixed(2), +r.a1.t.toFixed(2)] : null;
+  run.stats.narrator.afterSwitch = res;
+  log(`narrator after the switch to ${lang}: ${JSON.stringify(res)}`);
+}
+// SPEC §11 X5.16: a Russian player's narrator reads in Russian. Dana (a Russian browser) turns it on in the lobby, and
+// its words no longer say it is English; at the start of the next game her page plays her catastrophe's Russian clip by
+// itself (her clicks in the lobby are the gesture Chrome's real autoplay policy wants), and every ▶ says it plays ru.
+async function narratorRuLobby(P) {
+  if (!I18N.loaded) return;
+  const btn = await P.page.waitForSelector(sel('narrator-menu'), { visible: true, timeout: 3000 }).catch(() => null);
+  if (!btn) {
+    const msg = `${P.name}: no narrator control (narrator-menu) in the lobby header`;
+    if (!opts.url && !opts.publicDir) check(false, msg); else run.warnings.push(`${msg}; the Russian narrator check skipped`);
+    return;
+  }
+  await click(P, 'narrator-menu');
+  await click(P, 'narrator-toggle');
+  const on = await P.page.waitForFunction((q) => document.querySelector(q)?.getAttribute('aria-checked') === 'true', { timeout: 3000 }, sel('narrator-toggle')).then(() => true, () => false);
+  check(on, `${P.name}: the narrator switch did not turn on`);
+  const lead = await P.page.$eval('.narr-pop-lead', (e) => e.textContent).catch(() => '');
+  checkRu(lead === L('ru', 'narr.lead') && !/англ/i.test(lead), `${P.name}: the narrator popover's lead reads ${JSON.stringify(lead)}; expected narr.lead in Russian, which no longer says the narration is English (SPEC §11 X5.16)`);
+  await P.page.keyboard.press('Escape');
+  await P.page.waitForFunction((q) => !document.querySelector(q), { timeout: 3000 }, sel('narrator-toggle')).catch(() => {});
+  run.stats.narratorRu = { on: P.name };
+}
+async function narratorRuStart(P) {
+  if (!run.stats.narratorRu) return;
+  const t0 = Date.now();
+  const s = await state(P);
+  const clip = await narrClipOf(P, s && s.catastrophe, 'ru');
+  if (!check(!!clip && clip.lang === 'ru' && /^audio\/catastrophes-ru\//.test(clip.src), `no Russian clip (audio/catastrophes-ru/…) in audio/narration.json for "${s && s.catastrophe && s.catastrophe.title}": ${JSON.stringify(clip && clip.src)} (SPEC §11 X5.16)`)) return;
+  const r = await narrPlays(P, clip.src);
+  check(r.ok, `${P.name}: a Russian page with the narrator on, the game started, but ${clip.src} is not playing by itself (${JSON.stringify({ a0: r.a0, a1: r.a1 })}) (SPEC §11 X5.16)`);
+  const langs = await hookValues(P, 'narrator-play', 'data-lang');
+  check(langs.length >= 1 && langs.every((x) => x === 'ru'), `${P.name}: the ▶ Listen buttons play ${JSON.stringify(langs)}, expected ru`);
+  const words = await P.page.$$eval(sel('narrator-play'), (els) => els.filter((e) => window.__e2eVisible(e)).map((e) => `${e.getAttribute('title')} ${e.getAttribute('aria-label')} ${e.textContent}`)).catch(() => []);
+  checkRu(words.length >= 1 && words.every((x) => !/англ/i.test(x) && CYR.test(x)), `${P.name}: the ▶ Listen words still say English: ${JSON.stringify(words)} (SPEC §11 X5.16)`);
+  run.stats.narratorRu = { ...run.stats.narratorRu, clip: clip.src, t: r.a0 && r.a1 ? [+r.a0.t.toFixed(2), +r.a1.t.toFixed(2)] : null, ms: Date.now() - t0 };
+  log(`narrator in Russian: ${JSON.stringify(run.stats.narratorRu)}`);
+}
 async function narratorLobby(P) {
   const t0 = Date.now();
   const btn = await P.page.waitForSelector(sel('narrator-menu'), { visible: true, timeout: 3000 }).catch(() => null);
@@ -2661,12 +2762,11 @@ async function narratorStart(P, others) {
   const t0 = Date.now();
   const s = await state(P);
   const title = s && s.catastrophe ? s.catastrophe.title : '';
-  const clips = await P.page.evaluate(() => fetch('audio/narration.json').then((r) => r.json())).catch(() => []);
-  // (the clip of the catastrophe's content id, audio/catastrophes/<id>.mp3, SPEC §11 X5.2; a server without ids: the title)
-  const cid = s && s.catastrophe && typeof s.catastrophe.id === 'string' ? s.catastrophe.id : null;
-  const clip = (Array.isArray(clips) ? clips : []).find((x) => x && typeof x.title === 'string' && typeof x.src === 'string'
-    && (cid ? x.src.endsWith(`/${cid}.mp3`) : x.title.toLowerCase() === title.toLowerCase()));
+  // (the clip in the page's language: English here, audio/catastrophes/…, SPEC §11 X5.16)
+  const lang = await pageLang(P);
+  const clip = await narrClipOf(P, s && s.catastrophe, lang);
   if (!check(!!clip, `no clip in audio/narration.json for the dealt catastrophe "${title}"`)) return;
+  check(lang !== 'en' || /^audio\/catastrophes\//.test(clip.src), `the English clip of "${title}" is ${clip.src}, not in audio/catastrophes/`);
   let a0 = await narrAudio(P);
   for (let i = 0; i < 50 && !(a0 && a0.src && !a0.paused && a0.t > 0.05); i++) { await sleep(100); a0 = await narrAudio(P); }
   await sleep(600);

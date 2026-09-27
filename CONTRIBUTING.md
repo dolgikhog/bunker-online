@@ -39,9 +39,9 @@ its own server on a free port and writes screenshots to `reports/screens/e2e/` (
   text from published games, books or websites, or paste anything you do not have the rights to.
 - **English and Russian stay in sync.** Once the Russian translation lands, every change to a player-facing text
   (cards, UI, rules) comes with both languages in the same pull request.
-- **Catastrophe narration** (`public/audio/`) is generated from the card texts with `tools/voice/`. If you change a
-  catastrophe card, say so in the pull request; the owner regenerates the clip. See
-  [tools/voice/README.md](tools/voice/README.md).
+- **Catastrophe narration** (`public/audio/`, English and Russian) is generated from the card texts with
+  `tools/voice/`. If you change a catastrophe card, say so in the pull request; the owner regenerates its clips (the
+  Russian one from its ear script in `tools/voice/ru/scripts/`). See [tools/voice/README.md](tools/voice/README.md).
 - **No secrets or personal data** in commits: no server addresses, keys, tokens, `.env` files, personal names,
   e-mail addresses or local paths. Deploy settings live in `deploy/.env`, which is never committed.
 - Plain JavaScript (ES modules), no build step, and no new runtime dependencies without discussing it first.
