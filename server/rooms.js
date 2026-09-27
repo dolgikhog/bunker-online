@@ -290,11 +290,15 @@ export class Rooms {
    * @param {(rng) => object} [o.dealerFactory]  optional, for tests
    * @param {boolean} [o.fixedSpecials=true]      §11 X1 fixed Airlock/revive deal (false: the dealer supplies every special; tests)
    * @param {(msg: string, err?: unknown) => void} [o.logger]
+   * @param {object|null} [o.analytics]  server/analytics.js's Analytics (index.js; null in dev mode): told of rooms
+   *                                      created, spectators joined and games started/finished/ended/abandoned, as
+   *                                      counts only (never a name, an address or a code)
    */
   constructor({
     rng = null, minPlayers = 4, hostGraceMs = 45000, roomTtlMs = ROOM_TTL_MS, maxRoomsPerIp = MAX_ROOMS_PER_IP,
     joinFailBurst = JOIN_FAIL_BURST, joinFailRefillMs = JOIN_FAIL_REFILL_MS, now = Date.now, dealerFactory = null, logger = null,
     fixedSpecials = true, maxRoomsPerSite = maxRoomsPerIp * SITE_FACTOR, joinFailSiteBurst = joinFailBurst * SITE_FACTOR,
+    analytics = null,
   } = {}) {
     this.rng = rng;
     this.fixedSpecials = fixedSpecials !== false;
@@ -318,6 +322,7 @@ export class Rooms {
      * behind it: {t:'dev'} ops, `create`'s seed, the god view and the in-process bots.
      */
     this.dev = null;
+    this.analytics = analytics;
   }
 
   // ------------------------------------------------------------------------------------------------ transport hooks
@@ -349,6 +354,7 @@ export class Rooms {
       try {
         if (room.conns.size === 0) {
           if (room.emptySince !== null && t - room.emptySince >= this.roomTtlMs) {
+            if (ACTIVE_PHASES.has(room.game.phase)) this._track('gameAbandoned');
             this.rooms.delete(room.code);
             this.logger(`room ${room.code} deleted (idle)`);
           }
@@ -424,12 +430,14 @@ export class Rooms {
       this._error(conn, fail('not_in_room'));
       return;
     }
+    const before = room.game.phase;
     const res = room.game.handle(conn.playerId, msg);
     if (!res.ok) {
       if (res.internal) this.logger(`engine error on ${msg.t}`, room.game.lastError);
       this._error(conn, res);
       return;
     }
+    if (this.analytics && room.game.phase !== before) this._trackPhase(room, before);
     this._afterChange(room, msg.t === 'kick' ? msg.playerId : null);
   }
 
@@ -507,6 +515,7 @@ export class Rooms {
     this._moveOut(conn, old);
     const room = { code, game, tokens: new Map(), idToken: new Map(), conns: new Map(), emptySince: null, ipKey: key, siteKey: site };
     this.rooms.set(code, room);
+    this._track('roomCreated');
     this._admit(room, conn, res.id);
   }
 
@@ -547,6 +556,7 @@ export class Rooms {
     const old = this._soleLobby(conn);
     const res = room.game.join(msg.name, { spectator: msg.spectator === true, lang: conn.lang });
     if (!res.ok) { this._error(conn, res); return; }
+    if (res.role === 'spectator') this._track('spectatorJoined');
     this._moveOut(conn, old !== room ? old : null);
     this._admit(room, conn, res.id);
   }
@@ -665,6 +675,7 @@ export class Rooms {
     // Nobody is left in it at all (in a game, `left` players stay listed but can never come back): free the code now
     // instead of holding one of the 200 room slots for the 30-minute idle TTL.
     if (!room.game.spectators.length && !room.game.players.some((p) => p.status !== 'left')) {
+      if (ACTIVE_PHASES.has(room.game.phase)) this._track('gameAbandoned');
       this.rooms.delete(room.code);
       this._devAfterChange(room);
       return;
@@ -672,6 +683,32 @@ export class Rooms {
     if (room.conns.size === 0 && room.emptySince === null) room.emptySince = this.now();
     this._broadcast(room);
     this._devAfterChange(room);
+  }
+
+  /** Tells analytics (when there is one) of an event; a failure there never reaches the game. */
+  _track(event, data) {
+    if (!this.analytics) return;
+    try { this.analytics[event](data); } catch (e) { this.logger(`analytics ${event} failed`, e); }
+  }
+
+  /**
+   * A handled message changed the phase from `before`: lobby -> in game is a game started (its seat count and the
+   * seated players' languages, then the peak of games in progress), in game -> final a game finished, in game -> lobby
+   * (End game, §11 X6) a game ended by the host. Final -> lobby (Play again) is nothing new.
+   */
+  _trackPhase(room, before) {
+    const g = room.game;
+    const after = g.phase;
+    if (before === 'lobby' && ACTIVE_PHASES.has(after)) {
+      const langs = { en: 0, ru: 0 };
+      for (const p of g.players) {
+        const l = normLang(p.lang) ?? 'en';
+        langs[l] = (langs[l] || 0) + 1;
+      }
+      this._track('gameStarted', { players: g.players.length, langs });
+      this._track('observe', { activeGames: this.stats().activeGames });
+    } else if (ACTIVE_PHASES.has(before) && after === 'final') this._track('gameFinished');
+    else if (ACTIVE_PHASES.has(before) && after === 'lobby') this._track('gameEndedByHost');
   }
 
   /** §11 X9: dev mode's bots leave a room no human is left in, and close when their room is gone. */

@@ -900,6 +900,8 @@ export default {
   'fb.menuTitle': 'Обратная связь',
   'fb.menuLead': 'Что-то сломалось или есть идея? Напиши нам на Гитхабе (нужен бесплатный аккаунт).',
   'fb.lead': 'Что-то не так или есть идея для игры?',
+  'fb.privacy': 'Конфиденциальность',
+  'fb.privacyHint': 'Что сайт хранит о тебе и как долго. Откроется в новой вкладке',
 
   // ---- the narrator (public/narrator.js). The Russian clip plays (SPEC §11 X5.16); a catastrophe without one plays the
   // English clip, and the *En variants say so. title = the catastrophe's title, secs = the clip's length

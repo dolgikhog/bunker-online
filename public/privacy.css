@@ -1,0 +1,183 @@
+/* Bunker Online — the privacy notice (public/privacy.html). The app's palette and type (style.css :root), on a page of
+   its own: no script, both languages in one file. English shows by default; #ru shows the Russian one instead (CSS
+   :target, and :has() to hide the other). A browser without :has() shows both, one under the other. */
+
+:root {
+  --bg: #0a0a08;
+  --panel: #121210;
+  --panel-2: #171713;
+  --line: #2a2922;
+  --line-2: #3a382d;
+  --text: #ece7d6;
+  --text-2: #bdb7a3;
+  --dim: #8d8876;
+  --faint: #6c685a;
+  --hz: #f5c518;
+  --hz-2: #ffd84a;
+  --hz-ink: #141100;
+  --hz-soft: rgba(245, 197, 24, .10);
+  --hz-line: rgba(245, 197, 24, .45);
+  --mono: "JetBrains Mono", "JetBrainsMono Nerd Font", "SF Mono", "Cascadia Mono", "Roboto Mono", Menlo, Consolas, "Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+  --hazard: repeating-linear-gradient(-45deg, var(--hz) 0 10px, #0b0b09 10px 20px);
+  color-scheme: dark;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+html, body { margin: 0; padding: 0; }
+body {
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: radial-gradient(ellipse 120% 60% at 50% -10%, #17160f 0%, var(--bg) 60%) fixed, var(--bg);
+  color: var(--text);
+  font: 15px/1.6 var(--sans);
+  overflow-x: hidden;
+  overflow-wrap: break-word;
+}
+a { color: var(--hz); text-decoration: underline; text-decoration-color: var(--hz-line); text-underline-offset: 3px; }
+a:focus-visible { outline: 2px solid var(--hz); outline-offset: 2px; border-radius: 2px; }
+@media (hover: hover) { a:hover { color: var(--hz-2); text-decoration-color: var(--hz-2); } }
+p, ul, dl, dd, h1, h2, h3 { margin: 0; }
+b { font-weight: 700; color: var(--text); }
+
+.hz-strip { height: 6px; background: var(--hazard); }
+
+/* the top bar: home on the left, the language switch on the right */
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  width: min(760px, 100%);
+  margin: 0 auto;
+  padding: 14px 16px 0;
+}
+.home-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  font: 700 12px/1.2 var(--mono);
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--hz);
+  text-decoration: none;
+}
+.hz-sign {
+  position: relative;
+  display: inline-block;
+  width: 22px;
+  height: 20px;
+  flex: none;
+  background: var(--hz);
+  clip-path: polygon(50% 0, 100% 100%, 0 100%);
+}
+.hz-sign span {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 1px;
+  text-align: center;
+  font: 900 12px/1 var(--mono);
+  color: var(--hz-ink);
+}
+.langs { display: inline-flex; border: 1px solid var(--line-2); border-radius: 3px; overflow: hidden; }
+.langs a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 14px;
+  font: 700 12px/1 var(--mono);
+  letter-spacing: .08em;
+  color: var(--text-2);
+  text-decoration: none;
+}
+.langs a + a { border-left: 1px solid var(--line-2); }
+/* the language on screen (where :has() works) */
+body:not(:has(#ru:target)) .langs .l-en,
+body:has(#ru:target) .langs .l-ru { background: var(--hz); color: var(--hz-ink); }
+
+/* the notice */
+main { width: min(760px, 100%); margin: 0 auto; padding: 26px 16px 40px; }
+.notice { display: block; scroll-margin-top: 140px; }
+#ru { display: none; }
+#ru:target { display: block; }
+body:has(#ru:target) #en { display: none; }
+
+.notice .kicker { font: 700 11px/1.3 var(--mono); letter-spacing: .22em; text-transform: uppercase; color: var(--hz); }
+h1 {
+  margin: 10px 0 6px;
+  font: 800 clamp(28px, 7vw, 44px)/1.05 var(--mono);
+  letter-spacing: -.01em;
+  color: var(--text);
+}
+.updated { font: 12px/1.4 var(--mono); color: var(--dim); }
+
+.short {
+  margin: 22px 0 8px;
+  padding: 14px 16px 16px;
+  background: var(--hz-soft);
+  border-left: 3px solid var(--hz);
+  border-radius: 0 4px 4px 0;
+}
+.short h2 { display: block; margin: 0 0 8px; padding: 0; border: 0; font: 700 10.5px/1.2 var(--mono); letter-spacing: .16em; text-transform: uppercase; color: var(--hz); }
+.short ul { padding-left: 1.2em; display: grid; gap: 5px; }
+
+.notice > section { margin-top: 30px; }
+.notice > section > p + p { margin-top: 10px; }
+.notice p, .notice li { color: var(--text-2); }
+.notice .short li { color: var(--text); }
+.notice .short li::marker { color: var(--hz); }
+h2 {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin: 0 0 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--line-2);
+  font: 700 18px/1.3 var(--sans);
+  color: var(--text);
+}
+h2 .n { font: 700 12px/1 var(--mono); color: var(--hz); flex: none; }
+
+.item {
+  padding: 12px 14px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+.item + .item { margin-top: 10px; }
+.item h3 { font: 700 15px/1.35 var(--sans); color: var(--text); margin-bottom: 6px; }
+.item p + p { margin-top: 8px; }
+.item dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 12px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  font-size: 13.5px;
+}
+.item dt { font: 700 10px/1.9 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); }
+.item dd { color: var(--text-2); }
+
+.svc { list-style: none; padding: 0; display: grid; gap: 10px; }
+.svc li { padding-left: 14px; border-left: 2px solid var(--line-2); }
+.svc + p { margin-top: 14px; }
+
+.home { margin-top: 36px; padding-top: 14px; border-top: 1px dashed var(--line-2); font: 13px/1.5 var(--mono); }
+
+@media (min-width: 640px) {
+  body { font-size: 16px; }
+  main { padding-top: 34px; }
+  .item { padding: 14px 18px 16px; }
+}
+
+/* print both languages */
+@media print {
+  #en, #ru { display: block !important; }
+  #ru { margin-top: 40px; }
+  .top, .hz-strip { display: none; }
+}

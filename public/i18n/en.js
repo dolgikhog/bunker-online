@@ -892,6 +892,10 @@ export default {
   'fb.menuTitle': 'Feedback',
   'fb.menuLead': 'Something broke, or you have an idea? Tell us on GitHub (a free account is needed).',
   'fb.lead': 'Something off, or an idea for the game?',
+  // the privacy notice link (public/privacy.html), next to the links above in the landing footer, the rules sheet and
+  // the final screen; it opens in a new tab
+  'fb.privacy': 'Privacy',
+  'fb.privacyHint': 'What the site keeps about you, and for how long. Opens in a new tab',
 
   // ---- the narrator (public/narrator.js). The clip plays in the viewer's language (SPEC §11 X5.16); a language with
   // no clip of its own plays the English one, and the *En variants (narr.listenEn, narr.hearTitleEn, narr.listenAriaEn,

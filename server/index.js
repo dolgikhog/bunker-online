@@ -8,14 +8,23 @@
 // TCP peer is loopback counts as the last address in its X-Forwarded-For for every per-IP limit).
 // BUNKER_DEV (=1: dev mode, SPEC §11 X9: test shortcuts, see server/dev.js; never set in production, and refused
 // together with BUNKER_TRUST_PROXY=1 or NODE_ENV=production). BUNKER_WS_DEFLATE (=1: permessage-deflate on /ws, =0: off;
-// off by default, SPEC §11 X5.15: see WS_DEFLATE).
+// off by default, SPEC §11 X5.15: see WS_DEFLATE). BUNKER_STATE_DIR (unset: in memory only; relative paths resolve
+// against the repo root): where analytics.json, the daily usage counts, is kept (server/analytics.js; never in dev
+// mode; production: /var/lib/bunker).
+// BUNKER_ADMIN_TOKEN (at least 24 characters, URL-safe): turns on GET /admin/stats?key=<token>, the usage dashboard;
+// unset or shorter, that path is the plain 404 like any other.
 // Once listening, prints `BUNKER_LISTENING <port>` and `listening on http://<host>:<port>` to stdout, then in dev mode
 // DEV_BANNER.
 // HTTP: GET /healthz -> ok; GET /stats -> {"rooms","activeGames","sockets"} only for a request made on this host (a
 // loopback peer with no X-Forwarded-For, SPEC §11 X8), 404 for everyone else; in dev mode only, GET /devinfo ->
 // {"dev":true} and /dev -> public/dev.html (without dev mode these and every public/dev.* file are the plain 404);
-// every other path is a static file, GET or HEAD, with byte ranges for a GET (Accept-Ranges: bytes, 206, 416; see
-// parseRange).
+// GET /admin/stats?key=<BUNKER_ADMIN_TOKEN> -> the usage dashboard (&format=json: its data), to anyone with the key
+// (serveAdmin; without dev mode only); every other path is a static file, GET or HEAD, with byte ranges for a GET
+// (Accept-Ranges: bytes, 206, 416; see parseRange) and, for every file but the app page, a weak ETag and 304 answers
+// to If-None-Match / If-Modified-Since (Cache-Control: no-cache, so a browser revalidates and gets a 304, not the
+// bytes again). The app page (/ or /index.html) is no-store; with a valid ?room=CODE it is sent with the invite's
+// title, og:title and og:url (server/meta.js, for link previews). A GET of it is counted (analytics.js: a day's views
+// and visitors, never the request itself).
 
 import http from 'node:http';
 import net from 'node:net';
@@ -25,6 +34,8 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { Rooms, ipKey, siteKey, SITE_FACTOR } from './rooms.js';
 import { mulberry32, seedFromString } from './rng.js';
+import { Analytics, AdminGate, ADMIN_CSP, ANALYTICS_FILE, adminTokenUsable, renderDashboard } from './analytics.js';
+import { roomFromUrl, withRoomPreview } from './meta.js';
 
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -85,6 +96,7 @@ const MIME = {
   '.map': 'application/json; charset=utf-8',
   '.webmanifest': 'application/manifest+json; charset=utf-8',
   '.txt': 'text/plain; charset=utf-8',
+  '.xml': 'application/xml; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -115,6 +127,10 @@ export function configFromEnv(env = process.env) {
   const publicDir = env.BUNKER_PUBLIC_DIR && env.BUNKER_PUBLIC_DIR.trim()
     ? path.resolve(REPO_ROOT, env.BUNKER_PUBLIC_DIR.trim())
     : path.join(REPO_ROOT, 'public');
+  // unset: the counts stay in memory (a local run or a test never writes into the repo); production sets it
+  const stateDir = env.BUNKER_STATE_DIR && env.BUNKER_STATE_DIR.trim()
+    ? path.resolve(REPO_ROOT, env.BUNKER_STATE_DIR.trim())
+    : null;
   return {
     port,
     host: env.HOST && env.HOST.trim() ? env.HOST.trim() : '0.0.0.0',
@@ -129,6 +145,10 @@ export function configFromEnv(env = process.env) {
     production: env.NODE_ENV === 'production',
     // §11 X5.15: permessage-deflate on /ws (WS_DEFLATE): "1" on, "0" off, anything else the default (WS_DEFLATE_DEFAULT)
     wsDeflate: env.BUNKER_WS_DEFLATE === '1' ? true : env.BUNKER_WS_DEFLATE === '0' ? false : WS_DEFLATE_DEFAULT,
+    // usage counts (server/analytics.js): the directory of analytics.json (null: counted in memory only), and the
+    // dashboard's key (not adminTokenUsable: no dashboard)
+    stateDir,
+    adminToken: typeof env.BUNKER_ADMIN_TOKEN === 'string' ? env.BUNKER_ADMIN_TOKEN.trim() : '',
   };
 }
 
@@ -305,6 +325,34 @@ export function parseRange(header, size) {
   return { status: 206, ...ok[0] };
 }
 
+// ---- static files: conditional requests (RFC 9110 §13) -----------------------------------------------------------
+
+/**
+ * A static file's validator: a weak entity tag of its size and modification time (weak, so it never satisfies an
+ * If-Range: that needs a strong one, and If-Range keeps comparing Last-Modified). deploy.sh's rsync keeps the source
+ * files' mtimes, so an unchanged file keeps its tag across deploys and a changed one gets a new one.
+ */
+export function fileEtag(st) {
+  return `W/"${st.size.toString(16)}-${Math.floor(st.mtimeMs).toString(16)}"`;
+}
+
+/**
+ * Whether a GET or HEAD of a file with `etag` and modification time `mtimeMs` may be answered 304 Not Modified:
+ * If-None-Match, when present, decides alone (a weak comparison against each listed tag, or "*"); otherwise a valid
+ * If-Modified-Since at or after the file's time (in whole seconds, Last-Modified's precision) does (RFC 9110 §13.2.2).
+ */
+export function notModified(headers, etag, mtimeMs) {
+  const inm = headers['if-none-match'];
+  if (typeof inm === 'string') {
+    const want = etag.replace(/^W\//, '');
+    return inm.split(',').some((t) => { const x = t.trim(); return x === '*' || x.replace(/^W\//, '') === want; });
+  }
+  const ims = headers['if-modified-since'];
+  if (typeof ims !== 'string') return false;
+  const since = Date.parse(ims);
+  return Number.isFinite(since) && Math.floor(mtimeMs / 1000) * 1000 <= since;
+}
+
 /**
  * The static file server. `dev` (§11 X9): serve /devinfo and /dev (public/dev.html), and let pages of this origin frame
  * ours (X-Frame-Options SAMEORIGIN instead of DENY: the test table shows each seat's client in an <iframe>). Without it
@@ -348,8 +396,40 @@ function makeStaticHandler(publicDir, { dev = false } = {}) {
           const ext = path.extname(real).toLowerCase();
           const isIndex = path.basename(real) === 'index.html';
           const lastModified = st.mtime.toUTCString();
+          const security = {
+            'Content-Security-Policy': CSP,
+            'X-Content-Type-Options': 'nosniff',
+            'Referrer-Policy': 'no-referrer',
+            'X-Frame-Options': frameOptions,
+          };
+          // an invite link to the app page (/?room=ABCD): the page with the room in its title, og:title and og:url, so
+          // a chat app's preview names the room (server/meta.js; anything but a valid code gets the file as it is).
+          // The whole page, 200: Range is ignored, which a server may always do.
+          if (isIndex && real === path.join(realRoot, 'index.html') && roomFromUrl(req.url)) {
+            fs.readFile(real, 'utf8', (errRead, text) => {
+              if (errRead) { sendText(res, 404, 'Not found'); return; }
+              const body = Buffer.from(withRoomPreview(text, req.url), 'utf8');
+              res.writeHead(200, {
+                'Content-Type': MIME['.html'],
+                'Content-Length': body.length,
+                'Cache-Control': 'no-store',
+                ...security,
+                'Last-Modified': lastModified,
+              });
+              res.end(req.method === 'HEAD' ? undefined : body);
+            });
+            return;
+          }
+          // every file but the app page (no-store: counted, and never cached) is revalidated: a weak ETag and
+          // Last-Modified, and a 304 when the browser's copy is current (notModified)
+          const etag = isIndex ? null : fileEtag(st);
+          if (etag && notModified(req.headers, etag, st.mtimeMs)) {
+            res.writeHead(304, { ETag: etag, 'Last-Modified': lastModified, 'Cache-Control': 'no-cache', ...security });
+            res.end();
+            return;
+          }
           // byte ranges (parseRange): for a GET only (RFC 9110 §14.2), and an If-Range that is not this file's
-          // Last-Modified (an ETag, an older date) means the file changed since: then the whole file
+          // Last-Modified (a weak ETag, an older date) means the file changed since: then the whole file
           const ifRange = req.headers['if-range'];
           const range = req.method === 'GET' && (ifRange === undefined || ifRange === lastModified)
             ? parseRange(req.headers.range, st.size) : { status: 200 };
@@ -364,11 +444,9 @@ function makeStaticHandler(publicDir, { dev = false } = {}) {
             ...(part ? { 'Content-Range': `bytes ${range.start}-${range.end}/${st.size}` } : {}),
             'Accept-Ranges': 'bytes',
             'Cache-Control': isIndex ? 'no-store' : 'no-cache',
-            'Content-Security-Policy': CSP,
-            'X-Content-Type-Options': 'nosniff',
-            'Referrer-Policy': 'no-referrer',
-            'X-Frame-Options': frameOptions,
+            ...security,
             'Last-Modified': lastModified,
+            ...(etag ? { ETag: etag } : {}),
           });
           if (req.method === 'HEAD') { res.end(); return; }
           const stream = fs.createReadStream(real, part ? { start: range.start, end: range.end } : undefined);
@@ -379,6 +457,29 @@ function makeStaticHandler(publicDir, { dev = false } = {}) {
       });
     });
   };
+}
+
+// ---- usage counts and the owner's dashboard (server/analytics.js) ------------------------------------------------
+
+/** The app page: what a visit loads first (/?room=CODE included). */
+function isAppPage(pathname) {
+  return pathname === '/' || pathname === '/index.html';
+}
+
+/** An answer of the dashboard: no-store, never indexed, never framed, no referrer (its URL carries the key). */
+function sendAdmin(res, type, text) {
+  const body = Buffer.from(text, 'utf8');
+  res.writeHead(200, {
+    'Content-Type': type,
+    'Content-Length': body.length,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Robots-Tag': 'noindex, nofollow',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': ADMIN_CSP,
+  });
+  res.end(res.req.method === 'HEAD' ? undefined : body);
 }
 
 function rejectUpgrade(socket, status, text) {
@@ -418,6 +519,49 @@ export async function startServer(options = {}) {
   if (devModule) rooms.dev = new devModule.DevTools(rooms, { logger: log, botIdleMs: cfg.devBotIdleMs, botDelay: cfg.devBotDelay });
   const serveStatic = makeStaticHandler(cfg.publicDir, { dev });
 
+  // Usage counts (server/analytics.js): never in dev mode (its test tables are not visitors), and off with
+  // `analytics: false`; an object there overrides Analytics' options (tests: a clock, a salt source, the interval).
+  // `stateDir: null` keeps them in memory only. The dashboard needs them and a usable BUNKER_ADMIN_TOKEN.
+  let wss = null;
+  const analyticsOpts = cfg.analytics && typeof cfg.analytics === 'object' ? cfg.analytics : {};
+  const analytics = dev || cfg.analytics === false ? null : new Analytics({
+    file: cfg.stateDir ? path.join(cfg.stateDir, ANALYTICS_FILE) : null,
+    logger: log,
+    gauges: () => ({ sockets: wss ? wss.clients.size : 0, activeGames: rooms.stats().activeGames }),
+    ...analyticsOpts,
+  });
+  rooms.analytics = analytics;
+  const adminGate = analytics && adminTokenUsable(cfg.adminToken) ? new AdminGate({ token: cfg.adminToken, ...(cfg.adminGate || {}) }) : null;
+  const clientIp = (req) => resolveClientIp(req.socket.remoteAddress, req.headers['x-forwarded-for'], cfg.trustProxy);
+
+  /** Counts a GET of the app page (a view or a bot hit, and today's visitor hash in memory). Never throws. */
+  const countPageView = (req, url) => {
+    try {
+      analytics.pageView({
+        ip: clientIp(req), ua: req.headers['user-agent'], referer: req.headers.referer, host: req.headers.host,
+        invite: url.searchParams.has('room'),
+      });
+    } catch (e) { log('analytics page view failed', e); }
+  };
+
+  /**
+   * GET /admin/stats?key=… (HEAD too): the dashboard, or with &format=json its data. A missing or wrong key, a network
+   * that has spent its failed attempts (AdminGate), or no dashboard at all get the static server's own 404, byte for
+   * byte, so the path looks absent and there is no oracle. The static server itself answers them (there is no
+   * public/admin/stats): a refusal then takes a missing file's time too, not a shortcut's measurably quicker one.
+   */
+  const serveAdmin = (req, res, url) => {
+    if (!adminGate || !adminGate.check(clientIp(req), url.searchParams.get('key'))) { serveStatic(req, res); return; }
+    const st = rooms.stats();
+    const report = analytics.report({ sockets: wss.clients.size, rooms: st.rooms, activeGames: st.activeGames });
+    if (url.searchParams.get('format') === 'json') {
+      sendAdmin(res, 'application/json; charset=utf-8', JSON.stringify(report));
+      return;
+    }
+    const jsonHref = `?key=${encodeURIComponent(url.searchParams.get('key'))}&format=json`;
+    sendAdmin(res, 'text/html; charset=utf-8', renderDashboard(report, { jsonHref }));
+  };
+
   // §11 X8: {rooms, activeGames, sockets} for the deploy script (curl 127.0.0.1:8080/stats on the server). Anyone
   // else, including every request through the proxy, gets the static server's own 404, so /stats looks absent.
   // `sockets` counts every open WebSocket, in a room or not.
@@ -441,6 +585,12 @@ export async function startServer(options = {}) {
   const server = http.createServer((req, res) => {
     try {
       if (isStatsRequest(req)) { serveStats(req, res); return; }
+      if (analytics && (req.method === 'GET' || req.method === 'HEAD')) {
+        let url = null;
+        try { url = new URL(req.url || '/', 'http://localhost'); } catch { /* the static server answers it */ }
+        if (url && url.pathname === '/admin/stats') { serveAdmin(req, res, url); return; }
+        if (url && req.method === 'GET' && isAppPage(url.pathname)) countPageView(req, url);
+      }
       serveStatic(req, res);
     } catch (e) {
       log('http handler failed', e);
@@ -452,7 +602,7 @@ export async function startServer(options = {}) {
     else socket.destroy();
   });
 
-  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD, perMessageDeflate: wsDeflateOption(cfg.wsDeflate === true), clientTracking: true });
+  wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD, perMessageDeflate: wsDeflateOption(cfg.wsDeflate === true), clientTracking: true });
   const perIp = new Map();
 
   server.on('upgrade', (req, socket, head) => {
@@ -493,6 +643,9 @@ export async function startServer(options = {}) {
     };
     ws._bunkerConn = conn;
     rooms.open(conn);
+    if (analytics) {
+      try { analytics.observe({ sockets: wss.clients.size }); } catch (e) { log('analytics observe failed', e); }
+    }
     ws.on('error', () => {});
     ws.on('pong', () => { conn.alive = true; });
     ws.on('message', (data, isBinary) => {
@@ -541,6 +694,11 @@ export async function startServer(options = {}) {
     server.listen(cfg.port, cfg.host);
   });
   server.on('error', (e) => log('server error', e));
+  // the analytics tick (a new salt at UTC midnight, the peaks sampled, the file written when something changed), and
+  // the dashboard's failed-attempt budgets dropped once refilled
+  analytics?.start();
+  const gateSweep = adminGate ? setInterval(() => adminGate.sweep(), 60_000) : null;
+  gateSweep?.unref();
 
   const port = server.address().port;
   const shownHost = cfg.host.includes(':') ? `[${cfg.host}]` : cfg.host;
@@ -553,17 +711,23 @@ export async function startServer(options = {}) {
     host: cfg.host,
     url: `http://${shownHost}:${port}`,
     config: cfg,
+    analytics,
+    adminEnabled: !!adminGate,
     close() {
       if (closed) return Promise.resolve();
       closed = true;
       clearInterval(heartbeat);
       clearInterval(sweeper);
       if (rooms.dev) rooms.dev.close();
+      clearInterval(gateSweep);
+      // the day's counts reach the disk first (SIGTERM: a deploy restart), then the sockets close
+      const flushed = analytics ? analytics.close().catch((e) => log('analytics close failed', e)) : Promise.resolve();
       for (const ws of wss.clients) ws.terminate();
-      return new Promise((resolve) => {
+      const stopped = new Promise((resolve) => {
         wss.close(() => server.close(() => resolve()));
         server.closeAllConnections?.();
       });
+      return Promise.all([flushed, stopped]).then(() => {});
     },
   };
 }
@@ -592,7 +756,8 @@ if (import.meta.main) {
     process.stdout.write(`BUNKER_LISTENING ${srv.port}\n`);
     process.stdout.write(`listening on ${srv.url}\n`);
     if (cfg.dev) process.stdout.write(`${DEV_BANNER}\n`);
-    process.stderr.write(`[bunker] public dir ${cfg.publicDir}; min players ${cfg.minPlayers}${cfg.seed !== null ? `; seed ${cfg.seed}` : ''}${cfg.noLimits ? '; limits OFF' : ''}${cfg.trustProxy ? '; trusting X-Forwarded-For from loopback' : ''}${cfg.wsDeflate ? '; WebSocket permessage-deflate on' : ''}${cfg.dev ? '; DEV MODE (test shortcuts at /dev)' : ''}\n`);
+    process.stderr.write(`[bunker] public dir ${cfg.publicDir}; min players ${cfg.minPlayers}${cfg.seed !== null ? `; seed ${cfg.seed}` : ''}${cfg.noLimits ? '; limits OFF' : ''}${cfg.trustProxy ? '; trusting X-Forwarded-For from loopback' : ''}${cfg.wsDeflate ? '; WebSocket permessage-deflate on' : ''}${cfg.dev ? '; DEV MODE (test shortcuts at /dev)' : ''}${srv.analytics ? `; usage counts in ${srv.analytics.file ?? 'memory'}${srv.adminEnabled ? ', dashboard at /admin/stats' : ''}` : ''}\n`);
+    if (srv.analytics && cfg.adminToken && !srv.adminEnabled) process.stderr.write('[bunker] BUNKER_ADMIN_TOKEN is shorter than 24 characters: /admin/stats stays off\n');
     const stop = () => { srv.close().finally(() => process.exit(0)); setTimeout(() => process.exit(0), 2000).unref(); };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);

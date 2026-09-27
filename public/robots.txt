@@ -1,0 +1,10 @@
+# https://sealthebunker.com/ (reports/seo.md)
+# Everything is open to crawlers except the test table (/dev, dev mode only), the owner's pages (/admin) and the
+# health probe. Invite links (/?room=ABCD) are allowed: their canonical is the home page.
+User-agent: *
+Allow: /
+Disallow: /dev
+Disallow: /admin
+Disallow: /healthz
+
+Sitemap: https://sealthebunker.com/sitemap.xml

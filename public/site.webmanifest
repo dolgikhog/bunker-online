@@ -1,0 +1,20 @@
+{
+  "id": "/",
+  "name": "Seal the Bunker",
+  "short_name": "Bunker",
+  "description": "A free online table for the post-apocalyptic party game “Bunker”, 4–16 players. Бункер онлайн: онлайн-стол для дискуссионной игры «Бункер».",
+  "lang": "en",
+  "dir": "ltr",
+  "start_url": "/",
+  "scope": "/",
+  "display": "browser",
+  "background_color": "#0a0a08",
+  "theme_color": "#0b0b09",
+  "categories": ["games", "entertainment"],
+  "icons": [
+    { "src": "/favicon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
