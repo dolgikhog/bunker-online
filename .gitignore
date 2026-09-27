@@ -84,5 +84,8 @@ desktop.ini
 # written by deploy/deploy.sh
 public/version.json
 
+# usage counts of a server run with BUNKER_STATE_DIR=data (server/analytics.js; production keeps them in /var/lib/bunker)
+/data/
+
 # local stable checkouts (e.g. the dev test table)
 .worktrees/

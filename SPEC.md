@@ -1815,3 +1815,26 @@ The owner tests alone in one browser. Every incognito window shares one storage,
   - The client fetches it once. It shows `v<version>` quietly in the Rules sheet and the landing footer, and uses it in the links.
   - If the file is missing, the version is `dev`.
 - **Styling:** these links are small, secondary and never in the way of play. Keep all existing data-testids. The new ids are `report-issue-link`, `suggest-idea-link` and `app-version`.
+
+### X11: search, link previews, privacy notice and usage counts (2026-09-27, owner request; detail in reports/seo.md, reports/analytics.md, reports/privacy.md, reports/seo-analytics-integration.md)
+
+- **Brand.** On sealthebunker.com the site is "Seal the Bunker". The in-game naming is unchanged (`app.title` "Bunker Online" / «Бункер онлайн»).
+- **The page head (`public/index.html`).** A bilingual title and description (English first), canonical `https://sealthebunker.com/`, Open Graph tags with `og:image` `/og-image.png` (1200×630), `twitter:card` `summary_large_image`, JSON-LD (`WebSite` and `VideoGame`+`WebApplication`), icons and `site.webmanifest` (`display: browser`). No hreflang: one URL serves both languages, and app.js picks one.
+- **Fallback text.** `#app` starts with a static `<main class="seo-fallback">` (EN and RU, a no-JavaScript notice, the privacy links). It is hidden wherever scripts run and replaced by app.js's first render. It is never a `div`, because tools/e2e.js waits for `#app > div`.
+- **modulepreload.** The page preloads app.js's whole static import graph, plus narrator.js. `test/static.test.js` keeps the list in step with the imports.
+- **Invite previews (`server/meta.js`).** `GET /?room=CODE` (a valid §7 code, the first `room` parameter, either case) sends index.html with `<title>` and `og:title` "Join room CODE — Seal the Bunker" and `og:url` `https://sealthebunker.com/?room=CODE`. The canonical stays `/`. The answer is `no-store` and always the whole page (200; Range is ignored); HEAD has no body. Anything else gets the file byte for byte.
+- **Static files.**
+  - New: `robots.txt` (disallows `/dev`, `/admin`, `/healthz`; names the sitemap), `sitemap.xml` (`/` and `/privacy.html`), `og-image.png`, `favicon.ico`, `apple-touch-icon.png`, `icon-192.png`, `icon-512.png`, `icon-maskable-512.png`, `site.webmanifest`, `privacy.html`, `privacy.css`. The MIME map gains `.xml`.
+  - Every file but the app page: `Cache-Control: no-cache`, `Last-Modified` and a weak `ETag` (`W/"<size>-<mtime ms>"`, hex). A matching `If-None-Match` (weak comparison; when present it decides alone) or an `If-Modified-Since` at or after the file's time gets a 304. The weak tag never satisfies `If-Range`.
+  - The app page: `no-store`, no ETag, never a 304.
+- **Privacy notice (`/privacy.html`).** Static, with no script. English by default, Russian at `#ru`. The links have `data-testid="privacy-link"` and `data-where` = `landing`, `rules` or `final`, and open in a new tab, with `#ru` added in Russian. The strings are `fb.privacy` and `fb.privacyHint`. **The notice is the contract for logging, usage counts and storage: a change to any of them updates the notice and its date, in both languages.**
+- **Usage counts (`server/analytics.js`).**
+  - Per UTC day: views (GETs of `/` and `/index.html`; `invites` those with `?room=`) and bots (judged by User-Agent, a number only).
+  - Visitors: distinct HMAC-SHA256 of the network (rooms.js `ipKey`) and the User-Agent, keyed with a random daily salt. The salt and the hashes live in memory only; only the day's count is stored.
+  - Sources: the referring host, at most 30 a day.
+  - Game counts, from rooms.js: rooms, spectators, games started (players, a histogram, EN/RU), finished, ended by the host, abandoned, and the day's peaks.
+  - No cookies and no client script. Dev mode counts nothing.
+  - Storage: `$BUNKER_STATE_DIR/analytics.json` (unset: memory only). Writes are atomic, at most once a minute and on SIGTERM. 400 days are kept, then folded into all-time totals.
+- **Dashboard.** `GET /admin/stats?key=<BUNKER_ADMIN_TOKEN>` (a token of at least 24 characters), `&format=json` for the data. The key is compared in constant time. Failed attempts per network: a burst of 10, then 1 a minute. Every refusal is the static 404. The page has its own CSP, `no-store` and `noindex`. X8's `/stats` is unchanged.
+- **Logs.** The game server never logs an IP address, a User-Agent, a player name or game content. The tests scan the log for them.
+- **Production.** `BUNKER_STATE_DIR=/var/lib/bunker` (`StateDirectory=bunker`), and `BUNKER_ADMIN_TOKEN` in `/etc/bunker/bunker.env`.

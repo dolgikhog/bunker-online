@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0b09">
+<meta name="description" content="Privacy notice of sealthebunker.com: no accounts, no cookies, no trackers; what the game keeps, why and for how long. Политика конфиденциальности sealthebunker.com: без аккаунтов, cookie и трекеров; что хранит игра, зачем и как долго.">
+<!-- The privacy notice, English and Russian on one static page (no script: the CSP allows none inline). #ru shows the
+     Russian one (privacy.css). The in-game links (app.js privacyLink) open it in a new tab, with #ru in Russian.
+     Facts behind it: reports/privacy.md, reports/seo-analytics-integration.md. Change the date in both languages whenever
+     the text changes. -->
+<title>Privacy · Конфиденциальность · sealthebunker.com</title>
+<link rel="canonical" href="https://sealthebunker.com/privacy.html">
+<link rel="icon" href="favicon.ico" sizes="32x32">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="privacy.css">
+</head>
+<body>
+<div class="hz-strip" aria-hidden="true"></div>
+<header class="top">
+  <a class="home-mark" href="/"><span class="hz-sign" aria-hidden="true"><span>!</span></span>sealthebunker.com</a>
+  <nav class="langs" aria-label="Language · Язык">
+    <a class="l-en" href="#en" hreflang="en" lang="en">English</a><a class="l-ru" href="#ru" hreflang="ru" lang="ru">Русский</a>
+  </nav>
+</header>
+<main>
+
+<article id="en" class="notice" lang="en" aria-labelledby="en-title">
+  <p class="kicker">Data &amp; privacy</p>
+  <h1 id="en-title">Privacy notice</h1>
+  <p class="updated">Last updated: <time datetime="2026-09-27">27 September 2026</time></p>
+
+  <section class="short" aria-labelledby="en-short">
+    <h2 id="en-short">In short</h2>
+    <ul>
+      <li>No account, no cookies, no ads, no trackers, no third-party scripts.</li>
+      <li>Your IP address is used in the server’s memory to keep the game running and protected from abuse. It is never
+        saved.</li>
+      <li>Names, cards and votes exist in memory only while their room is open.</li>
+      <li>We count visitors and games as totals, and the totals are all we keep.</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="en-who">
+    <h2 id="en-who"><span class="n">01</span>Who runs this site</h2>
+    <p><b>sealthebunker.com</b> is a free, non-commercial hobby project run by a private individual,
+      <a href="https://github.com/dolgikhog">@dolgikhog on GitHub</a>. That person is the controller of the data described
+      here.</p>
+    <p>Questions about privacy: <a href="mailto:privacy@sealthebunker.com">privacy@sealthebunker.com</a>, or an
+      <a href="https://github.com/dolgikhog/bunker-online/issues">issue on GitHub</a>. GitHub issues are public, so use
+      email for anything personal.</p>
+  </section>
+
+  <section aria-labelledby="en-what">
+    <h2 id="en-what"><span class="n">02</span>What is processed, and why</h2>
+    <div class="item">
+      <h3>Your IP address and browser details</h3>
+      <p>As with any website, every request brings your IP address and your browser’s user-agent string to the server.
+        The game uses the IP address to cap how many connections, rooms and failed attempts (such as wrong room codes)
+        one network gets, which protects it from abuse and overload.</p>
+      <dl><dt>Kept</dt><dd>In memory only, while your connection or your room lasts (a count of failed attempts: at most
+        about ten minutes after the last one). The web server keeps no access logs, and its error lines leave the IP address
+        out (see “Error logs”).</dd></dl>
+    </div>
+    <div class="item">
+      <h3>Visit counts</h3>
+      <p>Each time the game page loads, the server adds to the day’s totals: a page view, whether the link was an invite
+        to a room, and the site that linked here if your browser says so (its domain only, such as google.com). Crawlers
+        and scripts are counted as a number only.</p>
+      <p>To count how many different people visit per day, the server makes a one-way hash of your IP address and user
+        agent, salted with a random key that is replaced every day. The key and the hashes stay in memory, cannot be
+        turned back into an address, and are thrown away when the day ends. Only the day’s total is saved.</p>
+      <dl><dt>Kept</dt><dd>Hashes: in memory, until the end of the day. Daily totals: 400 days, after which they only
+        add to all-time totals.</dd></dl>
+    </div>
+    <div class="item">
+      <h3>Game statistics</h3>
+      <p>Totals only, such as rooms created, games started and finished, players per game, the share of English and
+        Russian, and the day’s highest number of connections and of games at the same time. No names, no addresses, no
+        room codes, no game content.</p>
+      <dl><dt>Kept</dt><dd>Daily totals: 400 days, after which they only add to all-time totals.</dd></dl>
+    </div>
+    <div class="item">
+      <h3>What you type and play</h3>
+      <p>The display name you choose, your cards, your votes and the game log are held in the server’s memory to run the
+        game, and the other people in your room see them. Nothing asks for your real name: a nickname is fine.</p>
+      <dl><dt>Kept</dt><dd>In memory only. A room and everything in it is deleted at the latest 30 minutes after the last
+        person leaves, or when the server restarts.</dd></dl>
+    </div>
+    <div class="item">
+      <h3>Error logs</h3>
+      <p>When something breaks, the game server writes a technical message to the system log: program errors, and lines
+        about rooms such as “room ABCD deleted (idle)”. These never contain IP addresses, names or game content.</p>
+      <p>The web server in front of the game (Caddy) keeps no access logs. When a request fails there, for example in the
+        few seconds the game restarts for an update, it writes an error line with the requested web address (which may
+        contain a room code) and technical details such as the error and its duration. The IP address and everything your
+        browser sent with the request (user-agent, languages, referring site) are removed before the line is written.</p>
+      <dl><dt>Kept</dt><dd>Until the system log’s rotation removes them (the log’s size is capped).</dd></dl>
+    </div>
+  </section>
+
+  <section aria-labelledby="en-device">
+    <h2 id="en-device"><span class="n">03</span>What stays on your device</h2>
+    <p>The site keeps a few entries in your browser’s localStorage and sessionStorage: a token that puts you back in your
+      seat after a reload, the name you last used, your language, your narrator and display settings, and notes that the
+      game briefing and a narration were already shown, so they are not repeated. They stay on
+      your device and go to the server only when the game needs them, for example the token when you rejoin your room.
+      There are no cookies. To remove the entries, clear this site’s data in your browser.</p>
+  </section>
+
+  <section aria-labelledby="en-others">
+    <h2 id="en-others"><span class="n">04</span>Other services</h2>
+    <ul class="svc">
+      <li><b>Hosting.</b> <a href="https://www.hetzner.com/legal/privacy-policy">Hetzner Online GmbH</a> runs the server
+        in Germany (EU), as a processor on our behalf. The data above does not leave the EU.</li>
+      <li><b>HTTPS.</b> The web server, Caddy, uses certificates from
+        <a href="https://letsencrypt.org/privacy/">Let’s Encrypt</a>. No visitor data goes to them.</li>
+      <li><b>GitHub.</b> “Report an issue” and “Suggest an idea” open GitHub (GitHub, Inc., USA), a separate service with
+        its <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">own privacy
+        statement</a>. The form comes prefilled with the game version, a short browser summary such as “Firefox 131 ·
+        Linux”, your language and, in a room, the room code. GitHub receives these when the link opens; they become public
+        only if you submit the issue.</li>
+      <li><b>Google Search Console.</b> We use it to see how the site appears in Google Search. It adds no script and no
+        cookie to this site: Google collects that data on its own search pages, under its
+        <a href="https://policies.google.com/privacy">own privacy policy</a>.</li>
+    </ul>
+    <p>Nobody else gets data from this site. Nothing is sold, and there is no profiling or automated decision-making.</p>
+  </section>
+
+  <section aria-labelledby="en-basis">
+    <h2 id="en-basis"><span class="n">05</span>Legal basis</h2>
+    <p>Legitimate interests (Art. 6(1)(f) GDPR): running the game, keeping it secure and fair, and knowing roughly how
+      many people use it. The entries on your device are strictly necessary for features you ask for, so they need no
+      consent (Art. 5(3) of the ePrivacy Directive, 2002/58/EC). With no cookies and no tracking, there is nothing to
+      consent to.</p>
+  </section>
+
+  <section aria-labelledby="en-rights">
+    <h2 id="en-rights"><span class="n">06</span>Your rights</h2>
+    <p>Under the GDPR you may ask for access to your data, its correction or erasure, and restriction of its processing,
+      and you may object to the processing. You can also complain to a data protection authority, for example in the EU
+      country where you live or work.</p>
+    <p>In practice almost nothing stored here identifies you, so there is usually nothing to look up or delete: game data
+      disappears with its room, error lines with the log’s rotation, and the entries on your device are yours to clear.
+      Questions:
+      <a href="mailto:privacy@sealthebunker.com">privacy@sealthebunker.com</a>.</p>
+  </section>
+
+  <section aria-labelledby="en-changes">
+    <h2 id="en-changes"><span class="n">07</span>Changes</h2>
+    <p>If the site starts handling data differently, this page and the date at the top are updated at the same time.</p>
+  </section>
+
+  <p class="home"><a href="/">← sealthebunker.com</a></p>
+</article>
+
+<article id="ru" class="notice" lang="ru" aria-labelledby="ru-title">
+  <p class="kicker">Данные и конфиденциальность</p>
+  <h1 id="ru-title">Политика конфиденциальности</h1>
+  <p class="updated">Обновлено: <time datetime="2026-09-27">27 сентября 2026 г.</time></p>
+
+  <section class="short" aria-labelledby="ru-short">
+    <h2 id="ru-short">Коротко</h2>
+    <ul>
+      <li>Ни аккаунтов, ни файлов cookie, ни рекламы, ни трекеров, ни сторонних скриптов.</li>
+      <li>Твой IP-адрес используется в памяти сервера, чтобы игра работала и была защищена от злоупотреблений. Он нигде не
+        сохраняется.</li>
+      <li>Имена, карты и голоса существуют только в памяти, пока открыта их комната.</li>
+      <li>Посетителей и игры мы считаем только суммарно, и хранятся только эти суммы.</li>
+    </ul>
+  </section>
+
+  <section aria-labelledby="ru-who">
+    <h2 id="ru-who"><span class="n">01</span>Кто отвечает за сайт</h2>
+    <p><b>sealthebunker.com</b> — бесплатный некоммерческий проект частного лица:
+      <a href="https://github.com/dolgikhog">@dolgikhog на Гитхабе</a>. Этот человек и отвечает за обработку описанных
+      здесь данных (по GDPR — контролёр).</p>
+    <p>Вопросы о данных: <a href="mailto:privacy@sealthebunker.com">privacy@sealthebunker.com</a> или
+      <a href="https://github.com/dolgikhog/bunker-online/issues">обращение на Гитхабе</a>. Обращения на Гитхабе
+      публичны, поэтому личное лучше писать на почту.</p>
+  </section>
+
+  <section aria-labelledby="ru-what">
+    <h2 id="ru-what"><span class="n">02</span>Что обрабатывается и зачем</h2>
+    <div class="item">
+      <h3>IP-адрес и данные браузера</h3>
+      <p>Как и на любом сайте, с каждым запросом сервер получает твой IP-адрес и строку user-agent браузера. По IP-адресу
+        игра ограничивает, сколько подключений, комнат и неудачных попыток (например, неверных кодов комнат) приходится
+        на одну сеть, — это защищает её от злоупотреблений и перегрузки.</p>
+      <dl><dt>Хранится</dt><dd>Только в памяти, пока открыто подключение или существует комната (счётчик неудачных
+        попыток — не дольше примерно десяти минут после последней). Журналов доступа веб-сервер не ведёт, а из строк
+        журнала ошибок IP-адрес удаляется (см. «Журнал ошибок»).</dd></dl>
+    </div>
+    <div class="item">
+      <h3>Счётчик посещений</h3>
+      <p>Каждый раз, когда загружается страница игры, сервер прибавляет к итогам дня: просмотр страницы, была ли это
+        ссылка-приглашение в комнату, и сайт, откуда ведёт ссылка, если браузер его сообщает (только домен, например
+        google.com). Поисковые роботы и скрипты учитываются только общим числом.</p>
+      <p>Чтобы понять, сколько разных людей заходит за день, сервер вычисляет необратимый хеш от IP-адреса и user-agent
+        с «солью» — случайным ключом, который каждый день заменяется новым. Ключ и хеши хранятся только в памяти,
+        восстановить по ним адрес нельзя, а в конце дня они удаляются. Сохраняется только итоговое число за день.</p>
+      <dl><dt>Хранится</dt><dd>Хеши — в памяти, до конца дня. Итоги по дням — 400 дней, потом они только добавляются к
+        итогам за всё время.</dd></dl>
+    </div>
+    <div class="item">
+      <h3>Статистика игр</h3>
+      <p>Только суммы: например, сколько создано комнат, начато и доиграно игр, сколько игроков в игре, доля английского
+        и русского и наибольшее за день число подключений и игр одновременно. Ни имён, ни адресов, ни кодов комнат, ни
+        содержимого игр.</p>
+      <dl><dt>Хранится</dt><dd>Итоги по дням — 400 дней, потом они только добавляются к итогам за всё время.</dd></dl>
+    </div>
+    <div class="item">
+      <h3>Что ты вводишь и как играешь</h3>
+      <p>Выбранное имя, твои карты, голоса и журнал игры хранятся в памяти сервера, чтобы вести игру, и их видят остальные
+        в комнате. Настоящее имя нигде не требуется — подойдёт любой ник.</p>
+      <dl><dt>Хранится</dt><dd>Только в памяти. Комната со всем содержимым удаляется не позже чем через 30 минут после
+        того, как из неё выходит последний человек, или при перезапуске сервера.</dd></dl>
+    </div>
+    <div class="item">
+      <h3>Журнал ошибок</h3>
+      <p>Если что-то ломается, игровой сервер пишет техническое сообщение в системный журнал: ошибки программы и строки
+        о комнатах вроде «room ABCD deleted (idle)». IP-адресов, имён и содержимого игр в них нет.</p>
+      <p>Веб-сервер перед игрой (Caddy) журналов доступа не ведёт. Если запрос на нём не удался — например, в те
+        несколько секунд, пока игра перезапускается при обновлении, — он пишет строку в журнал ошибок: адрес страницы
+        (в нём может быть код комнаты) и технические подробности, например ошибку и её длительность. IP-адрес и всё,
+        что браузер отправил вместе с запросом (user-agent, языки, сайт, с которого ты пришёл), удаляются до записи.</p>
+      <dl><dt>Хранится</dt><dd>Пока записи не удалит ротация системного журнала (его размер ограничен).</dd></dl>
+    </div>
+  </section>
+
+  <section aria-labelledby="ru-device">
+    <h2 id="ru-device"><span class="n">03</span>Что хранится на твоём устройстве</h2>
+    <p>Сайт записывает несколько значений в localStorage и sessionStorage браузера: токен, по которому после перезагрузки
+      ты возвращаешься на своё место, последнее введённое имя, язык, настройки рассказчика и отображения, а также отметки
+      о том, что вводный экран и озвучка уже показаны, чтобы они не повторялись. Они остаются на
+      устройстве и уходят на сервер, только когда это нужно игре, — например, токен, когда ты возвращаешься в комнату.
+      Файлов cookie нет. Чтобы удалить эти значения, очисти данные этого сайта в браузере.</p>
+  </section>
+
+  <section aria-labelledby="ru-others">
+    <h2 id="ru-others"><span class="n">04</span>Другие сервисы</h2>
+    <ul class="svc">
+      <li><b>Хостинг.</b> Сервер работает у <a href="https://www.hetzner.com/legal/privacy-policy">Hetzner Online GmbH</a>
+        в Германии (ЕС); Hetzner обрабатывает данные по нашему поручению. Описанные выше данные не покидают ЕС.</li>
+      <li><b>HTTPS.</b> Веб-сервер Caddy использует сертификаты <a href="https://letsencrypt.org/privacy/">Let’s
+        Encrypt</a>. Данные посетителей туда не передаются.</li>
+      <li><b>Гитхаб.</b> Ссылки «Сообщить о проблеме» и «Предложить идею» открывают GitHub (GitHub, Inc., США) —
+        отдельный сервис со своей
+        <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">политикой
+        конфиденциальности</a>. Форма открывается уже заполненной: версия игры, краткое описание браузера (например,
+        «Firefox 131 · Linux»), язык и, если ты в комнате, её код. Гитхаб получает эти поля, как только открывается
+        ссылка, а публичными они становятся, только если ты отправишь обращение.</li>
+      <li><b>Google Search Console.</b> С её помощью мы смотрим, как сайт показывается в поиске Google. Она не добавляет на этот
+        сайт ни скриптов, ни cookie: эти данные Google собирает на своих страницах поиска по своей
+        <a href="https://policies.google.com/privacy">политике конфиденциальности</a>.</li>
+    </ul>
+    <p>Больше никто данных с этого сайта не получает. Мы ничего не продаём, не строим профилей и не принимаем
+      автоматических решений.</p>
+  </section>
+
+  <section aria-labelledby="ru-basis">
+    <h2 id="ru-basis"><span class="n">05</span>Правовые основания</h2>
+    <p>Законный интерес (ст. 6(1)(f) GDPR): чтобы игра работала, была защищена и честна и чтобы примерно знать, сколько
+      людей в неё играет. Значения на твоём устройстве строго необходимы для функций, которыми ты пользуешься, поэтому
+      согласия не требуют (ст. 5(3) Директивы ePrivacy, 2002/58/EC). Раз нет ни cookie, ни слежки, соглашаться не на что.</p>
+  </section>
+
+  <section aria-labelledby="ru-rights">
+    <h2 id="ru-rights"><span class="n">06</span>Твои права</h2>
+    <p>По GDPR ты можешь запросить доступ к своим данным, их исправление, удаление и ограничение обработки, а также
+      возразить против обработки. Можно и пожаловаться в надзорный орган по защите данных — например, в стране ЕС, где ты
+      живёшь или работаешь.</p>
+    <p>На деле здесь почти не хранится ничего, что тебя идентифицирует, поэтому искать и удалять обычно нечего: данные
+      игры исчезают вместе с комнатой, строки журнала ошибок — при его ротации, а значения на устройстве можно стереть в
+      любой момент. Вопросы — на
+      <a href="mailto:privacy@sealthebunker.com">privacy@sealthebunker.com</a>.</p>
+  </section>
+
+  <section aria-labelledby="ru-changes">
+    <h2 id="ru-changes"><span class="n">07</span>Изменения</h2>
+    <p>Если сайт начнёт обращаться с данными иначе, одновременно обновятся и эта страница, и дата вверху.</p>
+  </section>
+
+  <p class="home"><a href="/">← sealthebunker.com</a></p>
+</article>
+
+</main>
+</body>
+</html>

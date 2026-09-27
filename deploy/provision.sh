@@ -37,7 +37,9 @@ Wants=network-online.target
 User=bunker
 Group=bunker
 WorkingDirectory=/opt/bunker
-Environment=NODE_ENV=production PORT=8080 HOST=127.0.0.1 BUNKER_TRUST_PROXY=1
+Environment=NODE_ENV=production PORT=8080 HOST=127.0.0.1 BUNKER_TRUST_PROXY=1 BUNKER_STATE_DIR=/var/lib/bunker
+EnvironmentFile=-/etc/bunker/bunker.env
+StateDirectory=bunker
 ExecStart=/usr/bin/node server/index.js
 Restart=always
 RestartSec=2
@@ -53,6 +55,9 @@ UNIT
 
 IP4=$(curl -s -4 --max-time 5 https://ifconfig.me || true)
 {
+  # Global options: Caddy writes no access logs, but its error lines (e.g. a 502 while the game restarts) would carry
+  # the visitor's IP and browser headers into journald. Strip them, and any ?key= (the analytics dashboard token).
+  printf '{\n\tlog default {\n\t\tformat filter {\n\t\t\tfields {\n\t\t\t\trequest>remote_ip delete\n\t\t\t\trequest>remote_port delete\n\t\t\t\trequest>client_ip delete\n\t\t\t\trequest>headers delete\n\t\t\t\trequest>uri query {\n\t\t\t\t\tdelete key\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t}\n}\n'
   # /audio/* is served by Caddy itself: HTTP Range support (Safari/iOS needs it for media) + caching.
   printf '%s {\n\tencode gzip\n\thandle /audio/* {\n\t\troot * /opt/bunker/public\n\t\theader Cache-Control "public, max-age=604800"\n\t\tfile_server\n\t}\n\thandle {\n\t\treverse_proxy 127.0.0.1:8080\n\t}\n}\n' "$HOSTNAME_PUBLIC"
   if [ "${#REDIRECT_HOSTS[@]}" -gt 0 ]; then
@@ -68,6 +73,12 @@ sshd -t && systemctl reload ssh
 
 ufw allow 22/tcp >/dev/null; ufw allow 80/tcp >/dev/null; ufw allow 443/tcp >/dev/null
 ufw --force enable >/dev/null
+
+# Secrets for the service (the analytics dashboard key). Created once, never overwritten, root-only.
+install -d -m 700 /etc/bunker
+if [ ! -s /etc/bunker/bunker.env ]; then
+  umask 077; printf 'BUNKER_ADMIN_TOKEN=%s\n' "$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)" > /etc/bunker/bunker.env
+fi
 
 systemctl daemon-reload
 systemctl enable bunker >/dev/null 2>&1

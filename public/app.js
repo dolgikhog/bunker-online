@@ -2186,6 +2186,11 @@ function feedbackLinks(where, room) {
     a('report-issue-link', issueUrl({ lang: uiLang(), room: room || '' }), tr('fb.reportIssue')),
     a('suggest-idea-link', ideaUrl({ lang: uiLang() }), tr('fb.suggestIdea')));
 }
+// the privacy notice (public/privacy.html: English and Russian on one static page, #ru opens the Russian one). A new tab
+// like the links beside it, so a seat is never left; in the landing footer, the rules sheet and the final screen
+function privacyLink(where) {
+  return h('a', { class: 'rep-link privacy-link', testid: 'privacy-link', href: uiLang() === 'ru' ? '/privacy.html#ru' : '/privacy.html', target: '_blank', rel: 'noopener noreferrer', title: tr('fb.privacyHint'), 'data-where': where }, tr('fb.privacy'));
+}
 function versionTag(where) {
   const v = appVersion();
   return h('span', { class: 'app-version mono', testid: 'app-version', 'data-version': v, 'data-where': where, title: tr('fb.versionHint'), text: tr('fb.version', { code: v }) });
@@ -2311,7 +2316,7 @@ function vLanding() {
         form)),
     h('footer', { class: 'landing-foot' },
       h('span', { text: tr('landing.footer') }),
-      h('span', { class: 'foot-meta' }, feedbackLinks('landing', ''), versionTag('landing'))));
+      h('span', { class: 'foot-meta' }, feedbackLinks('landing', ''), privacyLink('landing'), versionTag('landing'))));
 }
 // Decorative: a hand of cards on the table — two backs, two face-up cards and a special.
 function vFan() {
@@ -2827,7 +2832,7 @@ function vFinalBanner(s, d) {
       h('div', { class: 'fb-col out' }, h('div', { class: 'k', text: tr('final.stayed') }),
         h('ul', { class: 'chips' }, f.out.map((id) => { const p = byId(s, id); return h('li', { class: 'chip bad', key: id }, nameOf(s, id), p && p.status === 'left' ? h('span', { class: 'chip-sub', text: ' ' + tr('final.left') }) : null); })))),
     // SPEC §11 X10: a quiet line under the result
-    h('p', { class: 'final-feedback' }, h('span', { class: 'final-fb-lead', text: tr('fb.lead') }), ' ', feedbackLinks('final', s.room)));
+    h('p', { class: 'final-feedback' }, h('span', { class: 'final-fb-lead', text: tr('fb.lead') }), ' ', feedbackLinks('final', s.room), ' ', privacyLink('final')));
 }
 // rail = the always-visible desktop version in the side column; otherwise a one-line summary that expands.
 function vSituation(s, d, rail) {
@@ -3729,7 +3734,7 @@ function vRulesModal() {
         sec(tr('rules.airlock'), tr('rules.air1'), tr('rules.air2'), tr('rules.air3'), airlockDealText(s), tr('rules.air4')),
         sec(tr('rules.end'), tr('rules.end1'), tr('rules.end2')),
         // SPEC §11 X10: the links and the version, quietly, at the foot of the sheet
-        h('p', { class: 'rs-feedback' }, h('span', { class: 'rs-fb-lead', text: tr('fb.lead') }), ' ', feedbackLinks('rules', s ? s.room : ''), ' ', versionTag('rules'))),
+        h('p', { class: 'rs-feedback' }, h('span', { class: 'rs-fb-lead', text: tr('fb.lead') }), ' ', feedbackLinks('rules', s ? s.room : ''), ' ', privacyLink('rules'), ' ', versionTag('rules'))),
       h('div', { class: 'modal-actions' }, h('span', { class: 'grow' }), h('button', { class: 'btn primary', act: 'rules-close' }, tr('rules.gotIt')))));
 }
 function vModal() {
