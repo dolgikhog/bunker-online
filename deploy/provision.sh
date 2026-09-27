@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # One-time server setup (Ubuntu 24.04, run as root on the server). Idempotent.
-# Usage: ssh root@HOST 'bash -s' -- <public-hostname> < deploy/provision.sh
+# Usage: ssh root@HOST 'bash -s' -- <public-hostname> [redirect-hostname ...] < deploy/provision.sh
+#   Extra hostnames (e.g. www.example.com, an old 1-2-3-4.sslip.io link) permanently redirect to the first one.
 set -euo pipefail
 HOSTNAME_PUBLIC="${1:?public hostname, e.g. 1-2-3-4.sslip.io}"
+shift
+REDIRECT_HOSTS=("$@")
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -qq
@@ -52,6 +55,9 @@ IP4=$(curl -s -4 --max-time 5 https://ifconfig.me || true)
 {
   # /audio/* is served by Caddy itself: HTTP Range support (Safari/iOS needs it for media) + caching.
   printf '%s {\n\tencode gzip\n\thandle /audio/* {\n\t\troot * /opt/bunker/public\n\t\theader Cache-Control "public, max-age=604800"\n\t\tfile_server\n\t}\n\thandle {\n\t\treverse_proxy 127.0.0.1:8080\n\t}\n}\n' "$HOSTNAME_PUBLIC"
+  if [ "${#REDIRECT_HOSTS[@]}" -gt 0 ]; then
+    printf '%s {\n\tredir https://%s{uri} permanent\n}\n' "$(IFS=,; echo "${REDIRECT_HOSTS[*]}" | sed 's/,/, /g')" "$HOSTNAME_PUBLIC"
+  fi
   if [ -n "$IP4" ]; then
     printf 'http://%s {\n\tredir https://%s{uri}\n}\n' "$IP4" "$HOSTNAME_PUBLIC"
   fi

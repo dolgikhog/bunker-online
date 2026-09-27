@@ -5,7 +5,7 @@
 
 An online party game in the style of the discussion game "Bunker" («Бункер»).
 
-**Play:** <https://178-104-144-119.sslip.io> ·
+**Play:** <https://sealthebunker.com> ·
 **[Report an issue](https://github.com/dolgikhog/bunker-online/issues/new/choose)** ·
 [Contributing](#contributing) · [License](#license)
 
@@ -32,7 +32,7 @@ right crew?
 ### Joining
 | You want to | Do this |
 |---|---|
-| Join a friend's game | Open the link they send (`https://178-104-144-119.sslip.io/?room=ABCD`), type a name and press **Join room ABCD**. You can also open the site, type the 4-letter code and press **Join** |
+| Join a friend's game | Open the link they send (`https://sealthebunker.com/?room=ABCD`), type a name and press **Join room ABCD**. You can also open the site, type the 4-letter code and press **Join** |
 | Watch only | Press **Watch** (or **Just watch**) instead. Spectators see only public information |
 | Get back in after a drop | Nothing to do: the page reconnects by itself, and your seat waits for you (shown as offline) |
 | Get back in after closing the tab | Open the link again **in the same browser** and press **Rejoin as ‹name›**. Your seat belongs to that browser, so another device cannot take it over |
@@ -182,7 +182,7 @@ Each of the 18 catastrophes has a recorded narration in both languages, male or 
 
 ## По-русски
 
-**Бункер онлайн** — онлайн-стол по мотивам дискуссионной игры «Бункер»: <https://178-104-144-119.sslip.io>. Страница
+**Бункер онлайн** — онлайн-стол по мотивам дискуссионной игры «Бункер»: <https://sealthebunker.com>. Страница
 раздаёт карты, ведёт очерёдность ходов и считает голоса, а спорите вы в своём голосовом чате (Дискорд, Телеграм…).
 Текстового чата нет. Регистрация и установка не нужны, с телефона тоже можно.
 
@@ -252,9 +252,9 @@ a checkout of this repository after `npm install`.
 
 ```sh
 # fill the room you created in your browser (you stay the host):
-npm run bots -- --url https://178-104-144-119.sslip.io --room ABCD --count 5
+npm run bots -- --url https://sealthebunker.com --room ABCD --count 5
 # or give the invite link alone (quote it: zsh treats "?" as a pattern):
-npm run bots -- --room 'https://178-104-144-119.sslip.io/?room=ABCD' --count 5
+npm run bots -- --room 'https://sealthebunker.com/?room=ABCD' --count 5
 # a table of bots that plays itself. Open the printed link and press Watch:
 npm run bots -- --url http://localhost:8080 --create 8 --host-bot
 ```
@@ -345,13 +345,14 @@ The live game runs on a small VPS with Ubuntu 24.04. The server's details are ke
 ```sh
 # deploy/.env
 BUNKER_DEPLOY_TARGET=root@<server IP>
-BUNKER_PUBLIC_HOSTNAME=<a-b-c-d>.sslip.io     # the server IP with dashes
+BUNKER_PUBLIC_HOSTNAME=example.com           # your domain, or <a-b-c-d>.sslip.io (the server IP with dashes)
+BUNKER_REDIRECT_HOSTNAMES="www.example.com"  # optional: names that redirect to it (e.g. an old sslip.io link)
 BUNKER_SSH_KEY=<path to the SSH private key>  # used by the commands below (deploy.sh also has a default)
 ```
 
 | | |
 |---|---|
-| URL | <https://178-104-144-119.sslip.io>. sslip.io resolves a name like `1-2-3-4.sslip.io` to the IP inside it, and Caddy gets the HTTPS certificate automatically. Plain `http://<server IP>` redirects there |
+| URL | <https://sealthebunker.com>: an A record for `@` and `www` points at the server, and Caddy gets the HTTPS certificates automatically. `www.`, the old `https://1-2-3-4.sslip.io` link and plain `http://<server IP>` redirect there, path and `?room=` included. Set `BUNKER_PUBLIC_HOSTNAME` and `BUNKER_REDIRECT_HOSTNAMES` in `deploy/.env`, then re-run `deploy/provision.sh` (see below). Without a domain, a `1-2-3-4.sslip.io` name works as the main hostname too |
 | Stack | **Caddy** (ports 80/443) → `127.0.0.1:8080` → the **systemd unit `bunker`** (user `bunker`, `/opt/bunker`, `node server/index.js`, `BUNKER_TRUST_PROXY=1`, restarts itself). Caddy serves `/audio/*` itself, with a 7-day cache. The firewall (ufw) allows 22, 80 and 443 |
 
 The commands below assume the settings are loaded into the shell: `. deploy/.env`.
@@ -359,7 +360,7 @@ The commands below assume the settings are loaded into the shell: `. deploy/.env
 **One-time setup** of a fresh Ubuntu 24.04 server. It installs Node 24, Caddy and ufw, and writes the unit and the
 Caddyfile. You can run it again safely.
 ```sh
-ssh -i "$BUNKER_SSH_KEY" "$BUNKER_DEPLOY_TARGET" 'bash -s' -- "$BUNKER_PUBLIC_HOSTNAME" < deploy/provision.sh
+ssh -i "$BUNKER_SSH_KEY" "$BUNKER_DEPLOY_TARGET" 'bash -s' -- "$BUNKER_PUBLIC_HOSTNAME" $BUNKER_REDIRECT_HOSTNAMES < deploy/provision.sh
 ```
 
 **Deploy** the current code:
